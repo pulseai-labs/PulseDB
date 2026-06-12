@@ -144,8 +144,8 @@ pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationErr
 
 // Core types
 pub use types::{
-    AgentId, CollectiveId, Embedding, ExperienceId, InsightId, RelationId, TaskId, Timestamp,
-    UserId,
+    AgentId, CollectiveId, Embedding, ExperienceId, InsightId, InstanceId, RelationId, TaskId,
+    Timestamp, UserId,
 };
 
 // Domain types

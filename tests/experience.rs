@@ -76,7 +76,7 @@ fn test_record_and_get_experience() {
     assert_eq!(exp.embedding.len(), DIM);
     assert_eq!(exp.importance, 0.9);
     assert_eq!(exp.confidence, 0.85);
-    assert_eq!(exp.applications, 0);
+    assert_eq!(exp.applications(), 0);
     assert_eq!(exp.domain, vec!["rust", "concurrency"]);
     assert_eq!(exp.related_files, vec!["src/main.rs"]);
     assert!(!exp.archived);
@@ -180,7 +180,7 @@ fn test_record_experience_default_fields() {
     let exp = db.get_experience(id).unwrap().unwrap();
     assert_eq!(exp.importance, 0.5); // default
     assert_eq!(exp.confidence, 0.5); // default
-    assert_eq!(exp.applications, 0);
+    assert_eq!(exp.applications(), 0);
     assert!(!exp.archived);
     assert!(matches!(
         exp.experience_type,
@@ -469,7 +469,7 @@ fn test_reinforce_experience() {
     let (db, cid, _dir) = open_db_with_collective();
 
     let id = db.record_experience(minimal_experience(cid)).unwrap();
-    assert_eq!(db.get_experience(id).unwrap().unwrap().applications, 0);
+    assert_eq!(db.get_experience(id).unwrap().unwrap().applications(), 0);
 
     let count = db.reinforce_experience(id).unwrap();
     assert_eq!(count, 1);
@@ -481,7 +481,7 @@ fn test_reinforce_experience() {
     assert_eq!(count, 3);
 
     let exp = db.get_experience(id).unwrap().unwrap();
-    assert_eq!(exp.applications, 3);
+    assert_eq!(exp.applications(), 3);
 
     db.close().unwrap();
 }
@@ -888,7 +888,7 @@ fn test_updated_experience_persists_across_reopen() {
         assert_eq!(exp.importance, 0.99);
         assert_eq!(exp.domain, vec!["updated"]);
         assert!(exp.archived);
-        assert_eq!(exp.applications, 2);
+        assert_eq!(exp.applications(), 2);
 
         db.close().unwrap();
     }

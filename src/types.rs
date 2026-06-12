@@ -3,8 +3,9 @@
 //! This module defines the fundamental ID types used throughout PulseDB.
 //! All ID types use UUID v7 for time-ordered unique identification.
 
-use serde::{Deserialize, Serialize};
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Collective identifier (UUID v7 for time-ordering).
@@ -107,6 +108,57 @@ impl Default for ExperienceId {
 }
 
 impl fmt::Display for ExperienceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Unique identifier for a PulseDB database instance.
+///
+/// Each database mints one stable instance id on first open and stores it in
+/// metadata. Temporal decay uses this id as the G-counter key for local
+/// reinforcement counts; the sync protocol also uses it to identify peers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InstanceId(pub Uuid);
+
+impl InstanceId {
+    /// Creates a new InstanceId with a UUID v7 (time-ordered).
+    #[inline]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    /// Creates a nil (all zeros) InstanceId.
+    ///
+    /// Useful for tests and explicitly reserved sentinel values.
+    #[inline]
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// Returns the raw UUID bytes for storage.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    /// Creates an InstanceId from raw bytes.
+    #[inline]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl Default for InstanceId {
+    /// Returns a nil (all zeros) InstanceId.
+    ///
+    /// For a new unique ID, use [`InstanceId::new()`].
+    fn default() -> Self {
+        Self::nil()
+    }
+}
+
+impl fmt::Display for InstanceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }

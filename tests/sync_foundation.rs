@@ -592,6 +592,7 @@ fn test_echo_prevention_suppresses_wal() {
     let _guard = SyncApplyGuard::enter();
 
     // Apply a synced experience (should NOT generate WAL event)
+    let timestamp = Timestamp::now();
     let exp = pulsedb::Experience {
         id: pulsedb::ExperienceId::new(),
         collective_id: cid,
@@ -600,12 +601,13 @@ fn test_echo_prevention_suppresses_wal() {
         experience_type: ExperienceType::Generic { category: None },
         importance: 0.5,
         confidence: 0.8,
-        applications: 0,
+        applications: std::collections::BTreeMap::new(),
         domain: vec![],
         related_files: vec![],
         source_agent: pulsedb::AgentId::new("sync-test"),
         source_task: None,
-        timestamp: Timestamp::now(),
+        timestamp,
+        last_reinforced: timestamp,
         archived: false,
     };
     db.apply_synced_experience(exp).unwrap();
@@ -628,6 +630,7 @@ fn test_apply_synced_experience_writes_data() {
     let cid = db.create_collective("apply-test").unwrap();
 
     let exp_id = pulsedb::ExperienceId::new();
+    let timestamp = Timestamp::now();
     let exp = pulsedb::Experience {
         id: exp_id,
         collective_id: cid,
@@ -636,12 +639,13 @@ fn test_apply_synced_experience_writes_data() {
         experience_type: ExperienceType::Generic { category: None },
         importance: 0.7,
         confidence: 0.9,
-        applications: 5,
+        applications: std::collections::BTreeMap::from([(pulsedb::InstanceId::new(), 5)]),
         domain: vec!["test".to_string()],
         related_files: vec![],
         source_agent: pulsedb::AgentId::new("sync-test"),
         source_task: None,
-        timestamp: Timestamp::now(),
+        timestamp,
+        last_reinforced: timestamp,
         archived: false,
     };
 
@@ -652,7 +656,7 @@ fn test_apply_synced_experience_writes_data() {
     // Verify data is retrievable
     let retrieved = db.get_experience(exp_id).unwrap().unwrap();
     assert_eq!(retrieved.content, "synced content");
-    assert_eq!(retrieved.applications, 5);
+    assert_eq!(retrieved.applications(), 5);
 }
 
 #[test]

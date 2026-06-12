@@ -4,10 +4,7 @@
 //! PulseDB instances: change payloads, cursors, handshake messages, and
 //! the instance identity type.
 
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::collective::Collective;
 use crate::experience::Experience;
@@ -15,68 +12,7 @@ use crate::insight::DerivedInsight;
 use crate::relation::ExperienceRelation;
 use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp};
 
-// ============================================================================
-// InstanceId — Unique identity for a PulseDB instance
-// ============================================================================
-
-/// Unique identifier for a PulseDB instance (UUID v7, time-ordered).
-///
-/// Each PulseDB database generates an `InstanceId` on first open and persists
-/// it in the metadata table. This ID is used to identify the source of sync
-/// changes and track per-peer cursors.
-///
-/// # Example
-/// ```
-/// use pulsedb::sync::types::InstanceId;
-///
-/// let id = InstanceId::new();
-/// println!("Instance: {}", id);
-/// assert_eq!(id.as_bytes().len(), 16);
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct InstanceId(pub Uuid);
-
-impl InstanceId {
-    /// Creates a new InstanceId with a UUID v7 (time-ordered).
-    #[inline]
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    /// Creates a nil (all zeros) InstanceId.
-    /// Useful for testing or sentinel values.
-    #[inline]
-    pub fn nil() -> Self {
-        Self(Uuid::nil())
-    }
-
-    /// Returns the raw UUID bytes for storage.
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        self.0.as_bytes()
-    }
-
-    /// Creates an InstanceId from raw bytes.
-    #[inline]
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(Uuid::from_bytes(bytes))
-    }
-}
-
-impl Default for InstanceId {
-    /// Returns a nil (all zeros) InstanceId.
-    ///
-    /// For a new unique ID, use [`InstanceId::new()`].
-    fn default() -> Self {
-        Self::nil()
-    }
-}
-
-impl fmt::Display for InstanceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use crate::types::InstanceId;
 
 // ============================================================================
 // SyncCursor — Tracks sync position per peer
@@ -371,7 +307,7 @@ mod tests {
     fn test_instance_id_nil() {
         let id = InstanceId::nil();
         assert_eq!(id, InstanceId::default());
-        assert_eq!(id.0, Uuid::nil());
+        assert_eq!(id, InstanceId::nil());
     }
 
     #[test]

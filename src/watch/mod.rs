@@ -286,6 +286,7 @@ mod tests {
         exp_type: ExperienceType,
         importance: f32,
     ) -> Experience {
+        let timestamp = Timestamp::now();
         Experience {
             id: ExperienceId::new(),
             collective_id,
@@ -294,12 +295,13 @@ mod tests {
             experience_type: exp_type,
             importance,
             confidence: 1.0,
-            applications: 0,
+            applications: std::collections::BTreeMap::new(),
             domain: domains,
             related_files: vec![],
             source_agent: AgentId::new("test-agent"),
             source_task: None,
-            timestamp: Timestamp::now(),
+            timestamp,
+            last_reinforced: timestamp,
             archived: false,
         }
     }
