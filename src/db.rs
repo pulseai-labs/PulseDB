@@ -74,8 +74,8 @@ use crate::config::{Config, EmbeddingProvider};
 use crate::embedding::{create_embedding_service, EmbeddingService};
 use crate::error::{NotFoundError, PulseDBError, Result, ValidationError};
 use crate::experience::{
-    validate_experience_update, validate_new_experience, Experience, ExperienceUpdate,
-    NewExperience,
+    energy as experience_energy, validate_experience_update, validate_new_experience, Experience,
+    ExperienceUpdate, NewExperience,
 };
 use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
 #[cfg(feature = "sync")]
@@ -1074,6 +1074,35 @@ impl PulseDB {
 
         info!(id = %id, applications = new_count, "Experience reinforced");
         Ok(new_count)
+    }
+
+    /// Computes the current temporal energy for an experience.
+    ///
+    /// This is a read-only diagnostic: it never writes to storage and does not
+    /// require a writable database handle. Per-collective decay configuration
+    /// takes precedence over the database's global default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
+    #[instrument(skip(self))]
+    pub fn energy(&self, id: ExperienceId) -> Result<f32> {
+        let experience = self
+            .storage
+            .get_experience(id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
+        let decay_config = self
+            .storage
+            .get_decay_config(experience.collective_id)?
+            .unwrap_or_else(|| self.config.decay.clone());
+
+        Ok(experience_energy(
+            experience.importance,
+            experience.applications(),
+            experience.last_reinforced,
+            Timestamp::now(),
+            &decay_config,
+        ))
     }
 
     // =========================================================================

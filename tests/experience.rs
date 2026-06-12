@@ -8,6 +8,7 @@ use pulsedb::{
     AgentId, CollectiveId, Config, ExperienceId, ExperienceType, ExperienceUpdate, NewExperience,
     PulseDB, Severity,
 };
+use std::time::Duration;
 use tempfile::tempdir;
 
 /// Default embedding dimension for tests (D384).
@@ -469,7 +470,11 @@ fn test_reinforce_experience() {
     let (db, cid, _dir) = open_db_with_collective();
 
     let id = db.record_experience(minimal_experience(cid)).unwrap();
-    assert_eq!(db.get_experience(id).unwrap().unwrap().applications(), 0);
+    let initial = db.get_experience(id).unwrap().unwrap();
+    assert_eq!(initial.applications(), 0);
+    let initial_last_reinforced = initial.last_reinforced;
+
+    std::thread::sleep(Duration::from_millis(2));
 
     let count = db.reinforce_experience(id).unwrap();
     assert_eq!(count, 1);
@@ -482,6 +487,7 @@ fn test_reinforce_experience() {
 
     let exp = db.get_experience(id).unwrap().unwrap();
     assert_eq!(exp.applications(), 3);
+    assert!(exp.last_reinforced > initial_last_reinforced);
 
     db.close().unwrap();
 }

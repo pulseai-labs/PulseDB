@@ -86,6 +86,28 @@ pub trait SubstrateProvider: Send + Sync {
     /// Retrieves an experience by ID, or `None` if it doesn't exist.
     async fn get_experience(&self, id: ExperienceId) -> Result<Option<Experience>, PulseDBError>;
 
+    /// Reinforces an experience and returns its summed application count.
+    ///
+    /// The default implementation returns an unsupported-operation error so
+    /// existing custom providers remain source-compatible without pretending a
+    /// mutation succeeded.
+    async fn reinforce_experience(&self, _id: ExperienceId) -> Result<u32, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::reinforce_experience is not supported by this implementation",
+        ))
+    }
+
+    /// Computes the current temporal energy for an experience.
+    ///
+    /// The default implementation returns an unsupported-operation error so
+    /// existing custom providers remain source-compatible without inventing a
+    /// misleading energy value.
+    async fn energy(&self, _id: ExperienceId) -> Result<f32, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::energy is not supported by this implementation",
+        ))
+    }
+
     /// Searches for experiences similar to the given embedding.
     ///
     /// Returns up to `k` results as `(Experience, similarity_score)` tuples,
