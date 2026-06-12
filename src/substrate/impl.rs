@@ -90,6 +90,16 @@ impl SubstrateProvider for PulseDBSubstrate {
         blocking(move || db.get_experience(id)).await
     }
 
+    async fn reinforce_experience(&self, id: ExperienceId) -> Result<u32, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.reinforce_experience(id)).await
+    }
+
+    async fn energy(&self, id: ExperienceId) -> Result<f32, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.energy(id)).await
+    }
+
     async fn search_similar(
         &self,
         collective: CollectiveId,

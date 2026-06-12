@@ -3,8 +3,8 @@
 //! Tests read-only mode, paginated list methods, and enriched watch events.
 
 use pulsedb::{
-    Config, ExperienceUpdate, InsightType, NewDerivedInsight, NewExperience, NewExperienceRelation,
-    PulseDB, RelationType, WatchEventType,
+    Config, InsightType, NewDerivedInsight, NewExperience, NewExperienceRelation, PulseDB,
+    RelationType, WatchEventType,
 };
 use tempfile::tempdir;
 
@@ -92,6 +92,12 @@ fn test_read_only_allows_reads() {
     assert!(db.get_experience(exp_id).unwrap().is_some());
     assert!(!db.list_collectives().unwrap().is_empty());
     assert!(db.get_collective(cid).unwrap().is_some());
+
+    let energy = db.energy(exp_id).unwrap();
+    assert!((0.0..=1.0).contains(&energy));
+
+    let err = db.reinforce_experience(exp_id).unwrap_err();
+    assert!(err.is_read_only());
 }
 
 // ============================================================================
@@ -218,7 +224,6 @@ fn test_watch_event_includes_experience_on_create() {
         .unwrap();
 
     // Get the event from the stream
-    use futures::StreamExt;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let event = rt.block_on(async {
         tokio::time::timeout(
@@ -253,7 +258,6 @@ fn test_watch_event_none_on_delete() {
     let stream = db.watch_experiences(cid).unwrap();
     db.delete_experience(exp_id).unwrap();
 
-    use futures::StreamExt;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let event = rt.block_on(async {
         tokio::time::timeout(

@@ -407,6 +407,27 @@ async fn test_trait_object_safety() {
     assert!(retrieved.is_some());
 }
 
+#[tokio::test]
+async fn test_reinforce_and_energy_through_trait_object() {
+    let (substrate, cid, _dir) = setup();
+    let provider: Box<dyn SubstrateProvider> = Box::new(substrate);
+
+    let exp_id = provider
+        .store_experience(minimal_experience(cid))
+        .await
+        .unwrap();
+
+    let before = provider.energy(exp_id).await.unwrap();
+    let count = provider.reinforce_experience(exp_id).await.unwrap();
+    let after = provider.energy(exp_id).await.unwrap();
+
+    let exp = provider.get_experience(exp_id).await.unwrap().unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(exp.applications(), 1);
+    assert!((0.0..=1.0).contains(&after));
+    assert!(after >= before);
+}
+
 // ============================================================================
 // Clone & concurrency
 // ============================================================================
