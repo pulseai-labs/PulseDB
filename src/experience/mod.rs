@@ -16,8 +16,10 @@
 //! - [`delete_experience(id)`](crate::PulseDB::delete_experience)
 //! - [`reinforce_experience(id)`](crate::PulseDB::reinforce_experience)
 
+mod decay;
 pub mod types;
 mod validation;
 
+pub use decay::energy;
 pub use types::{Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity};
 pub(crate) use validation::{validate_experience_update, validate_new_experience};
