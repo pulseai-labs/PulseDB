@@ -27,7 +27,7 @@ Add last_reinforced (Timestamp) to Experience and convert applications to a per-
 
 ##### Demo criteria
 
-- [ ] auto: cargo test --lib --features sync experience::decay sync::applier → expected: exit code 0
+- [ ] auto: cargo test --lib --features sync -- experience::decay sync::applier → expected: exit code 0
 - [ ] user: reinforce the same experience on two instances while diverged, then sync → expected: exact total (no lost or doubled counts); energy rises on reinforce then decays per the closed-form E(t)
 
 #### VS-3.5.2: Energy-weighted recall
