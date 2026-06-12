@@ -1010,6 +1010,45 @@ impl StorageEngine for RedbStorage {
         Ok(true)
     }
 
+    #[cfg(feature = "sync")]
+    fn merge_experience_applications(
+        &self,
+        id: ExperienceId,
+        applications: &BTreeMap<InstanceId, u32>,
+        last_reinforced: Option<Timestamp>,
+    ) -> Result<bool> {
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        let found = {
+            let mut exp_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+            let entry = match exp_table.get(id.as_bytes())? {
+                Some(v) => v,
+                None => return Ok(false),
+            };
+
+            let mut experience: Experience = bincode::deserialize(entry.value())
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            drop(entry);
+
+            for (instance_id, count) in applications {
+                let bucket = experience.applications.entry(*instance_id).or_insert(0);
+                *bucket = (*bucket).max(*count);
+            }
+
+            if let Some(incoming) = last_reinforced {
+                experience.last_reinforced = experience.last_reinforced.max(incoming);
+            }
+
+            let bytes = bincode::serialize(&experience)
+                .map_err(|e| StorageError::serialization(e.to_string()))?;
+            exp_table.insert(id.as_bytes(), bytes.as_slice())?;
+            true
+        };
+
+        write_txn.commit().map_err(StorageError::from)?;
+        debug!(id = %id, "Experience applications merged");
+        Ok(found)
+    }
+
     fn delete_experience(&self, id: ExperienceId) -> Result<bool> {
         // First read the experience to get collective_id, timestamp, and type_tag
         // (needed for cleaning up secondary indices and WAL event)

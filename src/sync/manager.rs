@@ -23,7 +23,7 @@ use super::progress::SyncProgressCallback;
 use super::pusher::LocalChangePusher;
 use super::transport::SyncTransport;
 use super::types::{HandshakeRequest, InstanceId, PullRequest, SyncCursor, SyncStatus};
-use super::SYNC_PROTOCOL_VERSION;
+use super::{SYNC_CAPABILITY_GCOUNTER_APPLICATIONS, SYNC_PROTOCOL_VERSION};
 
 /// Orchestrator for sync operations between two PulseDB instances.
 ///
@@ -251,7 +251,11 @@ impl SyncManager {
         let request = HandshakeRequest {
             instance_id: self.local_instance_id,
             protocol_version: SYNC_PROTOCOL_VERSION,
-            capabilities: vec!["push".into(), "pull".into()],
+            capabilities: vec![
+                "push".into(),
+                "pull".into(),
+                SYNC_CAPABILITY_GCOUNTER_APPLICATIONS.into(),
+            ],
         };
 
         let response = self.transport.handshake(request).await?;

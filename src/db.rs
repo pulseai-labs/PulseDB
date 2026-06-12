@@ -83,6 +83,8 @@ use crate::relation::ExperienceRelation;
 use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 #[cfg(feature = "sync")]
+use crate::types::InstanceId;
+#[cfg(feature = "sync")]
 use crate::types::RelationId;
 use crate::types::{CollectiveId, ExperienceId, InsightId, Timestamp};
 use crate::vector::HnswIndex;
@@ -2413,6 +2415,25 @@ impl PulseDB {
         self.storage.update_experience(id, &update)?;
         debug!(id = %id, "Synced experience update applied");
         Ok(())
+    }
+
+    /// Merges synced G-counter reinforcement fields from a remote peer.
+    ///
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    pub(crate) fn apply_synced_experience_counter_merge(
+        &self,
+        id: ExperienceId,
+        applications: &BTreeMap<InstanceId, u32>,
+        last_reinforced: Option<Timestamp>,
+    ) -> Result<bool> {
+        let merged =
+            self.storage
+                .merge_experience_applications(id, applications, last_reinforced)?;
+        if merged {
+            debug!(id = %id, "Synced experience counter merge applied");
+        }
+        Ok(merged)
     }
 
     /// Applies a synced experience deletion from a remote peer.

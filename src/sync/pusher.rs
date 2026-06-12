@@ -177,6 +177,8 @@ impl LocalChangePusher {
                             domain: Some(exp.domain.clone()),
                             related_files: Some(exp.related_files.clone()),
                             archived: Some(exp.archived),
+                            applications: Some(exp.applications.clone()),
+                            last_reinforced: Some(exp.last_reinforced),
                         };
                         Ok(Some(SyncPayload::ExperienceUpdated {
                             id,

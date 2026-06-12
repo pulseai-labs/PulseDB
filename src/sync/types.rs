@@ -4,6 +4,8 @@
 //! PulseDB instances: change payloads, cursors, handshake messages, and
 //! the instance identity type.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::collective::Collective;
@@ -85,6 +87,12 @@ pub struct SerializableExperienceUpdate {
 
     /// Set archived status.
     pub archived: Option<bool>,
+
+    /// Full G-counter applications map for CRDT merge.
+    pub applications: Option<BTreeMap<InstanceId, u32>>,
+
+    /// Last reinforcement timestamp for max-timestamp merge.
+    pub last_reinforced: Option<Timestamp>,
 }
 
 impl From<crate::experience::ExperienceUpdate> for SerializableExperienceUpdate {
@@ -95,6 +103,8 @@ impl From<crate::experience::ExperienceUpdate> for SerializableExperienceUpdate 
             domain: update.domain,
             related_files: update.related_files,
             archived: update.archived,
+            applications: None,
+            last_reinforced: None,
         }
     }
 }
@@ -383,6 +393,8 @@ mod tests {
             domain: None,
             related_files: Some(vec!["main.rs".to_string()]),
             archived: None,
+            applications: None,
+            last_reinforced: None,
         };
         let update: crate::experience::ExperienceUpdate = serializable.into();
         assert_eq!(update.importance, Some(0.5));
@@ -398,6 +410,8 @@ mod tests {
             domain: Some(vec!["test".to_string()]),
             related_files: None,
             archived: Some(true),
+            applications: Some(std::collections::BTreeMap::from([(InstanceId::new(), 2)])),
+            last_reinforced: Some(Timestamp::now()),
         };
         let bytes = bincode::serialize(&update).unwrap();
         let restored: SerializableExperienceUpdate = bincode::deserialize(&bytes).unwrap();
@@ -405,6 +419,8 @@ mod tests {
         assert_eq!(update.confidence, restored.confidence);
         assert_eq!(update.domain, restored.domain);
         assert_eq!(update.archived, restored.archived);
+        assert_eq!(update.applications, restored.applications);
+        assert_eq!(update.last_reinforced, restored.last_reinforced);
     }
 
     #[test]
@@ -418,7 +434,7 @@ mod tests {
     fn test_handshake_request_bincode_roundtrip() {
         let req = HandshakeRequest {
             instance_id: InstanceId::new(),
-            protocol_version: 1,
+            protocol_version: crate::sync::SYNC_PROTOCOL_VERSION,
             capabilities: vec!["push".to_string(), "pull".to_string()],
         };
         let bytes = bincode::serialize(&req).unwrap();
