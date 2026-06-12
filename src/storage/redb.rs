@@ -19,10 +19,12 @@
 use std::path::{Path, PathBuf};
 
 use ::redb::{Database, ReadableTable};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
 use crate::activity::Activity;
 use crate::collective::Collective;
+use crate::config::DecayConfig;
 use crate::experience::{Experience, ExperienceUpdate};
 use crate::insight::DerivedInsight;
 use crate::relation::{ExperienceRelation, RelationType};
@@ -31,19 +33,53 @@ use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp}
 use super::schema::{
     decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
     DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, WatchEventRecord, WatchEventTypeTag,
-    ACTIVITIES_TABLE, COLLECTIVES_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
-    EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE,
-    METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE,
-    SCHEMA_VERSION, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
+    ACTIVITIES_TABLE, COLLECTIVES_TABLE, DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE,
+    EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE,
+    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE,
+    RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION, WAL_SEQUENCE_KEY,
+    WATCH_EVENTS_TABLE,
 };
 #[cfg(feature = "sync")]
 use super::schema::{INSTANCE_ID_KEY, SYNC_CURSORS_TABLE};
 use super::StorageEngine;
-use crate::config::{Config, EmbeddingDimension};
+use crate::config::{Config, EmbeddingDimension, RecallWeights};
 use crate::error::{PulseDBError, Result, StorageError, ValidationError};
 
 /// Metadata key in the metadata table.
 const METADATA_KEY: &str = "db_metadata";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StoredDecayConfig {
+    half_life_secs: u64,
+    freq_weight: f32,
+    floor: f32,
+    auto_archive_below_floor: bool,
+    default_recall_weights: Option<RecallWeights>,
+}
+
+impl From<&DecayConfig> for StoredDecayConfig {
+    fn from(config: &DecayConfig) -> Self {
+        Self {
+            half_life_secs: config.half_life.as_secs(),
+            freq_weight: config.freq_weight,
+            floor: config.floor,
+            auto_archive_below_floor: config.auto_archive_below_floor,
+            default_recall_weights: config.default_recall_weights,
+        }
+    }
+}
+
+impl From<StoredDecayConfig> for DecayConfig {
+    fn from(config: StoredDecayConfig) -> Self {
+        Self {
+            half_life: std::time::Duration::from_secs(config.half_life_secs),
+            freq_weight: config.freq_weight,
+            floor: config.floor,
+            auto_archive_below_floor: config.auto_archive_below_floor,
+            default_recall_weights: config.default_recall_weights,
+        }
+    }
+}
 
 /// redb storage engine wrapper.
 ///
@@ -161,6 +197,7 @@ impl RedbStorage {
 
             // Create other tables (they're created on first access)
             let _ = write_txn.open_table(COLLECTIVES_TABLE)?;
+            let _ = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
             let _ = write_txn.open_table(EXPERIENCES_TABLE)?;
             let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
             let _ = write_txn.open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)?;
@@ -278,6 +315,7 @@ impl RedbStorage {
         {
             // Ensure watch_events table exists (migration for pre-E4-S02 databases)
             let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
+            let _ = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
 
             // Migrate WAL records from v1 → v2 (add entity_type field)
             if needs_v2_migration {
@@ -549,6 +587,36 @@ impl StorageEngine for RedbStorage {
             debug!(id = %id, "Collective deleted");
         }
         Ok(existed)
+    }
+
+    fn get_decay_config(&self, collective_id: CollectiveId) -> Result<Option<DecayConfig>> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let table = read_txn.open_table(DECAY_CONFIGS_TABLE)?;
+
+        match table.get(collective_id.as_bytes())? {
+            Some(value) => {
+                let stored: StoredDecayConfig = bincode::deserialize(value.value())
+                    .map_err(|e| StorageError::serialization(e.to_string()))?;
+                Ok(Some(stored.into()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn set_decay_config(&self, collective_id: CollectiveId, config: DecayConfig) -> Result<()> {
+        let stored = StoredDecayConfig::from(&config);
+        let bytes =
+            bincode::serialize(&stored).map_err(|e| StorageError::serialization(e.to_string()))?;
+
+        let write_txn = self.db.begin_write().map_err(StorageError::from)?;
+        {
+            let mut table = write_txn.open_table(DECAY_CONFIGS_TABLE)?;
+            table.insert(collective_id.as_bytes(), bytes.as_slice())?;
+        }
+        write_txn.commit().map_err(StorageError::from)?;
+
+        debug!(collective_id = %collective_id, "Decay config saved");
+        Ok(())
     }
 
     // =========================================================================
@@ -1957,6 +2025,7 @@ mod tests {
         read_txn
             .open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)
             .unwrap();
+        read_txn.open_table(DECAY_CONFIGS_TABLE).unwrap();
 
         Box::new(storage).close().unwrap();
     }
@@ -1993,6 +2062,33 @@ mod tests {
 
         let result = storage.get_collective(CollectiveId::new()).unwrap();
         assert!(result.is_none());
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_decay_config_absent_then_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        let collective_id = CollectiveId::new();
+
+        assert!(storage.get_decay_config(collective_id).unwrap().is_none());
+
+        let config = crate::config::DecayConfig {
+            half_life: std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            freq_weight: 0.5,
+            floor: 0.2,
+            auto_archive_below_floor: true,
+            default_recall_weights: None,
+        };
+
+        storage
+            .set_decay_config(collective_id, config.clone())
+            .unwrap();
+
+        let restored = storage.get_decay_config(collective_id).unwrap();
+        assert_eq!(restored, Some(config));
 
         Box::new(storage).close().unwrap();
     }

@@ -100,6 +100,13 @@ pub const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("m
 pub const COLLECTIVES_TABLE: TableDefinition<&[u8; 16], &[u8]> =
     TableDefinition::new("collectives");
 
+/// Decay configuration table.
+///
+/// Key: CollectiveId as 16-byte UUID
+/// Value: bincode-serialized per-collective decay configuration
+pub const DECAY_CONFIGS_TABLE: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("decay_configs");
+
 /// Experiences table.
 ///
 /// Key: ExperienceId as 16-byte UUID

@@ -32,7 +32,7 @@ use std::path::Path;
 
 use crate::activity::Activity;
 use crate::collective::Collective;
-use crate::config::Config;
+use crate::config::{Config, DecayConfig};
 use crate::error::Result;
 use crate::experience::{Experience, ExperienceUpdate};
 use crate::insight::DerivedInsight;
@@ -132,6 +132,23 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Returns an error if the write transaction fails.
     fn delete_collective(&self, id: CollectiveId) -> Result<bool>;
+
+    /// Retrieves the stored decay configuration for a collective.
+    ///
+    /// Returns `None` when no per-collective override has been stored; callers
+    /// should fall back to [`DecayConfig::default`] or their global config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read transaction or deserialization fails.
+    fn get_decay_config(&self, collective_id: CollectiveId) -> Result<Option<DecayConfig>>;
+
+    /// Saves the decay configuration override for a collective.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write transaction or serialization fails.
+    fn set_decay_config(&self, collective_id: CollectiveId, config: DecayConfig) -> Result<()>;
 
     // =========================================================================
     // Experience Index Operations (for collective stats & cascade delete)

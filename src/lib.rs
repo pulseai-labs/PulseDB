@@ -135,8 +135,8 @@ pub use db::PulseDB;
 
 // Configuration
 pub use config::{
-    ActivityConfig, Config, EmbeddingDimension, EmbeddingProvider, HnswConfig, SyncMode,
-    WatchConfig,
+    ActivityConfig, Config, DecayConfig, EmbeddingDimension, EmbeddingProvider, HnswConfig,
+    RecallWeights, SyncMode, WatchConfig,
 };
 
 // Error handling
@@ -150,7 +150,9 @@ pub use types::{
 
 // Domain types
 pub use collective::{Collective, CollectiveStats};
-pub use experience::{Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity};
+pub use experience::{
+    energy, Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity,
+};
 
 // Relations
 pub use relation::{ExperienceRelation, NewExperienceRelation, RelationDirection, RelationType};
