@@ -87,8 +87,19 @@ impl RemoteChangeApplier {
             // ─── Experience ──────────────────────────────────────────
             SyncPayload::ExperienceCreated(experience) => {
                 let id = experience.id;
-                // Idempotent: skip if already exists
                 if self.db.get_experience(id).map_err(map_err)?.is_some() {
+                    let merged = self
+                        .db
+                        .apply_synced_experience_counter_merge(
+                            id,
+                            &experience.applications,
+                            Some(experience.last_reinforced),
+                        )
+                        .map_err(map_err)?;
+                    if merged {
+                        trace!(id = %id, "Merged ExperienceCreated counter collision");
+                        return Ok(ApplyOutcome::Applied);
+                    }
                     trace!(id = %id, "Skipping ExperienceCreated: already exists");
                     return Ok(ApplyOutcome::Skipped);
                 }
@@ -104,15 +115,36 @@ impl RemoteChangeApplier {
                 timestamp,
                 ..
             } => {
-                // Conflict resolution
+                let applications = update.applications.as_ref().cloned().unwrap_or_default();
+                let last_reinforced = update.last_reinforced;
+                let has_counter_merge =
+                    update.applications.is_some() || update.last_reinforced.is_some();
+                let counter_merged = if has_counter_merge {
+                    self.db
+                        .apply_synced_experience_counter_merge(id, &applications, last_reinforced)
+                        .map_err(map_err)?
+                } else {
+                    false
+                };
+
+                let mut apply_scalar_update = true;
                 if self.config.conflict_resolution == ConflictResolution::LastWriteWins {
                     if let Some(local) = self.db.get_experience(id).map_err(map_err)? {
                         if local.timestamp > timestamp {
-                            trace!(id = %id, "Skipping ExperienceUpdated: local is newer (LastWriteWins)");
-                            return Ok(ApplyOutcome::Skipped);
+                            trace!(id = %id, "Skipping scalar ExperienceUpdated fields: local is newer (LastWriteWins)");
+                            apply_scalar_update = false;
                         }
                     }
                 }
+
+                if !apply_scalar_update {
+                    return if counter_merged {
+                        Ok(ApplyOutcome::ConflictResolved)
+                    } else {
+                        Ok(ApplyOutcome::Skipped)
+                    };
+                }
+
                 // ServerWins: always apply. LastWriteWins: remote is newer or equal.
                 let experience_update: ExperienceUpdate = update.into();
                 self.db
@@ -219,4 +251,108 @@ enum ApplyOutcome {
     Applied,
     Skipped,
     ConflictResolved,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::sync::types::{SerializableExperienceUpdate, SyncEntityType};
+    use crate::{
+        CollectiveId, Config, ExperienceType, InstanceId, NewExperience, PulseDB, Timestamp,
+    };
+
+    fn open_db() -> (Arc<PulseDB>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap());
+        (db, dir)
+    }
+
+    fn minimal_exp(cid: CollectiveId) -> NewExperience {
+        NewExperience {
+            collective_id: cid,
+            content: "applier merge test".to_string(),
+            experience_type: ExperienceType::Generic { category: None },
+            embedding: Some(vec![0.1f32; 384]),
+            importance: 0.9,
+            ..Default::default()
+        }
+    }
+
+    fn change(payload: SyncPayload, cid: CollectiveId) -> SyncChange {
+        SyncChange {
+            sequence: 1,
+            source_instance: InstanceId::new(),
+            collective_id: cid,
+            entity_type: SyncEntityType::Experience,
+            payload,
+            timestamp: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn experience_created_collision_merges_gcounter_fields() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-create-collision").unwrap();
+        let exp_id = db.record_experience(minimal_exp(cid)).unwrap();
+        let remote_key = InstanceId::new();
+        let incoming_last_reinforced = Timestamp::from_millis(i64::MAX);
+        let mut remote = db.get_experience(exp_id).unwrap().unwrap();
+        remote.applications = BTreeMap::from([(remote_key, 4)]);
+        remote.last_reinforced = incoming_last_reinforced;
+
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+        let outcome = applier
+            .apply_single(change(SyncPayload::ExperienceCreated(remote), cid))
+            .unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::Applied));
+        let merged = db.get_experience(exp_id).unwrap().unwrap();
+        assert_eq!(merged.applications.get(&remote_key), Some(&4));
+        assert_eq!(merged.last_reinforced, incoming_last_reinforced);
+    }
+
+    #[test]
+    fn lww_skip_does_not_skip_gcounter_merge() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-lww-counter").unwrap();
+        let exp_id = db.record_experience(minimal_exp(cid)).unwrap();
+        let remote_key = InstanceId::new();
+        let incoming_last_reinforced = Timestamp::from_millis(i64::MAX);
+        let update = SerializableExperienceUpdate {
+            importance: Some(0.1),
+            applications: Some(BTreeMap::from([(remote_key, 6)])),
+            last_reinforced: Some(incoming_last_reinforced),
+            ..Default::default()
+        };
+
+        let applier = RemoteChangeApplier::new(
+            Arc::clone(&db),
+            SyncConfig {
+                conflict_resolution: ConflictResolution::LastWriteWins,
+                ..SyncConfig::default()
+            },
+        );
+        let outcome = applier
+            .apply_single(change(
+                SyncPayload::ExperienceUpdated {
+                    id: exp_id,
+                    update,
+                    timestamp: Timestamp::from_millis(0),
+                },
+                cid,
+            ))
+            .unwrap();
+
+        assert!(matches!(outcome, ApplyOutcome::ConflictResolved));
+        let merged = db.get_experience(exp_id).unwrap().unwrap();
+        assert_eq!(merged.applications.get(&remote_key), Some(&6));
+        assert_eq!(merged.applications(), 6);
+        assert_eq!(merged.last_reinforced, incoming_last_reinforced);
+        assert!((merged.importance - 0.9).abs() < f32::EPSILON);
+    }
 }

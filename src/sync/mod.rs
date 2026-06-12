@@ -72,7 +72,10 @@ pub mod types;
 ///
 /// Exchanged during handshake to ensure compatibility between peers.
 /// Increment when making breaking changes to the wire format.
-pub const SYNC_PROTOCOL_VERSION: u32 = 1;
+pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+
+/// Capability advertised by peers that sync reinforcement G-counter fields.
+pub const SYNC_CAPABILITY_GCOUNTER_APPLICATIONS: &str = "gcounter-applications";
 
 // Re-exports for ergonomic access
 pub use config::SyncConfig;

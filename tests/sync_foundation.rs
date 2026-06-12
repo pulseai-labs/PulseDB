@@ -444,8 +444,8 @@ fn test_sync_config_bincode_roundtrip() {
 // ============================================================================
 
 #[test]
-fn test_protocol_version_is_one() {
-    assert_eq!(SYNC_PROTOCOL_VERSION, 1);
+fn test_protocol_version_is_two() {
+    assert_eq!(SYNC_PROTOCOL_VERSION, 2);
 }
 
 // ============================================================================
@@ -454,8 +454,8 @@ fn test_protocol_version_is_one() {
 
 use pulsedb::storage::schema::EntityTypeTag;
 use pulsedb::{
-    DerivedInsight, ExperienceType, InsightType, NewDerivedInsight, NewExperience,
-    NewExperienceRelation, PulseDB, RelationType,
+    ExperienceType, InsightType, NewDerivedInsight, NewExperience, NewExperienceRelation, PulseDB,
+    RelationType,
 };
 
 fn open_test_db() -> (PulseDB, tempfile::TempDir) {
@@ -829,7 +829,7 @@ fn test_compact_wal_preserves_events_above_cursor() {
     db.compact_wal().unwrap();
 
     // poll_changes should still work from after the compacted range
-    let (events, seq) = db.poll_changes(2).unwrap();
+    let (events, _seq) = db.poll_changes(2).unwrap();
     assert!(
         !events.is_empty(),
         "Events above cursor should survive compaction"
