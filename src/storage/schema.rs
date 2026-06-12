@@ -36,13 +36,15 @@ use redb::{MultimapTableDefinition, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::config::EmbeddingDimension;
-use crate::types::Timestamp;
+use crate::experience::ExperienceType;
+use crate::types::{AgentId, CollectiveId, ExperienceId, TaskId, Timestamp};
 
 /// Current schema version.
 ///
 /// Increment this when making breaking changes to the schema.
 /// Version 2 adds `entity_type` to `WatchEventRecord` for sync protocol support.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Version 3 reshapes `Experience` for temporal decay and G-counter applications.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Maximum content size in bytes (100 KB).
 pub const MAX_CONTENT_SIZE: usize = 100 * 1024;
@@ -218,7 +220,6 @@ pub const ACTIVITIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new
 /// Stored in `METADATA_TABLE` as raw 16 bytes. Generated on first open
 /// and persisted for the lifetime of the database. Used by the sync
 /// protocol to identify this PulseDB instance.
-#[cfg(feature = "sync")]
 pub const INSTANCE_ID_KEY: &str = "instance_id";
 
 /// Sync cursors table — per-peer sync position tracking.
@@ -298,6 +299,29 @@ pub(crate) struct WatchEventRecordV1 {
     pub collective_id: [u8; 16],
     pub event_type: WatchEventTypeTag,
     pub timestamp_ms: i64,
+}
+
+/// Schema v2 experience record (for migration deserialization only).
+///
+/// This mirrors the exact bincode layout of `Experience` before schema v3:
+/// scalar `applications`, no `last_reinforced`, and a skipped embedding.
+#[derive(Deserialize)]
+pub(crate) struct ExperienceV2 {
+    pub id: ExperienceId,
+    pub collective_id: CollectiveId,
+    pub content: String,
+    #[serde(skip)]
+    pub embedding: Vec<f32>,
+    pub experience_type: ExperienceType,
+    pub importance: f32,
+    pub confidence: f32,
+    pub applications: u32,
+    pub domain: Vec<String>,
+    pub related_files: Vec<String>,
+    pub source_agent: AgentId,
+    pub source_task: Option<TaskId>,
+    pub timestamp: Timestamp,
+    pub archived: bool,
 }
 
 /// Compact tag for watch event types stored on disk.
@@ -628,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 
     #[test]

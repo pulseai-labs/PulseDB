@@ -32,6 +32,7 @@ fn make_embedding(seed: u64) -> Vec<f32> {
 }
 
 fn make_test_experience(cid: CollectiveId, seed: u64) -> pulsedb::Experience {
+    let timestamp = Timestamp::now();
     pulsedb::Experience {
         id: pulsedb::ExperienceId::new(),
         collective_id: cid,
@@ -40,12 +41,13 @@ fn make_test_experience(cid: CollectiveId, seed: u64) -> pulsedb::Experience {
         experience_type: ExperienceType::Generic { category: None },
         importance: 0.5,
         confidence: 0.8,
-        applications: 0,
+        applications: std::collections::BTreeMap::new(),
         domain: vec!["benchmark".to_string()],
         related_files: vec![],
         source_agent: pulsedb::AgentId::new("bench"),
         source_task: None,
-        timestamp: Timestamp::now(),
+        timestamp,
+        last_reinforced: timestamp,
         archived: false,
     }
 }

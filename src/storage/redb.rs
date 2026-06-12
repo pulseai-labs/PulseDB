@@ -16,6 +16,7 @@
 //! - `./pulse.db` - Main database file
 //! - `./pulse.db.lock` - Lock file for writer coordination (may not be visible)
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ::redb::{Database, ReadableTable};
@@ -28,25 +29,44 @@ use crate::config::DecayConfig;
 use crate::experience::{Experience, ExperienceUpdate};
 use crate::insight::DerivedInsight;
 use crate::relation::{ExperienceRelation, RelationType};
-use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp};
+use crate::types::{CollectiveId, ExperienceId, InsightId, InstanceId, RelationId, Timestamp};
 
+#[cfg(feature = "sync")]
+use super::schema::SYNC_CURSORS_TABLE;
 use super::schema::{
     decode_collective_from_activity_key, encode_activity_key, encode_type_index_key,
-    DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, WatchEventRecord, WatchEventTypeTag,
-    ACTIVITIES_TABLE, COLLECTIVES_TABLE, DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE,
+    DatabaseMetadata, EntityTypeTag, ExperienceTypeTag, ExperienceV2, WatchEventRecord,
+    WatchEventTypeTag, ACTIVITIES_TABLE, COLLECTIVES_TABLE, DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE,
     EXPERIENCES_BY_COLLECTIVE_TABLE, EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE,
-    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, METADATA_TABLE, RELATIONS_BY_SOURCE_TABLE,
-    RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION, WAL_SEQUENCE_KEY,
-    WATCH_EVENTS_TABLE,
+    INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE, INSTANCE_ID_KEY, METADATA_TABLE,
+    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
+    WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
-#[cfg(feature = "sync")]
-use super::schema::{INSTANCE_ID_KEY, SYNC_CURSORS_TABLE};
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
 use crate::error::{PulseDBError, Result, StorageError, ValidationError};
 
 /// Metadata key in the metadata table.
 const METADATA_KEY: &str = "db_metadata";
+
+/// Deterministic sibling path retained before schema-v3 migrations.
+fn pre_v3_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "pulsedb.redb".into());
+    backup.set_file_name(format!("{file_name}.pre-v3.bak"));
+    backup
+}
+
+/// Reserved legacy bucket for scalar v2 application counts.
+///
+/// The bytes spell `PULSEDB_LEGACY__`; freshly minted UUIDv7 instance ids
+/// cannot collide with this fixed non-v7 sentinel.
+fn legacy_applications_instance_id() -> InstanceId {
+    InstanceId::from_bytes(*b"PULSEDB_LEGACY__")
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct StoredDecayConfig {
@@ -101,9 +121,8 @@ pub struct RedbStorage {
     /// Path to the database file.
     path: PathBuf,
 
-    /// Persistent instance ID for sync protocol (only with `sync` feature).
-    #[cfg(feature = "sync")]
-    instance_id: crate::sync::InstanceId,
+    /// Persistent instance ID for local G-counter buckets and sync protocol.
+    instance_id: InstanceId,
 }
 
 impl RedbStorage {
@@ -210,19 +229,17 @@ impl RedbStorage {
             let _ = write_txn.open_table(ACTIVITIES_TABLE)?;
             let _ = write_txn.open_table(WATCH_EVENTS_TABLE)?;
 
-            // Sync tables and instance ID (behind feature gate)
+            let instance_id = InstanceId::new();
+            meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
+
             #[cfg(feature = "sync")]
             {
-                let instance_id = crate::sync::InstanceId::new();
-                meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
                 let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
             }
         }
 
         write_txn.commit().map_err(StorageError::from)?;
 
-        // Load instance ID for the struct (behind feature gate)
-        #[cfg(feature = "sync")]
         let instance_id = {
             let read_txn = db.begin_read().map_err(StorageError::from)?;
             let meta_table = read_txn.open_table(METADATA_TABLE)?;
@@ -233,7 +250,7 @@ impl RedbStorage {
                 .value()
                 .try_into()
                 .map_err(|_| StorageError::corrupted("invalid instance_id bytes"))?;
-            crate::sync::InstanceId::from_bytes(bytes)
+            InstanceId::from_bytes(bytes)
         };
 
         info!(
@@ -246,7 +263,6 @@ impl RedbStorage {
             db,
             metadata,
             path,
-            #[cfg(feature = "sync")]
             instance_id,
         })
     }
@@ -275,8 +291,8 @@ impl RedbStorage {
 
         drop(read_txn);
 
-        // Validate schema version (allow migration from v1 → v2)
-        if metadata.schema_version != SCHEMA_VERSION && metadata.schema_version != 1 {
+        // Validate schema version (allow migration from v1 → v2 → v3).
+        if !matches!(metadata.schema_version, 1..=SCHEMA_VERSION) {
             warn!(
                 expected = SCHEMA_VERSION,
                 found = metadata.schema_version,
@@ -288,6 +304,7 @@ impl RedbStorage {
             }));
         }
         let needs_v2_migration = metadata.schema_version == 1;
+        let needs_v3_migration = metadata.schema_version <= 2;
 
         // Validate embedding dimension
         if metadata.embedding_dimension != config.embedding_dimension {
@@ -304,10 +321,18 @@ impl RedbStorage {
             ));
         }
 
-        // Update last_opened_at timestamp and bump schema version if migrating
+        if needs_v3_migration && config.read_only {
+            return Err(PulseDBError::ReadOnly);
+        }
+
+        if needs_v3_migration {
+            std::fs::copy(&path, pre_v3_backup_path(&path)).map_err(PulseDBError::Io)?;
+        }
+
+        // Update last_opened_at timestamp and bump schema version if migrating.
         let mut metadata = metadata;
         metadata.touch();
-        if needs_v2_migration {
+        if needs_v2_migration || needs_v3_migration {
             metadata.schema_version = SCHEMA_VERSION;
         }
 
@@ -324,26 +349,32 @@ impl RedbStorage {
             }
 
             let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
+
+            if meta_table.get(INSTANCE_ID_KEY)?.is_none() {
+                let instance_id = InstanceId::new();
+                meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
+                debug!("Generated new instance_id for existing database");
+            }
+
+            #[cfg(feature = "sync")]
+            {
+                let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
+            }
+
+            drop(meta_table);
+
+            if needs_v3_migration {
+                Self::migrate_experiences_v2_to_v3(&write_txn)?;
+                info!("Migrated experiences from schema v2 to v3");
+            }
+
+            let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
             let metadata_bytes = bincode::serialize(&metadata)
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             meta_table.insert(METADATA_KEY, metadata_bytes.as_slice())?;
-
-            // Ensure sync tables and instance ID exist (migration for pre-sync databases)
-            #[cfg(feature = "sync")]
-            {
-                // Generate instance_id if missing (first open with sync feature)
-                if meta_table.get(INSTANCE_ID_KEY)?.is_none() {
-                    let instance_id = crate::sync::InstanceId::new();
-                    meta_table.insert(INSTANCE_ID_KEY, instance_id.as_bytes().as_slice())?;
-                    debug!("Generated new instance_id for existing database");
-                }
-                let _ = write_txn.open_table(SYNC_CURSORS_TABLE)?;
-            }
         }
         write_txn.commit().map_err(StorageError::from)?;
 
-        // Load instance ID for the struct (behind feature gate)
-        #[cfg(feature = "sync")]
         let instance_id = {
             let read_txn = db.begin_read().map_err(StorageError::from)?;
             let meta_table = read_txn.open_table(METADATA_TABLE)?;
@@ -354,7 +385,7 @@ impl RedbStorage {
                 .value()
                 .try_into()
                 .map_err(|_| StorageError::corrupted("invalid instance_id bytes"))?;
-            crate::sync::InstanceId::from_bytes(bytes)
+            InstanceId::from_bytes(bytes)
         };
 
         info!(
@@ -367,7 +398,6 @@ impl RedbStorage {
             db,
             metadata,
             path,
-            #[cfg(feature = "sync")]
             instance_id,
         })
     }
@@ -481,6 +511,55 @@ impl RedbStorage {
         }
 
         debug!(count = entries.len(), "Migrated WAL records to v2");
+        Ok(())
+    }
+
+    /// Migrates experience records from schema v2 to v3.
+    ///
+    /// V2 stores scalar application counts. V3 stores a per-instance G-counter
+    /// and maps every legacy scalar into the reserved LEGACY bucket to avoid
+    /// double-counting already-synced replicas in later merge logic.
+    fn migrate_experiences_v2_to_v3(write_txn: &::redb::WriteTransaction) -> Result<()> {
+        let experiences_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+
+        let mut entries: Vec<([u8; 16], ExperienceV2)> = Vec::new();
+        for entry in experiences_table.iter()? {
+            let (key, value) = entry.map_err(StorageError::from)?;
+            let experience_id = *key.value();
+            let experience: ExperienceV2 = bincode::deserialize(value.value())
+                .map_err(|e| StorageError::serialization(format!("v2 experience record: {}", e)))?;
+            entries.push((experience_id, experience));
+        }
+        drop(experiences_table);
+
+        let mut experiences_table = write_txn.open_table(EXPERIENCES_TABLE)?;
+        for (experience_id, v2) in entries {
+            let mut applications = BTreeMap::new();
+            applications.insert(legacy_applications_instance_id(), v2.applications);
+
+            let v3 = Experience {
+                id: v2.id,
+                collective_id: v2.collective_id,
+                content: v2.content,
+                embedding: v2.embedding,
+                experience_type: v2.experience_type,
+                importance: v2.importance,
+                confidence: v2.confidence,
+                applications,
+                domain: v2.domain,
+                related_files: v2.related_files,
+                source_agent: v2.source_agent,
+                source_task: v2.source_task,
+                timestamp: v2.timestamp,
+                last_reinforced: v2.timestamp,
+                archived: v2.archived,
+            };
+            let bytes =
+                bincode::serialize(&v3).map_err(|e| StorageError::serialization(e.to_string()))?;
+            experiences_table.insert(&experience_id, bytes.as_slice())?;
+        }
+
+        debug!("Migrated experience records to v3");
         Ok(())
     }
 
@@ -1005,8 +1084,10 @@ impl StorageEngine for RedbStorage {
                 .map_err(|e| StorageError::serialization(e.to_string()))?;
             drop(entry);
 
-            experience.applications = experience.applications.saturating_add(1);
-            let new_count = experience.applications;
+            let bucket = experience.applications.entry(self.instance_id).or_insert(0);
+            *bucket = bucket.saturating_add(1);
+            experience.last_reinforced = Timestamp::now();
+            let new_count = experience.applications();
             let collective_id = experience.collective_id;
             let timestamp = experience.timestamp;
 
@@ -1870,10 +1951,176 @@ fn bytes_to_f32_vec(data: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PulseDB;
     use tempfile::tempdir;
+
+    #[derive(Serialize)]
+    struct SeedExperienceV2 {
+        id: ExperienceId,
+        collective_id: CollectiveId,
+        content: String,
+        experience_type: ExperienceType,
+        importance: f32,
+        confidence: f32,
+        applications: u32,
+        domain: Vec<String>,
+        related_files: Vec<String>,
+        source_agent: AgentId,
+        source_task: Option<crate::types::TaskId>,
+        timestamp: Timestamp,
+        archived: bool,
+    }
 
     fn default_config() -> Config {
         Config::default()
+    }
+
+    fn seed_schema_v2_store(
+        path: &Path,
+        applications: u32,
+    ) -> (ExperienceId, CollectiveId, Timestamp) {
+        let db = Database::builder().create(path).unwrap();
+        let collective = Collective::new("migrated-collective", 384);
+        let experience_id = ExperienceId::new();
+        let timestamp = Timestamp::from_millis(1_717_171_717_000);
+        let experience = SeedExperienceV2 {
+            id: experience_id,
+            collective_id: collective.id,
+            content: "legacy v2 experience".into(),
+            experience_type: ExperienceType::Fact {
+                statement: "legacy fact".into(),
+                source: "fixture".into(),
+            },
+            importance: 0.7,
+            confidence: 0.8,
+            applications,
+            domain: vec!["migration".into()],
+            related_files: vec!["src/storage/redb.rs".into()],
+            source_agent: AgentId::new("legacy-agent"),
+            source_task: None,
+            timestamp,
+            archived: false,
+        };
+
+        let mut metadata = DatabaseMetadata::new(EmbeddingDimension::D384);
+        metadata.schema_version = 2;
+        let metadata_bytes = bincode::serialize(&metadata).unwrap();
+        let collective_bytes = bincode::serialize(&collective).unwrap();
+        let experience_bytes = bincode::serialize(&experience).unwrap();
+        let embedding = vec![0.25_f32; 384];
+        let embedding_bytes = f32_slice_to_bytes(&embedding);
+
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta_table = write_txn.open_table(METADATA_TABLE).unwrap();
+            meta_table
+                .insert(METADATA_KEY, metadata_bytes.as_slice())
+                .unwrap();
+            let mut collectives = write_txn.open_table(COLLECTIVES_TABLE).unwrap();
+            collectives
+                .insert(collective.id.as_bytes(), collective_bytes.as_slice())
+                .unwrap();
+            let mut experiences = write_txn.open_table(EXPERIENCES_TABLE).unwrap();
+            experiences
+                .insert(experience_id.as_bytes(), experience_bytes.as_slice())
+                .unwrap();
+            let mut embeddings = write_txn.open_table(EMBEDDINGS_TABLE).unwrap();
+            embeddings
+                .insert(experience_id.as_bytes(), embedding_bytes.as_slice())
+                .unwrap();
+
+            let mut by_collective = write_txn
+                .open_multimap_table(EXPERIENCES_BY_COLLECTIVE_TABLE)
+                .unwrap();
+            let mut value = [0u8; 24];
+            value[..8].copy_from_slice(&timestamp.to_be_bytes());
+            value[8..24].copy_from_slice(experience_id.as_bytes());
+            by_collective
+                .insert(collective.id.as_bytes(), &value)
+                .unwrap();
+
+            let mut by_type = write_txn
+                .open_multimap_table(EXPERIENCES_BY_TYPE_TABLE)
+                .unwrap();
+            let type_key = encode_type_index_key(collective.id.as_bytes(), ExperienceTypeTag::Fact);
+            by_type.insert(&type_key, experience_id.as_bytes()).unwrap();
+
+            let _ = write_txn.open_table(DECAY_CONFIGS_TABLE).unwrap();
+            let _ = write_txn.open_table(WATCH_EVENTS_TABLE).unwrap();
+            let _ = write_txn.open_table(RELATIONS_TABLE).unwrap();
+            let _ = write_txn
+                .open_multimap_table(RELATIONS_BY_SOURCE_TABLE)
+                .unwrap();
+            let _ = write_txn
+                .open_multimap_table(RELATIONS_BY_TARGET_TABLE)
+                .unwrap();
+            let _ = write_txn.open_table(INSIGHTS_TABLE).unwrap();
+            let _ = write_txn
+                .open_multimap_table(INSIGHTS_BY_COLLECTIVE_TABLE)
+                .unwrap();
+            let _ = write_txn.open_table(ACTIVITIES_TABLE).unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        drop(db);
+
+        (experience_id, collective.id, timestamp)
+    }
+
+    #[test]
+    fn test_schema_v2_experience_migration_writes_legacy_bucket_backup_and_preserves_queries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let (experience_id, collective_id, timestamp) = seed_schema_v2_store(&path, 7);
+
+        let backup_path = pre_v3_backup_path(&path);
+        assert!(!backup_path.exists());
+
+        let db = PulseDB::open(&path, default_config()).unwrap();
+
+        assert!(backup_path.exists(), "v2 migration must retain a backup");
+        let experience = db.get_experience(experience_id).unwrap().unwrap();
+        assert_eq!(experience.last_reinforced, timestamp);
+        assert_eq!(experience.applications(), 7);
+        assert_eq!(
+            experience
+                .applications
+                .get(&legacy_applications_instance_id()),
+            Some(&7)
+        );
+
+        let query = vec![0.25_f32; 384];
+        let search_results = db.search_similar(collective_id, &query, 10).unwrap();
+        assert!(
+            search_results
+                .iter()
+                .any(|result| result.experience.id == experience_id),
+            "migrated experience must remain searchable"
+        );
+
+        let recent = db.get_recent_experiences(collective_id, 10).unwrap();
+        assert!(
+            recent
+                .iter()
+                .any(|experience| experience.id == experience_id),
+            "migrated experience must remain in the by-collective index"
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_read_only_open_refuses_unmigrated_schema_v2_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v2_store(&path, 3);
+
+        let err = RedbStorage::open(&path, &Config::read_only()).unwrap_err();
+        assert!(matches!(err, PulseDBError::ReadOnly));
+        assert!(
+            !pre_v3_backup_path(&path).exists(),
+            "read-only refusal must happen before migration backup/write work"
+        );
     }
 
     #[test]
@@ -2453,6 +2700,7 @@ mod tests {
 
     /// Creates a test experience with a given collective_id and embedding dimension.
     fn test_experience(collective_id: CollectiveId, dim: usize) -> Experience {
+        let timestamp = Timestamp::now();
         Experience {
             id: ExperienceId::new(),
             collective_id,
@@ -2464,12 +2712,13 @@ mod tests {
             },
             importance: 0.8,
             confidence: 0.7,
-            applications: 0,
+            applications: BTreeMap::new(),
             domain: vec!["rust".into(), "databases".into()],
             related_files: vec!["src/storage/redb.rs".into()],
             source_agent: AgentId::new("test-agent"),
             source_task: None,
-            timestamp: Timestamp::now(),
+            timestamp,
+            last_reinforced: timestamp,
             archived: false,
         }
     }
@@ -2494,7 +2743,7 @@ mod tests {
         assert_eq!(retrieved.content, "Test experience content");
         assert_eq!(retrieved.importance, 0.8);
         assert_eq!(retrieved.confidence, 0.7);
-        assert_eq!(retrieved.applications, 0);
+        assert_eq!(retrieved.applications(), 0);
         assert_eq!(retrieved.domain, vec!["rust", "databases"]);
         assert!(!retrieved.archived);
         // Embedding should be reconstituted from EMBEDDINGS_TABLE
@@ -2825,7 +3074,7 @@ mod tests {
 
         // Verify the stored value
         let retrieved = storage.get_experience(exp_id).unwrap().unwrap();
-        assert_eq!(retrieved.applications, 3);
+        assert_eq!(retrieved.applications(), 3);
 
         // Verify embedding was NOT re-written (still intact)
         let emb = storage.get_embedding(exp_id).unwrap().unwrap();

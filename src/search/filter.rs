@@ -129,6 +129,7 @@ mod tests {
 
     /// Helper to create a minimal test experience.
     fn test_experience() -> Experience {
+        let timestamp = Timestamp::now();
         Experience {
             id: ExperienceId::new(),
             collective_id: CollectiveId::new(),
@@ -140,12 +141,13 @@ mod tests {
             },
             importance: 0.5,
             confidence: 0.8,
-            applications: 0,
+            applications: std::collections::BTreeMap::new(),
             domain: vec!["rust".to_string(), "testing".to_string()],
             related_files: vec![],
             source_agent: AgentId::new("agent-1"),
             source_task: None,
-            timestamp: Timestamp::now(),
+            timestamp,
+            last_reinforced: timestamp,
             archived: false,
         }
     }

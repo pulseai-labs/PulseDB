@@ -320,7 +320,7 @@ async fn test_echo_prevention() {
 
     // The experience on A should still be the original (not duplicated)
     let exp = pair.db_a.get_experience(exp_id).unwrap().unwrap();
-    assert_eq!(exp.applications, 0); // Not modified
+    assert_eq!(exp.applications(), 0); // Not modified
 }
 
 // ============================================================================

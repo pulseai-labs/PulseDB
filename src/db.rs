@@ -58,6 +58,7 @@
 //! # }
 //! ```
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -837,6 +838,8 @@ impl PulseDB {
         let embedding_for_hnsw = embedding.clone();
         let collective_id = exp.collective_id;
 
+        let timestamp = Timestamp::now();
+
         // Construct the full experience record
         let experience = Experience {
             id: ExperienceId::new(),
@@ -846,12 +849,13 @@ impl PulseDB {
             experience_type: exp.experience_type,
             importance: exp.importance,
             confidence: exp.confidence,
-            applications: 0,
+            applications: BTreeMap::new(),
             domain: exp.domain,
             related_files: exp.related_files,
             source_agent: exp.source_agent,
             source_task: exp.source_task,
-            timestamp: Timestamp::now(),
+            timestamp,
+            last_reinforced: timestamp,
             archived: false,
         };
 

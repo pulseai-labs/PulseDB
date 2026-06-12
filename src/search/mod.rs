@@ -68,6 +68,7 @@ mod tests {
 
     /// Helper to create a SearchResult with a given similarity.
     fn make_result(similarity: f32) -> SearchResult {
+        let timestamp = Timestamp::now();
         SearchResult {
             experience: Experience {
                 id: ExperienceId::new(),
@@ -77,12 +78,13 @@ mod tests {
                 experience_type: ExperienceType::default(),
                 importance: 0.5,
                 confidence: 0.8,
-                applications: 0,
+                applications: std::collections::BTreeMap::new(),
                 domain: vec!["test".to_string()],
                 related_files: vec![],
                 source_agent: AgentId::new("agent-1"),
                 source_task: None,
-                timestamp: Timestamp::now(),
+                timestamp,
+                last_reinforced: timestamp,
                 archived: false,
             },
             similarity,
