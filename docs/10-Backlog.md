@@ -43,6 +43,7 @@ This document contains the prioritized product backlog for PulseDB, organized by
 | E4 | Real-Time Features | Must | 13 |
 | E5 | Polish & Release | Must | 18 |
 | E6 | Post-MVP Features | Won't (v1) | 55 |
+| E7 | Temporal Dynamics (v0.5.0) | Must (v0.5) | 16 |
 | **Total MVP** | | | **112** |
 
 ---
@@ -643,7 +644,77 @@ As a developer, I want PulseDB on crates.io so that I can add it as a dependency
 
 ---
 
-## 9. Dependency Graph
+## 9. Epic 7: Temporal Dynamics (v0.5.0)
+
+**Goal:** Give experiences a decaying, reinforcement-driven energy and blend it into recall. MVP-blocking for the Claude-Code-plugin consumer; sequenced ahead of production hardening. Source: `DECAY_SPEC.md`. Maps to roadmap Sprint 3.5.
+
+### E7-S01: Decay Core + Schema v3
+
+| Field | Value |
+|-------|-------|
+| **ID** | E7-S01 |
+| **Title** | Decay core + schema v3 |
+| **Priority** | Must |
+| **Points** | 8 |
+| **Depends On** | E1-S03 |
+| **Traces** | FR-030, FR-031, FR-033, FR-035 · VS-3.5.1 |
+
+**User Story:**
+As a substrate consumer, I want experiences to carry a reinforcement-driven energy that stays exact across multi-instance sync, so that recall can favor what is both relevant and recently useful.
+
+**Acceptance Criteria:**
+- [ ] `last_reinforced` added to Experience; v2→v3 auto-migration (default = creation timestamp, backup-before-migrate)
+- [ ] `applications` becomes a per-instance **G-counter** (`{InstanceId→u32}`, `applications()` returns the sum); `reinforce_experience()` increments the local instance's key + sets `last_reinforced = now` atomically
+- [ ] Migration moves legacy counts into a `{LEGACY}` **sentinel bucket** (double-count-safe, per §4 trap)
+- [ ] Sync-applier merge rules: per-key `max` ⇒ exact total; `max(last_reinforced)` latest-wins
+- [ ] Closed-form `energy(id)` diagnostic (read-only safe)
+- [ ] Per-collective `DecayConfig` (half_life, freq_weight, floor, auto_archive_below_floor, default_recall_weights)
+- [ ] Property tests: `E ∈ [0,1]`, monotonic decay under time advance, strict increase on reinforce; G-counter commutativity + **exact-total** + sentinel double-count regression
+
+---
+
+### E7-S02: Energy-Weighted Recall
+
+| Field | Value |
+|-------|-------|
+| **ID** | E7-S02 |
+| **Title** | Energy-weighted recall |
+| **Priority** | Must |
+| **Points** | 5 |
+| **Depends On** | E7-S01, E2-S02 |
+| **Traces** | FR-032, NFR-018, NFR-019 · VS-3.5.2 |
+
+**User Story:**
+As a substrate consumer, I want to blend similarity with energy in recall so that stale-but-similar memories don't crowd out fresh, proven ones.
+
+**Acceptance Criteria:**
+- [ ] `RecallWeights { similarity, energy }` on search options (defaults 0.7/0.3)
+- [ ] HNSW over-fetch (`k′ = max(4k, k+16)`) + in-substrate re-rank; same applied to `get_context_candidates`
+- [ ] Absent weights ⇒ legacy ranking; `RecallWeights{1.0, 0.0}` reproduces legacy order bit-for-bit
+
+---
+
+### E7-S03: Lifecycle + Bench Guard
+
+| Field | Value |
+|-------|-------|
+| **ID** | E7-S03 |
+| **Title** | Lifecycle + bench guard |
+| **Priority** | Should |
+| **Points** | 3 |
+| **Depends On** | E7-S02 |
+| **Traces** | FR-034, NFR-018 · VS-3.5.3 |
+
+**User Story:**
+As a substrate operator, I want cold-experience visibility and a latency guard so that decay can't silently break the recall budget.
+
+**Acceptance Criteria:**
+- [ ] `floor` config + `list_cold_experiences(below)` helper; `auto_archive_below_floor` OFF by default
+- [ ] Criterion bench: energy-weighted search < 50ms P99 @1M, regression < 10%
+
+---
+
+## 10. Dependency Graph
 
 ```
 E1-S01 (DB Lifecycle)
@@ -682,7 +753,7 @@ E5-* (Polish) depends on all above
 
 ---
 
-## 10. Sprint Allocation
+## 11. Sprint Allocation
 
 ### Sprint 1 (Week 1-2): Foundation
 - E1-S01: Database Lifecycle (5 pts)
@@ -731,3 +802,4 @@ E5-* (Polish) depends on all above
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0.0 | February 2026 | PulseDB Team | Initial backlog |
+| 1.1.0 | June 2026 | PulseDB Team | Added Epic E7 Temporal Dynamics (E7-S01/02/03) for v0.5.0 energy & decay — source `DECAY_SPEC.md`, maps to roadmap Sprint 3.5. E7-S01 widened for D7 (G-counter `applications` + sentinel migration + sync-applier merge rules). |

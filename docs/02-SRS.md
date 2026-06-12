@@ -913,6 +913,93 @@ pub trait SubstrateProvider: Send + Sync {
 
 ---
 
+### 3.9 Temporal Dynamics (v0.5.0)
+
+> MVP-blocking energy & decay layer. Source: `DECAY_SPEC.md` (decisions D1–D6, locked 2026-06-10). Roadmap: Sprint 3.5 (VS-3.5.1/.2/.3).
+
+#### FR-030: Experience Energy Model
+
+| Attribute | Value |
+|-----------|-------|
+| ID | FR-030 |
+| Priority | Must |
+| Description | Each Experience carries `last_reinforced: Timestamp` (schema v3). Energy is *derived, never stored*: `E(t) = clamp₀₁(importance · F(applications) · exp(−λ·Δt))`, where `Δt = now − last_reinforced`, `λ = ln(2)/half_life`, `F(n) = 1 + κ·ln(1+n)`. Per-collective `DecayConfig` { half_life 30d, freq_weight κ 0.25, floor 0.05, auto_archive_below_floor false, default_recall_weights None }. **`DecayConfig` is live-tunable** (not locked at creation, unlike embedding dimension); because energy is evaluated lazily at read time, changing `half_life`/`κ`/`floor` retroactively re-shapes the energy of *all* existing experiences on their next read — intended, to support dogfood tuning. |
+
+**Acceptance Criteria:**
+- [ ] `E ∈ [0,1]` always (clamped)
+- [ ] `E` monotonically non-increasing under pure time advance; strictly increases on reinforce
+- [ ] `F(0) = 1` (an unreinforced experience decays from its raw importance)
+- [ ] `DecayConfig` is per-collective with the specified defaults
+- [ ] `DecayConfig` is mutable post-creation; a `half_life` change is reflected on the next read (no record rewrite)
+
+#### FR-031: Reinforcement Semantics
+
+| Attribute | Value |
+|-----------|-------|
+| ID | FR-031 |
+| Priority | Must |
+| Description | `applications` is a **per-instance G-counter** (`BTreeMap<InstanceId, u32>`); the effective count `n` (for `F(n)`) and the public `applications()` accessor return the **sum** of values — no consumer breakage. `reinforce_experience()` keeps its signature; it atomically increments **the local instance's key** and sets `last_reinforced = now`. Explicit-only — no read/recall path mutates energy state; reads stay out of the sync WAL. **Sync merge (D7):** per-key max over the map (commutative + idempotent) ⇒ **exact total**; `last_reinforced` merges `max` (latest-wins). Convergent *and* exact — concurrent reinforcements on different instances are summed, not lost. |
+
+**Acceptance Criteria:**
+- [ ] `reinforce_experience()` increments the local instance's key and sets `last_reinforced = now` atomically; `applications()` returns the sum
+- [ ] No read path mutates energy state (preserves read-only mode)
+- [ ] Sync merge is commutative + idempotent and yields the **exact total** of concurrent reinforcements (per-key max, then sum)
+
+#### FR-032: Energy-Weighted Recall
+
+| Attribute | Value |
+|-----------|-------|
+| ID | FR-032 |
+| Priority | Must |
+| Description | Optional `RecallWeights { similarity, energy }` (α+β=1; defaults 0.7/0.3). **Weight precedence:** explicit per-request weights > per-collective `default_recall_weights` > legacy (`None`). **β=0 short-circuit:** when the resolved energy weight `β = 0` (including absent weights resolving to legacy, and explicit `{1.0, 0.0}`), recall uses the native legacy `k`-query path — **no over-fetch, no re-rank** — guaranteeing ranking identical to legacy. When `β > 0`: HNSW over-fetch `k′ = max(4k, k+16)`, compute `E` per candidate, `score = α·clamp₀₁(sim) + β·E`, sort desc, truncate to `k`. Applied to `search_similar` and the similarity component of `get_context_candidates`. |
+
+**Acceptance Criteria:**
+- [ ] Weight resolution honors precedence: request weights > collective `default_recall_weights` > legacy
+- [ ] `β = 0` (absent weights *or* explicit `{1.0, 0.0}`) routes to the legacy `k`-query path ⇒ ranking identical to legacy (no over-fetch)
+- [ ] Weighted query (`β > 0`) ranks a fresh-reinforced experience above a stale-but-similar one
+- [ ] Archived experiences still excluded from candidates
+
+#### FR-033: Energy Diagnostic
+
+| Attribute | Value |
+|-----------|-------|
+| ID | FR-033 |
+| Priority | Should |
+| Description | `PulseDB::energy(id) -> Result<f32>` returns the current derived energy for an experience; read-only-safe (works in read-only mode). Supports "why did this rank here". |
+
+**Acceptance Criteria:**
+- [ ] Returns the clamped `E` for an existing experience
+- [ ] Does not mutate state; succeeds in read-only mode
+
+#### FR-034: Cold-Experience Lifecycle
+
+| Attribute | Value |
+|-----------|-------|
+| ID | FR-034 |
+| Priority | Should |
+| Description | `floor` (default 0.05) marks experiences with `E < floor` prune-eligible. `list_cold_experiences(below: f32)` surfaces candidates. `auto_archive_below_floor` defaults **OFF**. Revival = existing `unarchive_experience()` + reinforce (no new lifecycle machinery). |
+
+**Acceptance Criteria:**
+- [ ] A cold experience (`E < floor`) appears in `list_cold_experiences`
+- [ ] `auto_archive_below_floor` is `false` by default (no automatic archiving)
+
+#### FR-035: Schema v3 Migration
+
+| Attribute | Value |
+|-----------|-------|
+| ID | FR-035 |
+| Priority | Must |
+| Description | Add `last_reinforced` to Experience and convert `applications: u32 → BTreeMap<InstanceId, u32>` (D7 G-counter); auto-migrate v2→v3 on `open()` (default `last_reinforced = timestamp`), reusing the v1→v2 backup-before-migrate machinery. **Migration trap (do not skip):** legacy counts migrate into a reserved `{LEGACY: old_count}` sentinel bucket — *never* the local instance's key — else two already-synced replicas migrate `5` into `{A:5}` and `{B:5}` and per-key-max sums to `10` (double-count corruption); the sentinel resolves `{LEGACY:5}` vs `{LEGACY:5}` to `5` on both sides. The new field rides existing full-record WAL/sync entries. **Cross-version sync (decision — closes the mixed-version gap):** energy state syncs cleanly only between peers ≥ v0.5.0; a v3 peer receiving a v2 record (no `last_reinforced`) defaults it to the record's `timestamp`; a v2 peer drops the field on round-trip, so reinforcement state is **not** preserved across a v2 hop. **Read-only migration (decision):** a read-only `open()` of an un-migrated v2 store returns `PulseDBError::ReadOnly` — migration requires a write and cannot proceed read-only (no silent energy-less mode). |
+
+**Acceptance Criteria:**
+- [ ] A v2 store opens, migrates, and has `last_reinforced == timestamp` and `applications == {LEGACY: old_count}` for all rows
+- [ ] A backup is created before migration
+- [ ] Migrating two already-synced replicas then merging does **not** double-count (sentinel-bucket regression test)
+- [ ] v3 peer ingesting a v2 record sets `last_reinforced = record.timestamp` (no panic, no data loss beyond the absent field)
+- [ ] Read-only `open()` of an un-migrated v2 store returns `PulseDBError::ReadOnly` with an actionable message
+
+---
+
 ## 4. Non-Functional Requirements
 
 ### 4.1 Performance Requirements
@@ -1066,6 +1153,25 @@ pub trait SubstrateProvider: Send + Sync {
 | Requirement | MSRV 1.75+ |
 | Measurement | CI builds with specified MSRV |
 
+### 4.6 Temporal Dynamics Requirements (v0.5.0)
+
+#### NFR-018: Energy-Weighted Recall Latency
+
+| Attribute | Value |
+|-----------|-------|
+| ID | NFR-018 |
+| Requirement | Energy-weighted `search_similar` (`β > 0`: over-fetch + `k′` `exp()` + re-rank) completes in < 50ms P99 |
+| Measurement | P99 latency; criterion regression < 10%. **Validated at the VS-3.5.2 recall gate** (not deferred to lifecycle/VS-3.5.3). |
+| Conditions | 1M experiences, k=20; `k′ = max(4k, k+16)` candidates at an `ef_search` sufficient for recall parity. **Over-fetch — not `exp()` — is the dominant added cost**; if the `ef_search` needed for `k′` quality breaches budget, NFR-018 is renegotiated as a separate (looser) target from NFR-004 rather than silently failing. |
+
+#### NFR-019: Recall Backward Compatibility
+
+| Attribute | Value |
+|-----------|-------|
+| ID | NFR-019 |
+| Requirement | `β = 0` recall (absent weights *or* explicit `{1.0, 0.0}`) reproduces legacy pure-similarity ranking bit-for-bit |
+| Measurement | Property test: `β=0` order ≡ legacy order. **Guaranteed by construction** via the FR-032 β=0 short-circuit (legacy `k`-query path, no over-fetch) — not by post-hoc re-rank equivalence under approximate HNSW |
+
 ---
 
 ## 5. Interface Requirements
@@ -1155,6 +1261,14 @@ See [04-DataModel.md](./04-DataModel.md) for complete data model specification.
 | NFR-002 | - | PERF-002 |
 | NFR-003 | - | PERF-003 |
 | NFR-004 | - | PERF-004 |
+| FR-030 | - | TC-030 |
+| FR-031 | - | TC-031 |
+| FR-032 | - | TC-032 |
+| FR-033 | - | TC-033 |
+| FR-034 | - | TC-034 |
+| FR-035 | - | TC-035 |
+| NFR-018 | - | BENCH-018 |
+| NFR-019 | - | TC-019 |
 
 ---
 
@@ -1163,3 +1277,4 @@ See [04-DataModel.md](./04-DataModel.md) for complete data model specification.
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0.0 | February 2026 | PulseDB Team | Initial SRS |
+| 1.1.0 | June 2026 | PulseDB Team | Added §3.9 Temporal Dynamics (FR-030–035) + §4.6 (NFR-018/019) for v0.5.0 energy & decay — source `DECAY_SPEC.md`. Incorporates D7 (per-instance G-counter `applications` + `{LEGACY}` sentinel-bucket migration), weight-precedence/β=0 short-circuit, and mixed-version-sync decisions from the integration audit. |
