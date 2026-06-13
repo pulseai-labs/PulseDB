@@ -951,11 +951,11 @@ pub trait SubstrateProvider: Send + Sync {
 |-----------|-------|
 | ID | FR-032 |
 | Priority | Must |
-| Description | Optional `RecallWeights { similarity, energy }` (α+β=1; defaults 0.7/0.3). **Weight precedence:** explicit per-request weights > per-collective `default_recall_weights` > legacy (`None`). **β=0 short-circuit:** when the resolved energy weight `β = 0` (including absent weights resolving to legacy, and explicit `{1.0, 0.0}`), recall uses the native legacy `k`-query path — **no over-fetch, no re-rank** — guaranteeing ranking identical to legacy. When `β > 0`: HNSW over-fetch `k′ = max(4k, k+16)`, compute `E` per candidate, `score = α·clamp₀₁(sim) + β·E`, sort desc, truncate to `k`. Applied to `search_similar` and the similarity component of `get_context_candidates`. |
+| Description | Optional `RecallWeights { similarity, energy }` (α+β=1; defaults 0.7/0.3). **Weight precedence:** explicit per-request weights > per-collective `default_recall_weights` > legacy (`None`). **β=0 short-circuit:** when the resolved energy weight `β = 0` (including absent weights resolving to legacy, and explicit `{1.0, 0.0}`), recall routes to the **existing legacy path, left byte-for-byte unchanged** — **no *re-rank* over-fetch (`k′`) and no re-rank** — guaranteeing ranking identical to legacy. (The legacy path's own pre-existing post-filter over-fetch is preserved as-is; "no over-fetch" means no *additional* `k′` re-rank over-fetch, not the removal of the legacy filter over-fetch — removing it would itself change filtered results.) When `β > 0`: HNSW over-fetch `k′ = max(4k, k+16)`, compute `E` per candidate, `score = α·clamp₀₁(sim) + β·E`, sort desc, truncate to `k`. Applied to `search_similar` and the similarity component of `get_context_candidates`. |
 
 **Acceptance Criteria:**
 - [ ] Weight resolution honors precedence: request weights > collective `default_recall_weights` > legacy
-- [ ] `β = 0` (absent weights *or* explicit `{1.0, 0.0}`) routes to the legacy `k`-query path ⇒ ranking identical to legacy (no over-fetch)
+- [ ] `β = 0` (absent weights *or* explicit `{1.0, 0.0}`) leaves the existing legacy path byte-for-byte unchanged ⇒ ranking identical to legacy (no *re-rank* over-fetch; the legacy path's own post-filter over-fetch is preserved)
 - [ ] Weighted query (`β > 0`) ranks a fresh-reinforced experience above a stale-but-similar one
 - [ ] Archived experiences still excluded from candidates
 
@@ -1161,7 +1161,7 @@ pub trait SubstrateProvider: Send + Sync {
 |-----------|-------|
 | ID | NFR-018 |
 | Requirement | Energy-weighted `search_similar` (`β > 0`: over-fetch + `k′` `exp()` + re-rank) completes in < 50ms P99 |
-| Measurement | P99 latency; criterion regression < 10%. **Validated at the VS-3.5.2 recall gate** (not deferred to lifecycle/VS-3.5.3). |
+| Measurement | P99 latency; criterion regression < 10%. **Split validation:** re-rank cost is *characterized* and β=0 zero-overhead *verified* at the VS-3.5.2 recall gate — a re-rank microbench plus a full weighted-search bench at the largest scale above the brute-force threshold, with documented extrapolation to 1M; the literal **1M-scale P99 regression gate is enforced at VS-3.5.3's criterion bench guard** (which stands up the 1M fixture). NFR-018 is traced by both slices. |
 | Conditions | 1M experiences, k=20; `k′ = max(4k, k+16)` candidates at an `ef_search` sufficient for recall parity. **Over-fetch — not `exp()` — is the dominant added cost**; if the `ef_search` needed for `k′` quality breaches budget, NFR-018 is renegotiated as a separate (looser) target from NFR-004 rather than silently failing. |
 
 #### NFR-019: Recall Backward Compatibility
@@ -1170,7 +1170,7 @@ pub trait SubstrateProvider: Send + Sync {
 |-----------|-------|
 | ID | NFR-019 |
 | Requirement | `β = 0` recall (absent weights *or* explicit `{1.0, 0.0}`) reproduces legacy pure-similarity ranking bit-for-bit |
-| Measurement | Property test: `β=0` order ≡ legacy order. **Guaranteed by construction** via the FR-032 β=0 short-circuit (legacy `k`-query path, no over-fetch) — not by post-hoc re-rank equivalence under approximate HNSW |
+| Measurement | Property test: `β=0` order ≡ legacy order. **Guaranteed by construction** via the FR-032 β=0 short-circuit (the existing legacy path, left byte-for-byte unchanged — no *re-rank* over-fetch) — not by post-hoc re-rank equivalence under approximate HNSW |
 
 ---
 
