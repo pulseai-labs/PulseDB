@@ -566,7 +566,7 @@ impl RecallWeights {
         Self { similarity, energy }
     }
 
-    fn validate(&self, field: &'static str) -> Result<(), ValidationError> {
+    pub(crate) fn validate(&self, field: &'static str) -> Result<(), ValidationError> {
         if !self.similarity.is_finite()
             || !self.energy.is_finite()
             || self.similarity < 0.0

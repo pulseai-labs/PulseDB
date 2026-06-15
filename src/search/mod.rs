@@ -5,11 +5,42 @@
 
 mod context;
 mod filter;
+pub(crate) mod rerank;
 
 pub use context::{ContextCandidates, ContextRequest};
 pub use filter::SearchFilter;
 
+use crate::config::RecallWeights;
 use crate::experience::Experience;
+
+/// Options for recall search.
+///
+/// `SearchOptions` is the call-time configuration for [`PulseDB::search()`].
+/// When `weights` is absent, search preserves legacy pure-similarity ranking.
+/// Energy-weighted ranking is introduced incrementally by VS-3.5.2.
+///
+/// [`PulseDB::search()`]: crate::PulseDB::search
+#[derive(Clone, Debug)]
+pub struct SearchOptions {
+    /// Maximum number of results to return.
+    pub k: usize,
+
+    /// Filter criteria applied after vector retrieval.
+    pub filter: SearchFilter,
+
+    /// Optional recall weights for similarity and temporal energy.
+    pub weights: Option<RecallWeights>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            k: 10,
+            filter: SearchFilter::default(),
+            weights: None,
+        }
+    }
+}
 
 /// A search result pairing an experience with its similarity score.
 ///

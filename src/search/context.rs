@@ -6,6 +6,7 @@
 //! experiences, insights, relations, active agents) into one response.
 
 use crate::activity::Activity;
+use crate::config::RecallWeights;
 use crate::experience::Experience;
 use crate::insight::DerivedInsight;
 use crate::relation::ExperienceRelation;
@@ -75,6 +76,12 @@ pub struct ContextRequest {
 
     /// Filter criteria applied to similar and recent experience queries.
     pub filter: SearchFilter,
+
+    /// Optional recall weights for similarity and temporal energy.
+    ///
+    /// This field is reserved for weighted context-candidate ranking in
+    /// VS-3.5.2 work item 1.03. `None` preserves legacy ranking.
+    pub recall_weights: Option<RecallWeights>,
 }
 
 impl Default for ContextRequest {
@@ -88,6 +95,7 @@ impl Default for ContextRequest {
             include_relations: true,
             include_active_agents: true,
             filter: SearchFilter::default(),
+            recall_weights: None,
         }
     }
 }
