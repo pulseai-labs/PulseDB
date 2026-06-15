@@ -80,7 +80,8 @@ use crate::experience::{
 use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
 #[cfg(feature = "sync")]
 use crate::relation::ExperienceRelation;
-use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
+use crate::search::rerank::{is_legacy_recall, resolve_recall_weights};
+use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 #[cfg(feature = "sync")]
 use crate::types::InstanceId;
@@ -1300,6 +1301,61 @@ impl PulseDB {
         k: usize,
     ) -> Result<Vec<SearchResult>> {
         self.search_similar_filtered(collective_id, query, k, SearchFilter::default())
+    }
+
+    /// Searches for experiences with optional recall weighting.
+    ///
+    /// This is the forward-compatible search entry for VS-3.5.2. When the
+    /// resolved energy weight is zero, it delegates to the unchanged legacy
+    /// similarity path. Positive energy weights return an error until the
+    /// energy re-rank engine lands in work item 1.02.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to search within
+    /// * `query` - Query embedding vector (must match collective's dimension)
+    /// * `options` - Result limit, filter, and optional recall weights
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if request weights are invalid
+    /// - [`ValidationError::InvalidField`] if energy weighting is requested
+    ///   before work item 1.02 implements the engine
+    /// - Legacy search errors from [`search_similar_filtered`](Self::search_similar_filtered)
+    #[instrument(skip(self, query, options))]
+    pub fn search(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        let collective_default = self
+            .storage
+            .get_decay_config(collective_id)?
+            .and_then(|config| config.default_recall_weights)
+            .filter(
+                |weights| match weights.validate("decay.default_recall_weights") {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "ignoring invalid stored default_recall_weights from issue #14"
+                        );
+                        false
+                    }
+                },
+            );
+
+        let effective = resolve_recall_weights(options.weights, collective_default)?;
+        if is_legacy_recall(effective) {
+            return self.search_similar_filtered(collective_id, query, options.k, options.filter);
+        }
+
+        Err(ValidationError::invalid_field(
+            "weights",
+            "energy-weighted recall (beta > 0) is not yet implemented; arrives in VS-3.5.2 work item 1.02 - use RecallWeights { similarity: 1.0, energy: 0.0 } or omit weights for legacy ranking",
+        )
+        .into())
     }
 
     /// Searches for semantically similar experiences with additional filtering.

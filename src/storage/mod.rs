@@ -28,6 +28,7 @@ pub mod schema;
 pub use self::redb::RedbStorage;
 pub use schema::{DatabaseMetadata, SCHEMA_VERSION};
 
+#[cfg(feature = "sync")]
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -38,7 +39,9 @@ use crate::error::Result;
 use crate::experience::{Experience, ExperienceUpdate};
 use crate::insight::DerivedInsight;
 use crate::relation::{ExperienceRelation, RelationType};
-use crate::types::{CollectiveId, ExperienceId, InsightId, InstanceId, RelationId, Timestamp};
+#[cfg(feature = "sync")]
+use crate::types::InstanceId;
+use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp};
 
 /// Storage engine trait for PulseDB.
 ///
