@@ -353,6 +353,7 @@ async fn test_get_context_candidates() {
             include_relations: false,
             include_active_agents: false,
             filter: SearchFilter::default(),
+            recall_weights: None,
         })
         .await
         .unwrap();
