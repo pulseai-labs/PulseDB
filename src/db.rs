@@ -70,7 +70,7 @@ use tracing::{info, instrument, warn};
 use crate::activity::{validate_new_activity, Activity, NewActivity};
 use crate::collective::types::CollectiveStats;
 use crate::collective::{validate_collective_name, Collective};
-use crate::config::{Config, EmbeddingProvider};
+use crate::config::{Config, DecayConfig, EmbeddingProvider, RecallWeights};
 use crate::embedding::{create_embedding_service, EmbeddingService};
 use crate::error::{NotFoundError, PulseDBError, Result, ValidationError};
 use crate::experience::{
@@ -80,7 +80,7 @@ use crate::experience::{
 use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
 #[cfg(feature = "sync")]
 use crate::relation::ExperienceRelation;
-use crate::search::rerank::{is_legacy_recall, resolve_recall_weights};
+use crate::search::rerank::{self, is_legacy_recall, resolve_recall_weights};
 use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 #[cfg(feature = "sync")]
@@ -1307,8 +1307,8 @@ impl PulseDB {
     ///
     /// This is the forward-compatible search entry for VS-3.5.2. When the
     /// resolved energy weight is zero, it delegates to the unchanged legacy
-    /// similarity path. Positive energy weights return an error until the
-    /// energy re-rank engine lands in work item 1.02.
+    /// similarity path. Positive energy weights over-fetch vector candidates,
+    /// blend similarity with temporal energy, then sort and truncate.
     ///
     /// # Arguments
     ///
@@ -1319,8 +1319,8 @@ impl PulseDB {
     /// # Errors
     ///
     /// - [`ValidationError::InvalidField`] if request weights are invalid
-    /// - [`ValidationError::InvalidField`] if energy weighting is requested
-    ///   before work item 1.02 implements the engine
+    /// - [`ValidationError::DimensionMismatch`] if `query.len()` doesn't match
+    ///   the collective's embedding dimension
     /// - Legacy search errors from [`search_similar_filtered`](Self::search_similar_filtered)
     #[instrument(skip(self, query, options))]
     pub fn search(
@@ -1329,9 +1329,9 @@ impl PulseDB {
         query: &[f32],
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        let collective_default = self
-            .storage
-            .get_decay_config(collective_id)?
+        let stored_decay_config = self.storage.get_decay_config(collective_id)?;
+        let collective_default = stored_decay_config
+            .as_ref()
             .and_then(|config| config.default_recall_weights)
             .filter(
                 |weights| match weights.validate("decay.default_recall_weights") {
@@ -1351,11 +1351,76 @@ impl PulseDB {
             return self.search_similar_filtered(collective_id, query, options.k, options.filter);
         }
 
-        Err(ValidationError::invalid_field(
-            "weights",
-            "energy-weighted recall (beta > 0) is not yet implemented; arrives in VS-3.5.2 work item 1.02 - use RecallWeights { similarity: 1.0, energy: 0.0 } or omit weights for legacy ranking",
+        let weights = effective.expect("non-legacy recall implies weights are present");
+        self.search_similar_weighted(
+            collective_id,
+            query,
+            options.k,
+            options.filter,
+            weights,
+            stored_decay_config,
         )
-        .into())
+    }
+
+    fn search_similar_weighted(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        k: usize,
+        filter: SearchFilter,
+        weights: RecallWeights,
+        stored_decay_config: Option<DecayConfig>,
+    ) -> Result<Vec<SearchResult>> {
+        if k == 0 || k > 1000 {
+            return Err(ValidationError::invalid_field("k", "must be between 1 and 1000").into());
+        }
+
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        let expected_dim = collective.embedding_dimension as usize;
+        if query.len() != expected_dim {
+            return Err(ValidationError::dimension_mismatch(expected_dim, query.len()).into());
+        }
+
+        let over_fetch = std::cmp::max(k.saturating_mul(4), k.saturating_add(16)).min(2000);
+        let ef_search = self.config.hnsw.ef_search.max(over_fetch);
+        let decay_config = stored_decay_config.unwrap_or_else(|| self.config.decay.clone());
+        let now = Timestamp::now();
+
+        let candidates = self
+            .with_vector_index(collective_id, |index| {
+                index.search_experiences(query, over_fetch, ef_search)
+            })?
+            .unwrap_or_default();
+
+        let mut scored = Vec::with_capacity(candidates.len());
+        for (exp_id, distance) in candidates {
+            if let Some(experience) = self.storage.get_experience(exp_id)? {
+                if filter.matches(&experience) {
+                    let similarity = 1.0 - distance;
+                    let energy = experience_energy(
+                        experience.importance,
+                        experience.applications(),
+                        experience.last_reinforced,
+                        now,
+                        &decay_config,
+                    );
+                    let score = rerank::blend_score(similarity, energy, weights);
+                    scored.push((
+                        SearchResult {
+                            experience,
+                            similarity,
+                        },
+                        score,
+                    ));
+                }
+            }
+        }
+
+        Ok(rerank::rerank(scored, k))
     }
 
     /// Searches for semantically similar experiences with additional filtering.
