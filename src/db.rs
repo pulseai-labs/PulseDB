@@ -2208,11 +2208,14 @@ impl PulseDB {
         }
 
         // ── 1. Similar experiences (HNSW vector search) ──────────
-        let similar_experiences = self.search_similar_filtered(
+        let similar_experiences = self.search(
             request.collective_id,
             &request.query_embedding,
-            request.max_similar,
-            request.filter.clone(),
+            SearchOptions {
+                k: request.max_similar,
+                filter: request.filter.clone(),
+                weights: request.recall_weights,
+            },
         )?;
 
         // ── 2. Recent experiences (timestamp index scan) ─────────
@@ -2280,6 +2283,52 @@ impl PulseDB {
             relations,
             active_agents,
         })
+    }
+
+    /// Inserts a backdated experience fixture into storage and the vector index.
+    #[cfg(test)]
+    pub(crate) fn insert_experience_backdated(
+        &self,
+        collective_id: CollectiveId,
+        content: &str,
+        embedding: Vec<f32>,
+        importance: f32,
+        applications: BTreeMap<crate::types::InstanceId, u32>,
+        last_reinforced: Timestamp,
+    ) -> Result<ExperienceId> {
+        self.check_writable()?;
+        let embedding_for_hnsw = embedding.clone();
+        let now = Timestamp::now();
+        let experience = Experience {
+            id: ExperienceId::new(),
+            collective_id,
+            content: content.to_string(),
+            embedding,
+            experience_type: crate::experience::ExperienceType::default(),
+            importance,
+            confidence: 0.8,
+            applications,
+            domain: vec![],
+            related_files: vec![],
+            source_agent: crate::types::AgentId::new("test"),
+            source_task: None,
+            timestamp: now,
+            last_reinforced,
+            archived: false,
+        };
+        let id = experience.id;
+
+        self.storage.save_experience(&experience)?;
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        let index = vectors
+            .get(&collective_id)
+            .ok_or_else(|| PulseDBError::vector("HNSW index missing for collective"))?;
+        index.insert_experience(id, &embedding_for_hnsw)?;
+
+        Ok(id)
     }
 
     // =========================================================================
