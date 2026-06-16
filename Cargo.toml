@@ -123,6 +123,10 @@ name = "scaling"
 harness = false
 
 [[bench]]
+name = "recall_rerank"
+harness = false
+
+[[bench]]
 name = "sync"
 harness = false
 required-features = ["sync"]
