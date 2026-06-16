@@ -139,7 +139,19 @@ pub struct ContextCandidates {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::config::{Config, RecallWeights};
+    use crate::types::{InstanceId, Timestamp};
+    use crate::PulseDB;
+
+    fn embedding_with_query_cosine(cosine: f32) -> Vec<f32> {
+        let mut embedding = vec![0.0; 384];
+        embedding[0] = cosine;
+        embedding[1] = (1.0 - cosine.powi(2)).sqrt();
+        embedding
+    }
 
     #[test]
     fn test_context_request_default_values() {
@@ -184,5 +196,68 @@ mod tests {
 
         let debug = format!("{:?}", candidates);
         assert!(debug.contains("ContextCandidates"));
+    }
+
+    #[test]
+    fn context_candidates_energy_reranks_fresh_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = PulseDB::open(dir.path().join("context-rerank.db"), Config::default()).unwrap();
+        let collective_id = db.create_collective("context-rerank").unwrap();
+        let query_embedding = embedding_with_query_cosine(1.0);
+        let now = Timestamp::now();
+        let stale_last_reinforced =
+            Timestamp::from_millis(now.as_millis() - 90 * 24 * 60 * 60 * 1000);
+        let fresh_last_reinforced = now;
+
+        let stale_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "stale but most similar",
+                embedding_with_query_cosine(0.95),
+                0.8,
+                BTreeMap::new(),
+                stale_last_reinforced,
+            )
+            .unwrap();
+        let fresh_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "fresh reinforced",
+                embedding_with_query_cosine(0.90),
+                0.8,
+                BTreeMap::from([(InstanceId::new(), 24)]),
+                fresh_last_reinforced,
+            )
+            .unwrap();
+
+        let weighted = db
+            .get_context_candidates(ContextRequest {
+                collective_id,
+                query_embedding: query_embedding.clone(),
+                max_similar: 2,
+                max_recent: 2,
+                include_insights: false,
+                include_relations: false,
+                include_active_agents: false,
+                recall_weights: Some(RecallWeights::new(0.5, 0.5)),
+                ..ContextRequest::default()
+            })
+            .unwrap();
+        let legacy = db
+            .get_context_candidates(ContextRequest {
+                collective_id,
+                query_embedding,
+                max_similar: 2,
+                max_recent: 2,
+                include_insights: false,
+                include_relations: false,
+                include_active_agents: false,
+                recall_weights: None,
+                ..ContextRequest::default()
+            })
+            .unwrap();
+
+        assert_eq!(weighted.similar_experiences[0].experience.id, fresh_id);
+        assert_eq!(legacy.similar_experiences[0].experience.id, stale_id);
     }
 }
