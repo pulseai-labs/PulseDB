@@ -2,6 +2,47 @@
 //!
 //! Run with: `cargo bench --bench recall_rerank`
 //!
+//! ===========================================================================
+//! NFR-018 1M P99 BUDGET — GATE VERDICT (VS-3.5.3 work-1.04, D1)
+//! ===========================================================================
+//! BUDGET: P99 latency of energy-weighted `search()` at N = 1,000,000 must be
+//!         <= 50 ms.
+//!
+//! VERDICT: **MET.** Measured at the literal N = 1,000,000 (NOT extrapolated):
+//!         NFR-018 1M P99 = 9.350 ms  (budget 50 ms)  -> MET, ~5.3x headroom.
+//!         P50 = 2.674 ms · P95 = 6.464 ms · P99 = 9.350 ms · max = 43.928 ms.
+//!         N = 1,000,000 measured · warmup = 100 · samples = 1000 ·
+//!         query_dist = random-fixed-seed · build_wall ~ 4585 s (~76 min) ·
+//!         open_cost ~ 149.8 s · fixture ~ 4.0 GB.
+//!
+//! TUNING: NONE. P99 (9.35 ms) is well under budget, so the runtime
+//!         `search_similar_weighted` path in `src/db.rs` is UNTOUCHED (the
+//!         over-fetch cap / ef_search / k' knobs are unchanged). The only
+//!         `src/` addition is the test-only HNSW-path recall guard
+//!         `weighted_search_recall_at_k_above_threshold` (src/search/rerank.rs).
+//!
+//! HONEST FRAMING (bears on issue #15): the literal 1M P99 (9.35 ms) is ~24x
+//!         the 100k-ladder P99 (0.38 ms). The 100k "near-flat curve" assumption
+//!         did NOT hold at 1M — which is exactly why the literal 1M was MEASURED
+//!         (approach b) rather than extrapolated. Still MET, but the real
+//!         headroom is ~5.3x (not the ~130x the extrapolation implied), and
+//!         max = 43.9 ms grazes the 50 ms budget. Future scale / over-fetch
+//!         sizing should treat the headroom as modest, not generous.
+//!
+//! D2 SOURCE OF TRUTH: the manual sampling loop `search_1m_p99_manual` prints
+//!         `NFR-018 1M P99 = {ms}ms (budget 50ms)` and does NOT assert!/panic!
+//!         on the value (the gate is a recorded verdict, not a process abort).
+//!
+//! BASELINE PORTABILITY (C4 / D5): the criterion regression baseline established
+//!         via `cargo bench search -- --save-baseline nfr018` is written to the
+//!         GITIGNORED `target/criterion/` dir. It is a SAME-MACHINE / SAME-SESSION
+//!         drift signal ONLY — NOT a committed, portable, or CI gate. A fresh
+//!         clone / CI runner has no baseline; a missing baseline is NOT a passing
+//!         gate. The **absolute 1M P99 above is the portable gate**; the
+//!         criterion regression-% (first-run +107%/+166% figures are the
+//!         predicted no-prior-baseline + open-rebuild noise) is best-effort only.
+//! ===========================================================================
+//!
 //! NFR-018 EXTRAPOLATION (characterization, NOT a 1M P99 gate; that is
 //! VS-3.5.3's `cargo bench search` guard):
 //! - Measured N uses the fallback 1,000 fixture, which is above
