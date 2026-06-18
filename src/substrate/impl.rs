@@ -238,4 +238,14 @@ impl SubstrateProvider for PulseDBSubstrate {
         let db = Arc::clone(&self.db);
         blocking(move || db.list_insights(collective, limit, offset)).await
     }
+
+    async fn list_cold_experiences(
+        &self,
+        collective: CollectiveId,
+        below: f32,
+        limit: usize,
+    ) -> Result<Vec<(ExperienceId, f32)>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.list_cold_experiences(collective, below, limit)).await
+    }
 }
