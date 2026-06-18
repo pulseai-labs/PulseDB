@@ -454,4 +454,185 @@ mod tests {
         assert_eq!(reranked[1].experience.content, "tie-a");
         assert_eq!(reranked[2].experience.content, "tie-b");
     }
+
+    // -----------------------------------------------------------------------
+    // NFR-018 HNSW-path recall guard (VS-3.5.3 work-1.04, C2/C3)
+    // -----------------------------------------------------------------------
+
+    /// Embedding dimension for the recall-guard fixture (matches D384).
+    const GUARD_DIM: usize = 384;
+
+    /// Deterministic embedding from a seed (independent of the bench helper so
+    /// the guard is self-contained). Distinct seeds yield well-separated
+    /// vectors, so cosine ranks are unambiguous (no ties to break).
+    fn guard_embedding(seed: u64) -> Vec<f32> {
+        (0..GUARD_DIM)
+            .map(|i| {
+                let h = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(i as u64)
+                    .wrapping_mul(1_442_695_040_888_963_407);
+                (h >> 33) as f32 / (u32::MAX as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// Cosine similarity of two equal-length vectors (the in-test ground-truth
+    /// metric). Mirrors the engine's `similarity = 1.0 - cosine_distance`.
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let mut dot = 0.0f32;
+        let mut na = 0.0f32;
+        let mut nb = 0.0f32;
+        for (x, y) in a.iter().zip(b) {
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        let denom = na.sqrt() * nb.sqrt();
+        if denom == 0.0 {
+            0.0
+        } else {
+            dot / denom
+        }
+    }
+
+    /// HNSW-path recall guard for the energy-weighted `search()` (C2/C3).
+    ///
+    /// VS-3.5.2's `search::` correctness suite runs only `<128`-experience
+    /// brute-force collectives, so below `BRUTE_FORCE_THRESHOLD = 128` the
+    /// over-fetch / `ef_search` / `k'` knobs are inert — that suite is
+    /// necessary but NOT sufficient to prove the HNSW retrieval path preserves
+    /// recall. This guard operates ABOVE the threshold (N = 256), where
+    /// `search()` traverses the real HNSW graph.
+    ///
+    /// Ground truth is computed EXHAUSTIVELY in-test (cosine over every fixture
+    /// vector), NOT via the engine's exact brute-force branch — that branch only
+    /// fires at `N <= 128` (`src/vector/hnsw.rs`), below this operating point, so
+    /// it cannot be the oracle here. All experiences share identical importance,
+    /// empty applications, and same-batch `last_reinforced`, so their energy term
+    /// is constant; the energy-weighted blended score is therefore monotonic in
+    /// cosine similarity, and the cosine top-k is an exact oracle for the engine's
+    /// top-k.
+    ///
+    /// MEASUREMENT IS AVERAGED OVER MANY QUERIES (fix-up iteration 1). A single
+    /// query's `recall@10` is 0.1-quantized (only 9/10 or 10/10 are possible);
+    /// against *approximate* HNSW at N=256 that single number flips between 0.900
+    /// and 1.000 across builds — a flaky measurement, not a production defect. We
+    /// therefore average `recall@K` over `Q = 100` distinct fixed-seed queries:
+    /// the **mean recall@K** is continuous and stable, and averages out per-build
+    /// HNSW non-determinism. The floor is calibrated to the MEASURED stable
+    /// baseline (see `RECALL_FLOOR` below): the guard's job is to catch a
+    /// *regression* from future tuning, so a baseline-relative floor is the
+    /// principled choice — an arbitrary 0.95 the untuned approximate path cannot
+    /// reliably clear would only manufacture flake. Test-only: changes no runtime
+    /// behavior and lands whether or not the runtime path was tuned.
+    #[test]
+    fn weighted_search_recall_at_k_above_threshold() {
+        use crate::experience::NewExperience;
+
+        // N strictly above BRUTE_FORCE_THRESHOLD (128) so the HNSW path fires.
+        const N: u64 = 256;
+        const K: usize = 10;
+        // Number of distinct fixed-seed queries to average over. Q >= 50 makes
+        // the mean recall continuous (not 0.1-quantized) and stable across the
+        // per-build HNSW non-determinism that made the single-query guard flaky.
+        const Q: u64 = 100;
+        // Floor calibrated to the measured stable mean recall@10 at N=256 on the
+        // approximate HNSW path. The stable measured baseline is ~0.97 (see
+        // report.md §8 for the multi-run characterization), comfortably ≥ 0.96,
+        // so the C3 floor stays at 0.95 with margin. This catches a recall
+        // *regression* from future over-fetch/ef/k' tuning; it is intentionally
+        // baseline-relative, not an arbitrary perfection demand.
+        const RECALL_FLOOR: f32 = 0.95;
+        // Optional override to prove the assertion is non-vacuous: set
+        // PULSEDB_RECALL_GUARD_FLOOR above the baseline and the test MUST fail.
+        let recall_floor: f32 = std::env::var("PULSEDB_RECALL_GUARD_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(RECALL_FLOOR);
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = PulseDB::open(dir.path().join("recall-guard.db"), Config::default()).unwrap();
+        let collective_id = db.create_collective("recall-guard").unwrap();
+
+        // Build the fixture. Identical importance + empty applications keeps the
+        // energy term constant across all records, so the blended-score ranking
+        // is monotonic in cosine similarity (the in-test oracle is then exact).
+        let mut embeddings: Vec<(ExperienceId, Vec<f32>)> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let embedding = guard_embedding(i);
+            let id = db
+                .record_experience(NewExperience {
+                    collective_id,
+                    content: format!("recall-guard experience {i}"),
+                    importance: 0.5,
+                    embedding: Some(embedding.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+            embeddings.push((id, embedding));
+        }
+
+        // Average recall@K over Q distinct fixed-seed queries. Each query seed is
+        // disjoint from the fixture seeds (0..N) so no query coincides with a
+        // stored vector (a realistic tail). The mean over Q queries is the stable,
+        // continuous metric that replaces the flaky single-query measurement.
+        let mut recall_sum = 0.0f64;
+        for q in 0..Q {
+            let query = guard_embedding(N + 1 + q);
+
+            // Ground truth: top-K experience ids by exhaustive cosine over EVERY
+            // fixture vector. With constant energy this equals the top-K by the
+            // engine's blended score.
+            let mut ranked: Vec<(ExperienceId, f32)> = embeddings
+                .iter()
+                .map(|(id, emb)| (*id, cosine(&query, emb)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            let truth_top_k: std::collections::HashSet<ExperienceId> =
+                ranked.iter().take(K).map(|(id, _)| *id).collect();
+
+            // Engine result via the energy-weighted HNSW path (beta > 0).
+            let results = db
+                .search(
+                    collective_id,
+                    &query,
+                    SearchOptions {
+                        k: K,
+                        filter: SearchFilter::default(),
+                        weights: Some(RecallWeights::new(0.5, 0.5)),
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(
+                results.len(),
+                K,
+                "HNSW path returned {} of {K} requested results (N={N}, query {q})",
+                results.len()
+            );
+
+            let hits = results
+                .iter()
+                .filter(|r| truth_top_k.contains(&r.experience.id))
+                .count();
+            recall_sum += hits as f64 / K as f64;
+        }
+
+        let mean_recall = (recall_sum / Q as f64) as f32;
+
+        // Visible under `cargo test -- --nocapture` for characterization runs.
+        println!(
+            "NFR-018 recall guard: mean recall@{K} = {mean_recall:.4} over Q={Q} queries at N={N} \
+             (floor {recall_floor})"
+        );
+
+        assert!(
+            mean_recall >= recall_floor,
+            "NFR-018 recall guard: mean recall@{K} = {mean_recall:.4} over Q={Q} queries is below \
+             the {recall_floor} floor at N={N} on the approximate HNSW path — a latency win must \
+             never be bought with a recall regression below this floor (C3: escalate/defer, not \
+             accept)."
+        );
+    }
 }
