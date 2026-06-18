@@ -1137,6 +1137,24 @@ impl PulseDB {
     /// the whole scan (scalar `experience_energy` per candidate), mirroring
     /// [`energy()`](Self::energy) — never a per-item `self.energy(id)` re-resolve.
     ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("cold.db"), pulsedb::Config::default())?;
+    /// let collective = db.create_collective("my-project")?;
+    ///
+    /// // Surface up to 100 prune-eligible candidates with energy < 0.05,
+    /// // coldest-first. Returns lightweight (ExperienceId, energy) pairs —
+    /// // not full Experience records. Read-only: nothing is archived.
+    /// for (id, energy) in db.list_cold_experiences(collective, 0.05, 100)? {
+    ///     println!("cold candidate {id} @ energy {energy}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Arguments
     ///
     /// * `collective_id` - The collective to scan.

@@ -76,6 +76,7 @@ pulsehive-db = { version = "0.3", features = ["sync-http"] }
 ## Features
 
 - **Experience storage** — Record, retrieve, update, archive, and delete agent experiences with full CRUD operations
+- **Temporal lifecycle** — Experiences accrue/decay energy over time; `list_cold_experiences()` surfaces coldest-first prune-eligible candidates for human/agent-triggered review (read-only — auto-archive is OFF by default)
 - **Vector search** — HNSW approximate nearest neighbor search for semantic similarity (384-dimensional embeddings by default)
 - **Knowledge graph** — Typed relations between experiences (Supports, Contradicts, Elaborates, Supersedes, Implies, RelatedTo)
 - **Real-time watch** — In-process notification streams via crossbeam channels and cross-process change detection via WAL sequence tracking
@@ -183,6 +184,20 @@ A **collective** is an isolated namespace for experiences, typically one per pro
 ### Experience
 
 An **experience** is a unit of learned knowledge. It contains content (text), an embedding (vector), importance and confidence scores, domain tags, and a typed variant — `TechInsight`, `ErrorPattern`, `SuccessPattern`, `ArchitecturalDecision`, and more.
+
+### Temporal lifecycle
+
+Each experience has a temporal **energy** that decays when unused and is reinforced on access. `list_cold_experiences()` surfaces prune-eligible candidates (energy below a threshold, not yet archived), coldest-first, as lightweight `(id, energy)` pairs for a human/agent to review:
+
+```rust
+let collective = db.create_collective("my-project")?;
+// Surface up to 100 candidates with energy < 0.05, coldest-first (read-only):
+for (id, energy) in db.list_cold_experiences(collective, 0.05, 100)? {
+    println!("cold candidate {id} @ energy {energy}");
+}
+```
+
+It is a **read-only review tool** — it never archives anything. Auto-archive is **OFF by default** (`auto_archive_below_floor` is inert; no automatic prune trigger is wired).
 
 ## Minimum Supported Rust Version
 
