@@ -58,9 +58,16 @@ pub(crate) fn rerank(scored: Vec<(SearchResult, f32)>, k: usize) -> Vec<SearchRe
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+
     use super::*;
+    use crate::config::{Config, DecayConfig};
     use crate::experience::{Experience, ExperienceType};
-    use crate::types::{AgentId, CollectiveId, ExperienceId, Timestamp};
+    use crate::search::{SearchFilter, SearchOptions};
+    use crate::types::{AgentId, CollectiveId, ExperienceId, InstanceId, Timestamp};
+    use crate::PulseDB;
 
     fn make_result(content: &str, similarity: f32) -> SearchResult {
         let timestamp = Timestamp::now();
@@ -84,6 +91,296 @@ mod tests {
             },
             similarity,
         }
+    }
+
+    fn embedding_with_query_cosine(cosine: f32) -> Vec<f32> {
+        let mut embedding = vec![0.0; 384];
+        embedding[0] = cosine;
+        embedding[1] = (1.0 - cosine.powi(2)).sqrt();
+        embedding
+    }
+
+    fn recall_default(weights: RecallWeights) -> DecayConfig {
+        DecayConfig {
+            default_recall_weights: Some(weights),
+            ..Config::default().decay
+        }
+    }
+
+    fn min_importance_filter() -> SearchFilter {
+        SearchFilter {
+            min_importance: Some(0.2),
+            ..SearchFilter::default()
+        }
+    }
+
+    fn compare_legacy_results(left: &[SearchResult], right: &[SearchResult]) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert_eq!(left.experience.id, right.experience.id);
+            assert_eq!(left.similarity, right.similarity);
+        }
+    }
+
+    fn open_search_fixture(name: &str) -> (tempfile::TempDir, PulseDB, CollectiveId) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = PulseDB::open(dir.path().join(format!("{name}.db")), Config::default()).unwrap();
+        let collective_id = db.create_collective(name).unwrap();
+        (dir, db, collective_id)
+    }
+
+    fn insert_similarity_fixture(db: &PulseDB, collective_id: CollectiveId, similarities: &[f32]) {
+        let now = Timestamp::now();
+        for (index, similarity) in similarities.iter().copied().enumerate() {
+            db.insert_experience_backdated(
+                collective_id,
+                &format!("fixture-{index}"),
+                embedding_with_query_cosine(similarity),
+                0.5,
+                BTreeMap::new(),
+                now,
+            )
+            .unwrap();
+        }
+    }
+
+    fn search_with(
+        db: &PulseDB,
+        collective_id: CollectiveId,
+        weights: Option<RecallWeights>,
+        filter: SearchFilter,
+        k: usize,
+    ) -> Vec<SearchResult> {
+        db.search(
+            collective_id,
+            &embedding_with_query_cosine(1.0),
+            SearchOptions { k, filter, weights },
+        )
+        .unwrap()
+    }
+
+    fn legacy_search(
+        db: &PulseDB,
+        collective_id: CollectiveId,
+        filter: SearchFilter,
+        k: usize,
+    ) -> Vec<SearchResult> {
+        db.search_similar_filtered(collective_id, &embedding_with_query_cosine(1.0), k, filter)
+            .unwrap()
+    }
+
+    fn insert_pinned_stale_fresh_pair(
+        db: &PulseDB,
+        collective_id: CollectiveId,
+    ) -> (ExperienceId, ExperienceId) {
+        let now = Timestamp::now();
+        let stale_last_reinforced =
+            Timestamp::from_millis(now.as_millis() - 365 * 24 * 60 * 60 * 1000);
+        let applications = BTreeMap::from([(InstanceId::new(), 1)]);
+
+        let stale_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "A stale-but-similar",
+                embedding_with_query_cosine(0.90),
+                0.9,
+                applications.clone(),
+                stale_last_reinforced,
+            )
+            .unwrap();
+        let fresh_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "B fresh-reinforced",
+                embedding_with_query_cosine(0.70),
+                0.7,
+                applications,
+                now,
+            )
+            .unwrap();
+
+        (stale_id, fresh_id)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(12))]
+
+        #[test]
+        fn beta_zero_request_matches_legacy_despite_weighted_collective_default(
+            similarities in prop::collection::vec(0.25f32..0.98, 3..10),
+        ) {
+            let (_dir, db, collective_id) = open_search_fixture("beta-zero-request");
+            insert_similarity_fixture(&db, collective_id, &similarities);
+            db.set_decay_config_for_test(
+                collective_id,
+                recall_default(RecallWeights::new(0.6, 0.4)),
+            )
+            .unwrap();
+
+            for filter in [SearchFilter::default(), min_importance_filter()] {
+                let legacy = legacy_search(&db, collective_id, filter.clone(), similarities.len());
+                let weighted = search_with(
+                    &db,
+                    collective_id,
+                    Some(RecallWeights::new(1.0, 0.0)),
+                    filter,
+                    similarities.len(),
+                );
+                compare_legacy_results(&weighted, &legacy);
+            }
+        }
+
+        #[test]
+        fn absent_weights_without_collective_default_match_legacy(
+            similarities in prop::collection::vec(0.25f32..0.98, 3..10),
+        ) {
+            let (_dir, db, collective_id) = open_search_fixture("absent-weights");
+            insert_similarity_fixture(&db, collective_id, &similarities);
+
+            for filter in [SearchFilter::default(), min_importance_filter()] {
+                let legacy = legacy_search(&db, collective_id, filter.clone(), similarities.len());
+                let weighted = search_with(&db, collective_id, None, filter, similarities.len());
+                compare_legacy_results(&weighted, &legacy);
+            }
+        }
+    }
+
+    #[test]
+    fn absent_request_uses_collective_default_and_diverges_from_legacy() {
+        let (_dir, db, collective_id) = open_search_fixture("resolved-default-diverges");
+        let (stale_id, fresh_id) = insert_pinned_stale_fresh_pair(&db, collective_id);
+        db.set_decay_config_for_test(collective_id, recall_default(RecallWeights::new(0.6, 0.4)))
+            .unwrap();
+
+        let legacy = legacy_search(&db, collective_id, SearchFilter::default(), 2);
+        let weighted = search_with(&db, collective_id, None, SearchFilter::default(), 2);
+
+        assert_eq!(legacy[0].experience.id, stale_id);
+        assert_eq!(weighted[0].experience.id, fresh_id);
+        assert_ne!(
+            legacy
+                .iter()
+                .map(|result| result.experience.id)
+                .collect::<Vec<_>>(),
+            weighted
+                .iter()
+                .map(|result| result.experience.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pinned_stale_fresh_fixture_flips_only_when_energy_weighted() {
+        let (_dir, db, collective_id) = open_search_fixture("pinned-stale-fresh");
+        let (stale_id, fresh_id) = insert_pinned_stale_fresh_pair(&db, collective_id);
+
+        let legacy_none = search_with(&db, collective_id, None, SearchFilter::default(), 2);
+        let legacy_explicit = search_with(
+            &db,
+            collective_id,
+            Some(RecallWeights::new(1.0, 0.0)),
+            SearchFilter::default(),
+            2,
+        );
+
+        db.set_decay_config_for_test(collective_id, recall_default(RecallWeights::new(0.7, 0.3)))
+            .unwrap();
+        let default_weighted = search_with(&db, collective_id, None, SearchFilter::default(), 2);
+        let headline_weighted = search_with(
+            &db,
+            collective_id,
+            Some(RecallWeights::new(0.5, 0.5)),
+            SearchFilter::default(),
+            2,
+        );
+
+        assert_eq!(legacy_none[0].experience.id, stale_id);
+        assert_eq!(legacy_none[1].experience.id, fresh_id);
+        assert_eq!(legacy_explicit[0].experience.id, stale_id);
+        assert_eq!(legacy_explicit[1].experience.id, fresh_id);
+        assert_eq!(default_weighted[0].experience.id, fresh_id);
+        assert_eq!(default_weighted[1].experience.id, stale_id);
+        assert_eq!(headline_weighted[0].experience.id, fresh_id);
+        assert_eq!(headline_weighted[1].experience.id, stale_id);
+        assert!((headline_weighted[0].similarity - 0.70).abs() < 0.001);
+        assert!((headline_weighted[1].similarity - 0.90).abs() < 0.001);
+    }
+
+    #[test]
+    fn energy_scenario_captures_decay_and_reinforcement_boost() {
+        let (_dir, db, collective_id) = open_search_fixture("energy-scenario");
+        let now = Timestamp::now();
+        let stale_last_reinforced =
+            Timestamp::from_millis(now.as_millis() - 365 * 24 * 60 * 60 * 1000);
+
+        let stale_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "fully decayed memory",
+                embedding_with_query_cosine(0.90),
+                0.9,
+                BTreeMap::from([(InstanceId::new(), 1)]),
+                stale_last_reinforced,
+            )
+            .unwrap();
+        let fresh_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "fresh reinforced memory",
+                embedding_with_query_cosine(0.70),
+                0.7,
+                BTreeMap::from([(InstanceId::new(), 1)]),
+                now,
+            )
+            .unwrap();
+
+        let stale_energy = db.energy(stale_id).unwrap();
+        let fresh_reinforced_energy = db.energy(fresh_id).unwrap();
+
+        assert!(stale_energy < 0.001);
+        assert!(fresh_reinforced_energy > 0.82);
+        assert!(fresh_reinforced_energy > 0.7);
+    }
+
+    #[test]
+    fn archived_experiences_stay_excluded_under_energy_weighting() {
+        let (_dir, db, collective_id) = open_search_fixture("archived-weighted");
+        let now = Timestamp::now();
+        let archived_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "archived high-signal memory",
+                embedding_with_query_cosine(0.99),
+                1.0,
+                BTreeMap::from([(InstanceId::new(), 100)]),
+                now,
+            )
+            .unwrap();
+        let active_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "active lower-signal memory",
+                embedding_with_query_cosine(0.75),
+                0.5,
+                BTreeMap::new(),
+                now,
+            )
+            .unwrap();
+        db.archive_experience(archived_id).unwrap();
+
+        let weighted = search_with(
+            &db,
+            collective_id,
+            Some(RecallWeights::new(0.5, 0.5)),
+            SearchFilter::default(),
+            2,
+        );
+
+        assert_eq!(weighted.len(), 1);
+        assert_eq!(weighted[0].experience.id, active_id);
+        assert!(!weighted
+            .iter()
+            .any(|result| result.experience.id == archived_id));
     }
 
     #[test]
