@@ -2331,6 +2331,16 @@ impl PulseDB {
         Ok(id)
     }
 
+    /// Stores a collective decay config fixture for tests.
+    #[cfg(test)]
+    pub(crate) fn set_decay_config_for_test(
+        &self,
+        collective_id: CollectiveId,
+        config: DecayConfig,
+    ) -> Result<()> {
+        self.storage.set_decay_config(collective_id, config)
+    }
+
     // =========================================================================
     // Watch System (E4-S01)
     // =========================================================================
