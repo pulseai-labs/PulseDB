@@ -1108,6 +1108,124 @@ impl PulseDB {
         ))
     }
 
+    /// Surfaces prune-eligible cold experiences in a collective, coldest-first.
+    ///
+    /// Returns lightweight `(ExperienceId, energy)` pairs — **never** full
+    /// [`Experience`] records — for every experience whose current temporal
+    /// energy is `< below` **and** that is **not already archived**
+    /// (`energy < below && !archived`). Results are sorted ascending by energy
+    /// (coldest first) and truncated to `limit`.
+    ///
+    /// This is a **human-triggered review tool**, not an automatic actuator: it
+    /// merely *surfaces* candidates a consumer may choose to archive/prune. It
+    /// **does not archive** anything and never mutates storage — the
+    /// `auto_archive_below_floor` flag is inert and read by no actuator.
+    ///
+    /// # Archived exclusion
+    ///
+    /// Already-archived experiences are excluded even when their energy is
+    /// `< below`: re-listing them is noise that would double-count a consumer's
+    /// prune loop. Only *cold AND not-yet-archived* experiences are returned.
+    ///
+    /// # Performance
+    ///
+    /// This is a **deliberate `O(n)` single-pass full-collective scan** (enumerate
+    /// all experience IDs → load each → compute scalar energy → filter). There is
+    /// **no energy index**; the scan is acceptable precisely because this is a
+    /// human-triggered review tool invoked rarely, not a hot query path. The
+    /// `DecayConfig` is resolved once and `Timestamp::now()` is captured once for
+    /// the whole scan (scalar `experience_energy` per candidate), mirroring
+    /// [`energy()`](Self::energy) — never a per-item `self.energy(id)` re-resolve.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to scan.
+    /// * `below` - Energy threshold in `[0.0, 1.0]`; experiences with current
+    ///   energy strictly below this are surfaced.
+    /// * `limit` - Maximum number of pairs to return (1-1000).
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if `limit` is 0 or > 1000, or if
+    ///   `below` is NaN or outside `[0.0, 1.0]`.
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist.
+    #[instrument(skip(self))]
+    pub fn list_cold_experiences(
+        &self,
+        collective_id: CollectiveId,
+        below: f32,
+        limit: usize,
+    ) -> Result<Vec<(ExperienceId, f32)>> {
+        // Validate limit (mirror get_recent_experiences_filtered).
+        if limit == 0 || limit > 1000 {
+            return Err(
+                ValidationError::invalid_field("limit", "must be between 1 and 1000").into(),
+            );
+        }
+
+        // Validate threshold: reject NaN and out-of-range.
+        if below.is_nan() || !(0.0..=1.0).contains(&below) {
+            return Err(
+                ValidationError::invalid_field("below", "must be between 0.0 and 1.0").into(),
+            );
+        }
+
+        // Verify collective exists.
+        self.storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        // Resolve decay config ONCE and capture `now` ONCE for the whole scan
+        // (hot-path rule: never re-resolve per item via self.energy(id)).
+        let decay_config = self
+            .storage
+            .get_decay_config(collective_id)?
+            .unwrap_or_else(|| self.config.decay.clone());
+        let now = Timestamp::now();
+
+        // O(n) single-pass full-collective scan: page through all experience IDs,
+        // load each, compute scalar energy, keep `energy < below && !archived`.
+        let mut cold: Vec<(ExperienceId, f32)> = Vec::new();
+        let page = 1000usize;
+        let mut offset = 0usize;
+        loop {
+            let ids = self
+                .storage
+                .list_experience_ids_paginated(collective_id, page, offset)?;
+            if ids.is_empty() {
+                break;
+            }
+            let fetched = ids.len();
+            for id in ids {
+                let Some(experience) = self.storage.get_experience(id)? else {
+                    continue;
+                };
+                if experience.archived {
+                    continue;
+                }
+                let energy = experience_energy(
+                    experience.importance,
+                    experience.applications(),
+                    experience.last_reinforced,
+                    now,
+                    &decay_config,
+                );
+                if energy < below {
+                    cold.push((id, energy));
+                }
+            }
+            if fetched < page {
+                break;
+            }
+            offset += fetched;
+        }
+
+        // Coldest-first (ascending energy), then truncate to limit.
+        cold.sort_by(|a, b| a.1.total_cmp(&b.1));
+        cold.truncate(limit);
+        Ok(cold)
+    }
+
     // =========================================================================
     // Recent Experiences
     // =========================================================================
@@ -2846,5 +2964,233 @@ mod tests {
     fn test_pulsedb_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PulseDB>();
+    }
+
+    // =========================================================================
+    // list_cold_experiences — conservative-lifecycle surfacing (VS-3.5.3 / FR-034)
+    // =========================================================================
+
+    /// A 384-d embedding fixture (dimension must match the default D384 index).
+    fn cold_test_embedding() -> Vec<f32> {
+        let mut embedding = vec![0.0f32; 384];
+        embedding[0] = 1.0;
+        embedding
+    }
+
+    /// Backdates `last_reinforced` by `days` so the fixture decays well below
+    /// the default `floor` (0.05) under a 30-day half-life.
+    fn days_ago(days: i64) -> Timestamp {
+        Timestamp::from_millis(Timestamp::now().as_millis() - days * 24 * 60 * 60 * 1000)
+    }
+
+    /// Opens a default-config db with a single collective.
+    fn open_cold_fixture(name: &str) -> (tempfile::TempDir, PulseDB, CollectiveId) {
+        let dir = tempdir().unwrap();
+        let db = PulseDB::open(dir.path().join(format!("{name}.db")), Config::default()).unwrap();
+        let collective_id = db.create_collective(name).unwrap();
+        (dir, db, collective_id)
+    }
+
+    #[test]
+    fn list_cold_experiences_surfaces_below_floor() {
+        let (_dir, db, collective_id) = open_cold_fixture("cold-surfaces");
+        let floor = Config::default().decay.floor; // 0.05
+
+        // A cold experience: importance 0.9 last reinforced ~365 days ago decays
+        // far below the 0.05 floor under the default 30-day half-life.
+        let cold_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold memory",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+
+        // A warm experience: importance 0.9 reinforced now stays at ~0.9 (> floor).
+        let warm_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "warm memory",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                Timestamp::now(),
+            )
+            .unwrap();
+
+        let cold = db
+            .list_cold_experiences(collective_id, floor, 100)
+            .unwrap();
+
+        // Only the cold experience is surfaced, with its energy reported.
+        assert_eq!(cold.len(), 1, "exactly one experience is below the floor");
+        assert_eq!(cold[0].0, cold_id, "the cold experience is surfaced");
+        assert!(
+            cold[0].1 < floor,
+            "reported energy {} is below floor {floor}",
+            cold[0].1
+        );
+        assert!(
+            !cold.iter().any(|(id, _)| *id == warm_id),
+            "the warm experience is not surfaced"
+        );
+
+        // Coldest-first ordering: add a second, even-colder experience and assert
+        // the result is sorted ascending by energy.
+        let colder_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "even colder memory",
+                cold_test_embedding(),
+                0.1,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+        let cold = db
+            .list_cold_experiences(collective_id, floor, 100)
+            .unwrap();
+        assert_eq!(cold.len(), 2, "both cold experiences are surfaced");
+        assert!(
+            cold[0].1 <= cold[1].1,
+            "results are coldest-first (ascending energy): {:?}",
+            cold
+        );
+        assert_eq!(cold[0].0, colder_id, "the coldest experience comes first");
+
+        // limit/below validation: limit 0 and out-of-range `below` are rejected.
+        assert!(db.list_cold_experiences(collective_id, floor, 0).is_err());
+        assert!(db.list_cold_experiences(collective_id, 1.5, 100).is_err());
+        assert!(db
+            .list_cold_experiences(collective_id, f32::NAN, 100)
+            .is_err());
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn cold_experience_not_auto_archived_by_default() {
+        // D3 invariant: under DEFAULT config, recording → searching → listing a
+        // cold experience NEVER flips `archived` — auto_archive_below_floor is
+        // inert (read by no actuator).
+        let (_dir, db, collective_id) = open_cold_fixture("auto-archive-off");
+        let floor = Config::default().decay.floor;
+
+        let cold_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold-but-not-archived",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+
+        // Freshly recorded: archived must be false.
+        assert!(
+            !db.storage
+                .get_experience(cold_id)
+                .unwrap()
+                .unwrap()
+                .archived,
+            "archived is false immediately after record"
+        );
+
+        // search: a query touching the collective must not flip archived.
+        let _ = db
+            .search_similar(collective_id, &cold_test_embedding(), 10)
+            .unwrap();
+        assert!(
+            !db.storage
+                .get_experience(cold_id)
+                .unwrap()
+                .unwrap()
+                .archived,
+            "archived is false after search"
+        );
+
+        // list_cold_experiences surfaces it but must NOT archive it.
+        let cold = db
+            .list_cold_experiences(collective_id, floor, 100)
+            .unwrap();
+        assert!(
+            cold.iter().any(|(id, _)| *id == cold_id),
+            "the cold experience is surfaced"
+        );
+        assert!(
+            !db.storage
+                .get_experience(cold_id)
+                .unwrap()
+                .unwrap()
+                .archived,
+            "archived is STILL false after list_cold_experiences (no auto-archive)"
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn list_cold_excludes_archived_experiences() {
+        // C5: an experience that is cold (E < below) AND already archived is
+        // EXCLUDED from the result (prune-eligible = cold and not yet archived).
+        let (_dir, db, collective_id) = open_cold_fixture("cold-excludes-archived");
+        let floor = Config::default().decay.floor;
+
+        // Two genuinely-cold experiences (both would match E < below).
+        let surfaced_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold not archived",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+        let archived_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold already archived",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+
+        // Non-vacuity guard: confirm BOTH are below the floor BEFORE archiving —
+        // so the exclusion below is genuinely the !archived filter at work, not a
+        // side-effect of the archived experience being warm.
+        let before = db
+            .list_cold_experiences(collective_id, floor, 100)
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "both cold experiences match E < below before archiving"
+        );
+
+        // Archive one of them — it now matches E < below but is archived.
+        db.archive_experience(archived_id).unwrap();
+
+        let after = db
+            .list_cold_experiences(collective_id, floor, 100)
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "the archived cold experience is excluded by the !archived filter"
+        );
+        assert_eq!(after[0].0, surfaced_id, "only the non-archived cold exp remains");
+        assert!(
+            !after.iter().any(|(id, _)| *id == archived_id),
+            "the archived cold experience does NOT appear"
+        );
+
+        db.close().unwrap();
     }
 }
