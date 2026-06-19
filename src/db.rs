@@ -3039,9 +3039,7 @@ mod tests {
             )
             .unwrap();
 
-        let cold = db
-            .list_cold_experiences(collective_id, floor, 100)
-            .unwrap();
+        let cold = db.list_cold_experiences(collective_id, floor, 100).unwrap();
 
         // Only the cold experience is surfaced, with its energy reported.
         assert_eq!(cold.len(), 1, "exactly one experience is below the floor");
@@ -3068,9 +3066,7 @@ mod tests {
                 days_ago(365),
             )
             .unwrap();
-        let cold = db
-            .list_cold_experiences(collective_id, floor, 100)
-            .unwrap();
+        let cold = db.list_cold_experiences(collective_id, floor, 100).unwrap();
         assert_eq!(cold.len(), 2, "both cold experiences are surfaced");
         assert!(
             cold[0].1 <= cold[1].1,
@@ -3132,9 +3128,7 @@ mod tests {
         );
 
         // list_cold_experiences surfaces it but must NOT archive it.
-        let cold = db
-            .list_cold_experiences(collective_id, floor, 100)
-            .unwrap();
+        let cold = db.list_cold_experiences(collective_id, floor, 100).unwrap();
         assert!(
             cold.iter().any(|(id, _)| *id == cold_id),
             "the cold experience is surfaced"
@@ -3183,9 +3177,7 @@ mod tests {
         // Non-vacuity guard: confirm BOTH are below the floor BEFORE archiving —
         // so the exclusion below is genuinely the !archived filter at work, not a
         // side-effect of the archived experience being warm.
-        let before = db
-            .list_cold_experiences(collective_id, floor, 100)
-            .unwrap();
+        let before = db.list_cold_experiences(collective_id, floor, 100).unwrap();
         assert_eq!(
             before.len(),
             2,
@@ -3195,15 +3187,16 @@ mod tests {
         // Archive one of them — it now matches E < below but is archived.
         db.archive_experience(archived_id).unwrap();
 
-        let after = db
-            .list_cold_experiences(collective_id, floor, 100)
-            .unwrap();
+        let after = db.list_cold_experiences(collective_id, floor, 100).unwrap();
         assert_eq!(
             after.len(),
             1,
             "the archived cold experience is excluded by the !archived filter"
         );
-        assert_eq!(after[0].0, surfaced_id, "only the non-archived cold exp remains");
+        assert_eq!(
+            after[0].0, surfaced_id,
+            "only the non-archived cold exp remains"
+        );
         assert!(
             !after.iter().any(|(id, _)| *id == archived_id),
             "the archived cold experience does NOT appear"

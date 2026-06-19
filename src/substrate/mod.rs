@@ -377,7 +377,8 @@ mod tests {
 
         let err = result.expect_err("default list_cold_experiences must return an Err");
         assert!(
-            err.to_string().contains("not supported by this implementation"),
+            err.to_string()
+                .contains("not supported by this implementation"),
             "expected unsupported-operation error, got: {err}"
         );
     }

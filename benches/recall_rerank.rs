@@ -380,7 +380,11 @@ fn search_1m_p99_manual(c: &mut Criterion) {
         "NFR-018 1M latency summary: N={n} (measured{}) warmup={warmup} samples={samples} \
          P50={p50:.3}ms P95={p95:.3}ms P99={p99:.3}ms max={max:.3}ms \
          | build_wall={:?} open_cost={open_cost:?} query_dist=random-fixed-seed",
-        if n == 1_000_000 { "" } else { ", FALLBACK<1M — linear extrapolation to 1M is a caveat, not measured" },
+        if n == 1_000_000 {
+            ""
+        } else {
+            ", FALLBACK<1M — linear extrapolation to 1M is a caveat, not measured"
+        },
         build_wall.unwrap_or(Duration::ZERO),
     );
 
