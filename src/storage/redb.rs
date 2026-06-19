@@ -325,9 +325,19 @@ impl RedbStorage {
             return Err(PulseDBError::ReadOnly);
         }
 
-        if needs_v3_migration {
+        // The pre-v3 backup is a plain file copy of the on-disk database. On
+        // Windows the live redb handle holds an OS file lock, so `fs::copy` fails
+        // with a lock violation (error 33) while `db` is open. Drop the handle to
+        // release the lock, copy, then re-open. Only runs on the one-time v3
+        // migration path; `db` has had read-only access (metadata read) up to here,
+        // so dropping and reopening loses no state.
+        let db = if needs_v3_migration {
+            drop(db);
             std::fs::copy(&path, pre_v3_backup_path(&path)).map_err(PulseDBError::Io)?;
-        }
+            Self::create_database(&path, config)?
+        } else {
+            db
+        };
 
         // Update last_opened_at timestamp and bump schema version if migrating.
         let mut metadata = metadata;
