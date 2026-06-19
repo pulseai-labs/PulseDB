@@ -247,23 +247,19 @@ pub(crate) fn validate_experience_update(update: &ExperienceUpdate) -> Result<()
 /// Rust's type system enforces.
 fn validate_experience_type(et: &ExperienceType) -> Result<(), PulseDBError> {
     match et {
-        ExperienceType::SuccessPattern { quality, .. } => {
-            if !(0.0..=1.0).contains(quality) {
-                return Err(ValidationError::invalid_field(
-                    "experience_type.quality",
-                    format!("must be between 0.0 and 1.0, got {}", quality),
-                )
-                .into());
-            }
+        ExperienceType::SuccessPattern { quality, .. } if !(0.0..=1.0).contains(quality) => {
+            return Err(ValidationError::invalid_field(
+                "experience_type.quality",
+                format!("must be between 0.0 and 1.0, got {}", quality),
+            )
+            .into());
         }
-        ExperienceType::UserPreference { strength, .. } => {
-            if !(0.0..=1.0).contains(strength) {
-                return Err(ValidationError::invalid_field(
-                    "experience_type.strength",
-                    format!("must be between 0.0 and 1.0, got {}", strength),
-                )
-                .into());
-            }
+        ExperienceType::UserPreference { strength, .. } if !(0.0..=1.0).contains(strength) => {
+            return Err(ValidationError::invalid_field(
+                "experience_type.strength",
+                format!("must be between 0.0 and 1.0, got {}", strength),
+            )
+            .into());
         }
         _ => {}
     }

@@ -1465,22 +1465,28 @@ impl PulseDB {
         query: &[f32],
         options: SearchOptions,
     ) -> Result<Vec<SearchResult>> {
-        let stored_decay_config = self.storage.get_decay_config(collective_id)?;
-        let collective_default = stored_decay_config
-            .as_ref()
-            .and_then(|config| config.default_recall_weights)
-            .filter(
-                |weights| match weights.validate("decay.default_recall_weights") {
+        // Effective per-collective decay config: a stored per-collective override
+        // wins; otherwise fall back to the global `Config.decay` — matching the
+        // record/energy reads elsewhere. This also honors the documented global
+        // `Config.decay.default_recall_weights` for collectives with no stored
+        // override (PR #23 review; precedence stored > global > none, relates to #16).
+        let decay_config = self
+            .storage
+            .get_decay_config(collective_id)?
+            .unwrap_or_else(|| self.config.decay.clone());
+        let collective_default =
+            decay_config.default_recall_weights.filter(|weights| {
+                match weights.validate("decay.default_recall_weights") {
                     Ok(()) => true,
                     Err(error) => {
                         warn!(
                             ?error,
-                            "ignoring invalid stored default_recall_weights from issue #14"
+                            "ignoring invalid default_recall_weights (issue #14)"
                         );
                         false
                     }
-                },
-            );
+                }
+            });
 
         let effective = resolve_recall_weights(options.weights, collective_default)?;
         if is_legacy_recall(effective) {
@@ -1494,7 +1500,7 @@ impl PulseDB {
             options.k,
             options.filter,
             weights,
-            stored_decay_config,
+            decay_config,
         )
     }
 
@@ -1505,7 +1511,7 @@ impl PulseDB {
         k: usize,
         filter: SearchFilter,
         weights: RecallWeights,
-        stored_decay_config: Option<DecayConfig>,
+        decay_config: DecayConfig,
     ) -> Result<Vec<SearchResult>> {
         if k == 0 || k > 1000 {
             return Err(ValidationError::invalid_field("k", "must be between 1 and 1000").into());
@@ -1523,7 +1529,6 @@ impl PulseDB {
 
         let over_fetch = std::cmp::max(k.saturating_mul(4), k.saturating_add(16)).min(2000);
         let ef_search = self.config.hnsw.ef_search.max(over_fetch);
-        let decay_config = stored_decay_config.unwrap_or_else(|| self.config.decay.clone());
         let now = Timestamp::now();
 
         let candidates = self
@@ -2251,7 +2256,7 @@ impl PulseDB {
             .collect();
 
         // Sort by last_heartbeat descending (most recently active first)
-        active.sort_by(|a, b| b.last_heartbeat.cmp(&a.last_heartbeat));
+        active.sort_by_key(|a| std::cmp::Reverse(a.last_heartbeat));
 
         Ok(active)
     }

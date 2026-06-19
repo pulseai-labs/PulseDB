@@ -307,6 +307,34 @@ mod tests {
     }
 
     #[test]
+    fn global_config_default_recall_weights_apply_without_stored_override() {
+        // PR #23 review (relates to #16): a globally-configured
+        // `Config.decay.default_recall_weights` must drive ranking for collectives
+        // that have NO per-collective stored DecayConfig override. Otherwise the
+        // documented global default silently no-ops to the legacy similarity path.
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            decay: DecayConfig {
+                default_recall_weights: Some(RecallWeights::new(0.7, 0.3)),
+                ..Config::default().decay
+            },
+            ..Config::default()
+        };
+        let db = PulseDB::open(dir.path().join("global-default.db"), config).unwrap();
+        let collective_id = db.create_collective("global-default").unwrap();
+        let (stale_id, fresh_id) = insert_pinned_stale_fresh_pair(&db, collective_id);
+
+        // No set_decay_config_for_test: the global config is the only weight source.
+        let weighted = search_with(&db, collective_id, None, SearchFilter::default(), 2);
+
+        assert_eq!(
+            weighted[0].experience.id, fresh_id,
+            "global default recall weights must rank the fresh/high-energy experience first"
+        );
+        assert_eq!(weighted[1].experience.id, stale_id);
+    }
+
+    #[test]
     fn energy_scenario_captures_decay_and_reinforcement_boost() {
         let (_dir, db, collective_id) = open_search_fixture("energy-scenario");
         let now = Timestamp::now();
