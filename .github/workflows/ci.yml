@@ -204,6 +204,15 @@ jobs:
           key: criterion-baseline-main
 
       - name: Run benchmarks
+        # The NFR-018 1M P99 bench is a local/manual source-of-truth: it builds a
+        # persisted, seed-stamped ~4 GB fixture once (~76 min) and reuses it (D5).
+        # CI has no persisted fixture, so running it at the literal default N=1M
+        # would rebuild a 4 GB fixture every run. Cap the fixture size on CI so the
+        # bench is a fast smoke; the literal-1M P99 gate is measured locally (#19).
+        env:
+          NFR018_N: "2000"
+          NFR018_WARMUP: "20"
+          NFR018_SAMPLES: "200"
         run: cargo bench
 
       # Compare against baseline and report regressions (PRs only, advisory)
