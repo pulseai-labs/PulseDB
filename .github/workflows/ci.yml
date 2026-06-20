@@ -157,7 +157,7 @@ jobs:
         run: cargo tarpaulin --fail-under 80 --out xml --out html
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: |
@@ -217,7 +217,7 @@ jobs:
       # Restore baseline from main branch (PRs only)
       - name: Restore baseline
         if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: target/criterion-baseline/
           key: criterion-baseline-main
@@ -254,13 +254,13 @@ jobs:
 
       - name: Cache baseline
         if: github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: target/criterion-baseline/
           key: criterion-baseline-main
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
           path: target/criterion/

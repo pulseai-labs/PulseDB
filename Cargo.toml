@@ -70,7 +70,7 @@ tokio = { version = "1", features = ["rt"] }
 ort = { version = "2.0.0-rc.9", optional = true, features = ["ndarray"] }
 
 # Optional: HuggingFace tokenizer for text preprocessing (WordPiece, BPE)
-tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
 
 # Optional: N-dimensional arrays for ONNX tensor construction (must match ort's ndarray version)
 ndarray = { version = "0.17", optional = true }
