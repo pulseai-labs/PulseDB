@@ -4,8 +4,13 @@
 
 [advisories]
 version = 2
-# RustSec advisory DB. Fail on vulnerabilities; add IDs here to consciously ignore.
-ignore = []
+# RustSec advisory DB. Fails on vulnerabilities; IDs below are consciously ignored.
+ignore = [
+  # bincode 1.x is unmaintained (RUSTSEC-2025-0141). PulseDB pins bincode 1.3 for
+  # on-disk serialization; migrating to bincode 2.x is a tracked follow-up, not a
+  # vulnerability. cargo-audit treats this as a warning; cargo-deny errors on it.
+  "RUSTSEC-2025-0141",
+]
 
 [bans]
 multiple-versions = "warn"

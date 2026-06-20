@@ -182,22 +182,9 @@ jobs:
         run: cargo audit
 
   # ─────────────────────────────────────────────
-  # Job 5b: Secret scan (gitleaks)
-  # ─────────────────────────────────────────────
-  gitleaks:
-    name: Secret Scan (gitleaks)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ─────────────────────────────────────────────
-  # Job 5c: Dependency policy (cargo-deny)
+  # Job 5b: Dependency policy (cargo-deny)
+  # Secret scanning is handled by GitHub-native secret scanning + push protection
+  # (enabled on the repo). .gitleaks.toml is provided for optional local scans.
   # ─────────────────────────────────────────────
   cargo-deny:
     name: Dependency Policy (cargo-deny)

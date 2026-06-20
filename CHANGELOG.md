@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PUBLIC_BOUNDARY.md` — what is public vs. internal for the PulseDB open-source repo.
 - `CONTRIBUTING.md` — contribution guidelines.
 - `.gitignore` secret-file patterns (`*.pem`, `*.key`, `*.crt`, `id_rsa`, `.secrets/`, …).
-- Security CI: `gitleaks` secret scan + `cargo-deny` (advisories/licenses/bans); Dependabot config (`cargo` + `github-actions`).
+- Security CI: `cargo-deny` job (advisories/bans/sources); Dependabot config (`cargo` + `github-actions`). Secret scanning is enforced via GitHub-native secret scanning + push protection (`.gitleaks.toml` is kept for optional local scans).
 - CI hardening: least-privilege default `GITHUB_TOKEN` permissions; the publish job now runs through a manual-approval `crates-io` environment.
 
 ## [0.5.0] - 2026-06-20
