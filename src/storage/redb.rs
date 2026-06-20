@@ -361,10 +361,24 @@ impl RedbStorage {
             // lock-release window before the re-read below can confirm migration is
             // still needed; if a concurrent upgrader already migrated the file and
             // wrote the backup, copying now would overwrite the genuine pre-v3
-            // sidecar with already-migrated v3 data. The first writer's backup wins.
+            // sidecar with already-migrated v3 data. Atomically claim the backup
+            // path (create_new / O_EXCL) so only the first writer creates it — a
+            // concurrent upgrader that lost the race sees AlreadyExists and leaves
+            // the genuine sidecar untouched (no TOCTOU between exists() and copy()).
             let backup_path = pre_v3_backup_path(&path);
-            if !backup_path.exists() {
-                std::fs::copy(&path, &backup_path).map_err(PulseDBError::Io)?;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&backup_path)
+            {
+                Ok(mut backup_file) => {
+                    let mut source = std::fs::File::open(&path).map_err(PulseDBError::Io)?;
+                    std::io::copy(&mut source, &mut backup_file).map_err(PulseDBError::Io)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    debug!("pre-v3 backup already exists; preserving it");
+                }
+                Err(error) => return Err(PulseDBError::Io(error)),
             }
             let reopened = Self::create_database(&path, config)?;
             let reopened_metadata = Self::read_metadata(&reopened)?;
