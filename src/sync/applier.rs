@@ -19,6 +19,14 @@ use super::error::SyncError;
 use super::guard::SyncApplyGuard;
 use super::types::{SyncChange, SyncPayload};
 
+/// Upper bound on the number of per-instance buckets accepted in a single
+/// experience's `applications` G-counter from a remote peer. Each bucket is one
+/// distinct replica that reinforced the experience, so realistic counts are in
+/// the tens-to-thousands even for large fleets; a payload exceeding this is
+/// treated as malformed/hostile and rejected to prevent unbounded memory growth
+/// and persistent state bloat (resource-exhaustion DoS) during sync apply.
+const MAX_SYNC_APPLICATION_BUCKETS: usize = 65_536;
+
 /// Result of applying a batch of remote changes.
 #[derive(Clone, Debug, Default)]
 pub struct ApplyResult {
@@ -87,6 +95,12 @@ impl RemoteChangeApplier {
             // ─── Experience ──────────────────────────────────────────
             SyncPayload::ExperienceCreated(experience) => {
                 let id = experience.id;
+                if experience.applications.len() > MAX_SYNC_APPLICATION_BUCKETS {
+                    return Err(SyncError::invalid_payload(format!(
+                        "experience {id} sync create carries {} application buckets (max {MAX_SYNC_APPLICATION_BUCKETS})",
+                        experience.applications.len()
+                    )));
+                }
                 if self.db.get_experience(id).map_err(map_err)?.is_some() {
                     let merged = self
                         .db
@@ -115,6 +129,14 @@ impl RemoteChangeApplier {
                 timestamp,
                 ..
             } => {
+                if let Some(incoming) = update.applications.as_ref() {
+                    if incoming.len() > MAX_SYNC_APPLICATION_BUCKETS {
+                        return Err(SyncError::invalid_payload(format!(
+                            "experience {id} sync update carries {} application buckets (max {MAX_SYNC_APPLICATION_BUCKETS})",
+                            incoming.len()
+                        )));
+                    }
+                }
                 let applications = update.applications.as_ref().cloned().unwrap_or_default();
                 let last_reinforced = update.last_reinforced;
                 let has_counter_merge =
@@ -247,6 +269,7 @@ impl RemoteChangeApplier {
 }
 
 /// Internal outcome of applying a single change.
+#[derive(Debug)]
 enum ApplyOutcome {
     Applied,
     Skipped,
@@ -354,5 +377,42 @@ mod tests {
         assert_eq!(merged.applications(), 6);
         assert_eq!(merged.last_reinforced, incoming_last_reinforced);
         assert!((merged.importance - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn oversized_application_bucket_map_is_rejected() {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("applier-bucket-bound").unwrap();
+        let exp_id = db.record_experience(minimal_exp(cid)).unwrap();
+
+        // A hostile peer payload with more buckets than the accepted bound.
+        let mut buckets = BTreeMap::new();
+        for i in 0..=(MAX_SYNC_APPLICATION_BUCKETS as u128) {
+            buckets.insert(InstanceId::from_bytes(i.to_le_bytes()), 1u32);
+        }
+        assert_eq!(buckets.len(), MAX_SYNC_APPLICATION_BUCKETS + 1);
+
+        let update = SerializableExperienceUpdate {
+            applications: Some(buckets),
+            ..Default::default()
+        };
+
+        let applier = RemoteChangeApplier::new(Arc::clone(&db), SyncConfig::default());
+        let result = applier.apply_single(change(
+            SyncPayload::ExperienceUpdated {
+                id: exp_id,
+                update,
+                timestamp: Timestamp::now(),
+            },
+            cid,
+        ));
+
+        assert!(
+            matches!(result, Err(SyncError::InvalidPayload(_))),
+            "oversized application bucket map must be rejected, got {result:?}"
+        );
+        // Nothing from the oversized map may have been persisted.
+        let stored = db.get_experience(exp_id).unwrap().unwrap();
+        assert!(stored.applications.len() <= 1);
     }
 }

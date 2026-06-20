@@ -518,89 +518,73 @@ Retrieves raw context candidates for a task.
 impl PulseDB {
     pub fn get_context_candidates(
         &self,
-        request: ContextCandidatesRequest,
+        request: ContextRequest,
     ) -> Result<ContextCandidates, PulseDBError>;
 }
 
 #[derive(Clone, Debug)]
-pub struct ContextCandidatesRequest {
-    /// Target collective
+pub struct ContextRequest {
+    /// Target collective (must exist)
     pub collective_id: CollectiveId,
-    
-    /// Query embedding for similarity search
-    pub query_embedding: Vec<f32>,
-    
-    /// Max recent experiences to retrieve
-    pub max_recent: usize,
-    
-    /// Max similar experiences to retrieve
-    pub max_similar: usize,
-    
-    /// Include active agent activities
-    pub include_activities: bool,
-    
-    /// Include derived insights
-    pub include_insights: bool,
-    
-    /// Include experience relations
-    pub include_relations: bool,
-    
-    /// Filter by domains (optional)
-    pub domain_filter: Option<Vec<String>>,
-    
-    /// Minimum importance threshold (optional)
-    pub min_importance: Option<f32>,
-}
 
-impl Default for ContextCandidatesRequest {
-    fn default() -> Self {
-        Self {
-            collective_id: CollectiveId::nil(),
-            query_embedding: vec![],
-            max_recent: 10,
-            max_similar: 20,
-            include_activities: true,
-            include_insights: true,
-            include_relations: true,
-            domain_filter: None,
-            min_importance: None,
-        }
-    }
+    /// Query embedding for similarity search and insight retrieval
+    pub query_embedding: Vec<f32>,
+
+    /// Max similar experiences to return (1-1000, default: 20)
+    pub max_similar: usize,
+
+    /// Max recent experiences to return (1-1000, default: 10)
+    pub max_recent: usize,
+
+    /// Include derived insights (default: true)
+    pub include_insights: bool,
+
+    /// Include relations for returned experiences (default: true)
+    pub include_relations: bool,
+
+    /// Include active (non-stale) agent activities (default: true)
+    pub include_active_agents: bool,
+
+    /// Filter applied to similar and recent experience queries
+    pub filter: SearchFilter,
+
+    /// Optional recall weights for similarity + temporal energy
+    /// (`None` preserves legacy similarity-only ranking)
+    pub recall_weights: Option<RecallWeights>,
 }
+// ContextRequest implements Default (nil collective, empty query, the limits/flags above).
 
 #[derive(Clone, Debug)]
 pub struct ContextCandidates {
-    /// Recent experiences sorted by timestamp descending
+    /// Semantically similar experiences, sorted by similarity descending
+    pub similar_experiences: Vec<SearchResult>,
+
+    /// Most recent experiences, sorted by timestamp descending
     pub recent_experiences: Vec<Experience>,
-    
-    /// Similar experiences with similarity scores
-    pub similar_experiences: Vec<(Experience, f32)>,
-    
-    /// Stored derived insights
-    pub stored_insights: Vec<DerivedInsight>,
-    
-    /// Currently active agents
-    pub active_agents: Vec<Activity>,
-    
-    /// Relations for returned experiences
+
+    /// Derived insights similar to the query (empty if `include_insights` was false)
+    pub insights: Vec<DerivedInsight>,
+
+    /// Relations involving the returned experiences (deduped; empty if not requested)
     pub relations: Vec<ExperienceRelation>,
+
+    /// Currently active (non-stale) agents (empty if `include_active_agents` was false)
+    pub active_agents: Vec<Activity>,
 }
 ```
 
 **Example:**
 ```rust
-let candidates = db.get_context_candidates(ContextCandidatesRequest {
+let candidates = db.get_context_candidates(ContextRequest {
     collective_id,
     query_embedding: embedding_model.embed("Help user with auth")?,
     max_recent: 5,
     max_similar: 20,
-    include_activities: true,
-    domain_filter: Some(vec!["auth".into()]),
     ..Default::default()
 })?;
 
-for (exp, score) in candidates.similar_experiences {
-    println!("Score {:.3}: {}", score, exp.content);
+for result in candidates.similar_experiences {
+    println!("Score {:.3}: {}", result.similarity, result.experience.content);
 }
 ```
 
@@ -1184,7 +1168,7 @@ impl Timestamp {
 use pulsedb::{
     PulseDB, Config, EmbeddingProvider, EmbeddingDimension,
     NewExperience, ExperienceType, Severity,
-    ContextCandidatesRequest, NewExperienceRelation, RelationType,
+    ContextRequest, NewExperienceRelation, RelationType,
     AgentId,
 };
 
@@ -1212,6 +1196,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         importance: 0.9,
         domain: vec!["prisma".into(), "nextjs".into()],
         source_agent: AgentId("agent_1".into()),
+        // Config::default() uses the External embedding provider, so callers must
+        // supply the embedding (matching the collective's dimension). Builtin
+        // provider (feature `builtin-embeddings`) generates it automatically.
+        embedding: Some(vec![0.1; 384]),
         ..Default::default()
     })?;
     
@@ -1226,6 +1214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         importance: 0.95,
         domain: vec!["prisma".into(), "nextjs".into()],
         source_agent: AgentId("agent_1".into()),
+        embedding: Some(vec![0.1; 384]), // External provider — supply the embedding
         ..Default::default()
     })?;
     
@@ -1243,11 +1232,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ─────────────────────────────────────────────────────────────
     // 5. Get context candidates (another agent)
     // ─────────────────────────────────────────────────────────────
-    let candidates = db.get_context_candidates(ContextCandidatesRequest {
+    let candidates = db.get_context_candidates(ContextRequest {
         collective_id,
-        query_embedding: vec![0.0; 384],  // Would be real embedding
+        query_embedding: vec![0.0; 384], // Would be a real query embedding
         max_similar: 10,
-        domain_filter: Some(vec!["prisma".into()]),
         ..Default::default()
     })?;
     

@@ -100,7 +100,7 @@ async fn test_basic_experience_sync() {
     // Verify B has the experience
     let exp = pair.db_b.get_experience(exp_id).unwrap();
     assert!(exp.is_some(), "Experience should have synced to DB-B");
-    assert_eq!(exp.unwrap().content.starts_with("experience-"), true);
+    assert!(exp.unwrap().content.starts_with("experience-"));
 }
 
 #[tokio::test]

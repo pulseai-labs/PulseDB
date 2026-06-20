@@ -1201,41 +1201,33 @@ impl PulseDB {
             .unwrap_or_else(|| self.config.decay.clone());
         let now = Timestamp::now();
 
-        // O(n) single-pass full-collective scan: page through all experience IDs,
-        // load each, compute scalar energy, keep `energy < below && !archived`.
+        // Single-pass full-collective scan. Stream every experience ID in ONE
+        // index iteration (limit = usize::MAX, offset = 0) — offset-restart
+        // pagination was quadratic (each page re-skipped from the start). The
+        // remaining per-row-txn / embedding-hauling / snapshot-safety rework is
+        // tracked in #21. Load each, compute scalar energy, keep
+        // `energy < below && !archived`.
         let mut cold: Vec<(ExperienceId, f32)> = Vec::new();
-        let page = 1000usize;
-        let mut offset = 0usize;
-        loop {
-            let ids = self
-                .storage
-                .list_experience_ids_paginated(collective_id, page, offset)?;
-            if ids.is_empty() {
-                break;
+        let ids = self
+            .storage
+            .list_experience_ids_paginated(collective_id, usize::MAX, 0)?;
+        for id in ids {
+            let Some(experience) = self.storage.get_experience(id)? else {
+                continue;
+            };
+            if experience.archived {
+                continue;
             }
-            let fetched = ids.len();
-            for id in ids {
-                let Some(experience) = self.storage.get_experience(id)? else {
-                    continue;
-                };
-                if experience.archived {
-                    continue;
-                }
-                let energy = experience_energy(
-                    experience.importance,
-                    experience.applications(),
-                    experience.last_reinforced,
-                    now,
-                    &decay_config,
-                );
-                if energy < below {
-                    cold.push((id, energy));
-                }
+            let energy = experience_energy(
+                experience.importance,
+                experience.applications(),
+                experience.last_reinforced,
+                now,
+                &decay_config,
+            );
+            if energy < below {
+                cold.push((id, energy));
             }
-            if fetched < page {
-                break;
-            }
-            offset += fetched;
         }
 
         // Coldest-first (ascending energy), then truncate to limit.
