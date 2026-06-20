@@ -134,19 +134,38 @@ pub struct Config {
     /// Sync mode for durability
     pub sync_mode: SyncMode,
     
+    /// HNSW vector index configuration
+    pub hnsw: HnswConfig,
+    
+    /// Agent-activity tracking configuration
+    pub activity: ActivityConfig,
+    
     /// Watch system configuration
-    pub watch_config: WatchConfig,
+    pub watch: WatchConfig,
+    
+    /// Temporal decay / energy configuration (per-collective default)
+    pub decay: DecayConfig,
+    
+    /// Open the database read-only (all mutations return `PulseDBError::ReadOnly`)
+    pub read_only: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            embedding_provider: EmbeddingProvider::Builtin { model_path: None },
+            // Default = External provider: the caller supplies embeddings
+            // (NewExperience.embedding = Some(..)). Enable the `builtin-embeddings`
+            // feature + EmbeddingProvider::Builtin to have PulseDB generate them.
+            embedding_provider: EmbeddingProvider::External,
             embedding_dimension: EmbeddingDimension::D384,
             default_collective: None,
             cache_size_mb: 64,
             sync_mode: SyncMode::Normal,
-            watch_config: WatchConfig::default(),
+            hnsw: HnswConfig::default(),
+            activity: ActivityConfig::default(),
+            watch: WatchConfig::default(),
+            decay: DecayConfig::default(),
+            read_only: false,
         }
     }
 }

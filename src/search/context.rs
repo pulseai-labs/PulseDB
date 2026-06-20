@@ -115,7 +115,10 @@ impl Default for ContextRequest {
 /// - `active_agents` - Non-stale agents in the collective
 #[derive(Clone, Debug)]
 pub struct ContextCandidates {
-    /// Semantically similar experiences, sorted by similarity descending.
+    /// Semantically similar experiences. Ordered by descending cosine similarity
+    /// for legacy recall; when recall weights are active, ordered by the blended
+    /// similarity+energy score — so `SearchResult.similarity` (always the raw
+    /// cosine value) is not necessarily monotonically descending.
     pub similar_experiences: Vec<SearchResult>,
 
     /// Most recent experiences, sorted by timestamp descending.

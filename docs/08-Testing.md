@@ -282,7 +282,7 @@ fn test_multi_agent_hive_mind_workflow() {
     
     // Agent 2: Working on related task, gets context
     let query = db.embed("database queries in Next.js API routes").unwrap();
-    let candidates = db.get_context_candidates(ContextCandidatesRequest {
+    let candidates = db.get_context_candidates(ContextRequest {
         collective_id,
         query_embedding: query,
         max_similar: 10,
@@ -291,7 +291,7 @@ fn test_multi_agent_hive_mind_workflow() {
     
     // Agent 2 should see Agent 1's problem
     assert!(candidates.similar_experiences.iter()
-        .any(|(e, _)| e.id == problem_id));
+        .any(|r| r.experience.id == problem_id));
     
     // Agent 2: Finds solution, records it
     let solution_id = db.record_experience(NewExperience {
@@ -319,7 +319,7 @@ fn test_multi_agent_hive_mind_workflow() {
     
     // Agent 3: Gets context for related work
     let query = db.embed("edge runtime database access").unwrap();
-    let candidates = db.get_context_candidates(ContextCandidatesRequest {
+    let candidates = db.get_context_candidates(ContextRequest {
         collective_id,
         query_embedding: query,
         max_similar: 10,
@@ -329,13 +329,13 @@ fn test_multi_agent_hive_mind_workflow() {
     
     // Agent 3 should see both problem and solution
     let exp_ids: Vec<_> = candidates.similar_experiences.iter()
-        .map(|(e, _)| e.id)
+        .map(|r| r.experience.id)
         .collect();
     assert!(exp_ids.contains(&problem_id) || exp_ids.contains(&solution_id));
     
     // Relations should link them
-    if let Some((solution_exp, _)) = candidates.similar_experiences.iter()
-        .find(|(e, _)| e.id == solution_id)
+    if candidates.similar_experiences.iter()
+        .any(|r| r.experience.id == solution_id)
     {
         let relations: Vec<_> = candidates.relations.iter()
             .filter(|r| r.source_id == solution_id)

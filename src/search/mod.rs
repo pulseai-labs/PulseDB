@@ -16,8 +16,10 @@ use crate::experience::Experience;
 /// Options for recall search.
 ///
 /// `SearchOptions` is the call-time configuration for [`PulseDB::search()`].
-/// When `weights` is absent, search preserves legacy pure-similarity ranking.
-/// Energy-weighted ranking is introduced incrementally by VS-3.5.2.
+/// Recall-weight precedence is: explicit `weights` here > the collective's
+/// configured `DecayConfig.default_recall_weights` (per-collective stored config,
+/// else the global `Config.decay`) > legacy pure-similarity ranking. So
+/// `weights: None` preserves legacy ranking only when no default is configured.
 ///
 /// [`PulseDB::search()`]: crate::PulseDB::search
 #[derive(Clone, Debug)]
@@ -28,7 +30,8 @@ pub struct SearchOptions {
     /// Filter criteria applied after vector retrieval.
     pub filter: SearchFilter,
 
-    /// Optional recall weights for similarity and temporal energy.
+    /// Optional recall weights for similarity and temporal energy. `None` falls
+    /// back to the configured `default_recall_weights`, then to legacy ranking.
     pub weights: Option<RecallWeights>,
 }
 

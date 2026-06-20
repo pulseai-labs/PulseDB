@@ -372,8 +372,18 @@ impl RedbStorage {
                 .open(&backup_path)
             {
                 Ok(mut backup_file) => {
-                    let mut source = std::fs::File::open(&path).map_err(PulseDBError::Io)?;
-                    std::io::copy(&mut source, &mut backup_file).map_err(PulseDBError::Io)?;
+                    // If the copy fails after we claimed the path (disk full, short
+                    // write, interruption), remove the partial/empty backup so a
+                    // later open does not treat it as a valid pre-v3 sidecar via the
+                    // AlreadyExists branch — the next open then re-creates a complete one.
+                    let copy_result = std::fs::File::open(&path).and_then(|mut source| {
+                        std::io::copy(&mut source, &mut backup_file).map(|_| ())
+                    });
+                    if let Err(error) = copy_result {
+                        drop(backup_file);
+                        let _ = std::fs::remove_file(&backup_path);
+                        return Err(PulseDBError::Io(error));
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     debug!("pre-v3 backup already exists; preserving it");
