@@ -64,7 +64,8 @@
 //! ## Distributed Sync
 //!
 //! With the `sync` feature, PulseDB instances can synchronize data across a
-//! network. See the [`sync`] module for full documentation.
+//! network. See the `sync` module for full documentation (enable the `sync`
+//! feature to build it).
 //!
 //! Key components:
 //! - `SyncManager` — Orchestrates sync lifecycle (start/stop/sync_once)

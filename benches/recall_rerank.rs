@@ -249,7 +249,7 @@ fn sample_queries(n: usize) -> usize {
     std::env::var("NFR018_SAMPLES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| if n == LITERAL_NFR018_N { 1_000 } else { 200 })
+        .unwrap_or(if n == LITERAL_NFR018_N { 1_000 } else { 200 })
         .max(1)
 }
 
