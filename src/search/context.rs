@@ -79,8 +79,11 @@ pub struct ContextRequest {
 
     /// Optional recall weights for similarity and temporal energy.
     ///
-    /// This field is reserved for weighted context-candidate ranking in
-    /// VS-3.5.2 work item 1.03. `None` preserves legacy ranking.
+    /// Forwarded to `search()` for the similar-experience query. Precedence:
+    /// these weights > the collective's configured `default_recall_weights`
+    /// (per-collective stored config, else the global `Config.decay`) > legacy
+    /// pure-similarity ranking. So `None` preserves legacy ranking only when no
+    /// default is configured.
     pub recall_weights: Option<RecallWeights>,
 }
 
