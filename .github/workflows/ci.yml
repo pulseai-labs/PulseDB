@@ -157,7 +157,7 @@ jobs:
         run: cargo tarpaulin --fail-under 80 --out xml --out html
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: |
@@ -260,7 +260,7 @@ jobs:
           key: criterion-baseline-main
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
           path: target/criterion/
