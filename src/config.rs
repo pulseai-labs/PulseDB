@@ -620,7 +620,12 @@ pub struct DecayConfig {
     /// Default: `0.05`.
     pub floor: f32,
 
-    /// Whether cold experiences should be archived automatically.
+    /// Reserved for future automatic archiving of cold experiences.
+    ///
+    /// **Inert in v0.5.0** — this flag round-trips through config but wires **no**
+    /// automatic archive behavior; setting it `true` is currently a no-op.
+    /// `list_cold_experiences()` only *surfaces* prune candidates — archiving
+    /// remains the consumer's explicit decision. (Tracked: issues #20/#22.)
     ///
     /// Default: `false`.
     pub auto_archive_below_floor: bool,
