@@ -6,10 +6,8 @@ title = "PulseDB gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Allowlist for known-safe matches"
-# Synthetic example vectors / fixtures in docs and tests are not secrets.
-paths = [
-  '''docs/.*\.md''',
-  '''(^|/)tests/.*''',
-  '''(^|/)benches/.*''',
-]
+description = "Allowlist for known-safe matches (kept minimal — no blanket path excludes)"
+# Do NOT blanket-exclude tests/, benches/, or docs/ — that creates a secret-scanning
+# blind spot (a real credential in a fixture would pass). If a local scan
+# false-positives on a synthetic example, allowlist that exact value, e.g.:
+#   regexes = ['''EXAMPLE_FAKE_TOKEN_[A-Z0-9]+''']

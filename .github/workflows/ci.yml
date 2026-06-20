@@ -191,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check advisories bans sources
 
@@ -271,7 +271,7 @@ jobs:
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, test, test-msrv, coverage, security]
+    needs: [lint, test, test-msrv, coverage, security, cargo-deny]
     runs-on: ubuntu-latest
     # Gated by the 'crates-io' GitHub Environment (manual approval required before
     # the irreversible crates.io publish). CARGO_TOKEN may be scoped to this environment.

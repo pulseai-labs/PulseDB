@@ -4,7 +4,11 @@
 
 [advisories]
 version = 2
-# RustSec advisory DB. Fails on vulnerabilities; IDs below are consciously ignored.
+# Vulnerabilities always gate. Unmaintained advisories gate only for our DIRECT
+# deps (actionable); transitive unmaintained crates (e.g. `paste` pulled in by
+# feature deps — outside our control) are surfaced but do not fail CI.
+unmaintained = "workspace"
+# IDs consciously ignored:
 ignore = [
   # bincode 1.x is unmaintained (RUSTSEC-2025-0141). PulseDB pins bincode 1.3 for
   # on-disk serialization; migrating to bincode 2.x is a tracked follow-up, not a
