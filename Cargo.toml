@@ -24,7 +24,7 @@ sync-websocket = ["sync", "tokio-tungstenite"]
 
 [dependencies]
 # Storage - redb is a pure Rust embedded KV store with ACID transactions
-redb = "2.1"
+redb = "4.1"
 
 # Serialization - bincode is fast and compact for internal storage
 bincode = "1.3"
