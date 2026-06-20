@@ -59,43 +59,64 @@ This document defines the testing strategy for PulseDB, including test types, co
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    // Validation is exercised through `record_experience`, which returns a
+    // `ValidationError` for invalid input. (The internal validator is private.)
+
     #[test]
     fn test_new_experience_validation_valid() {
-        let exp = NewExperience {
-            collective_id: CollectiveId::new(),
+        let (db, _dir) = setup_db();
+        let collective_id = db.create_collective("test").unwrap();
+
+        let result = db.record_experience(NewExperience {
+            collective_id,
             content: "Test content".into(),
             importance: 0.5,
             confidence: 0.8,
+            embedding: Some(vec![0.1; 384]), // External provider — supply embedding
             ..Default::default()
-        };
-        
-        assert!(exp.validate().is_ok());
+        });
+
+        assert!(result.is_ok());
     }
-    
+
     #[test]
     fn test_new_experience_validation_empty_content() {
-        let exp = NewExperience {
-            collective_id: CollectiveId::new(),
+        let (db, _dir) = setup_db();
+        let collective_id = db.create_collective("test").unwrap();
+
+        let err = db.record_experience(NewExperience {
+            collective_id,
             content: "".into(),
+            embedding: Some(vec![0.1; 384]),
             ..Default::default()
-        };
-        
-        let err = exp.validate().unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidField { field, .. } if field == "content"));
+        }).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulseDBError::Validation(ValidationError::RequiredField { field })
+                if field == "content"
+        ));
     }
-    
+
     #[test]
     fn test_new_experience_validation_importance_too_high() {
-        let exp = NewExperience {
-            collective_id: CollectiveId::new(),
+        let (db, _dir) = setup_db();
+        let collective_id = db.create_collective("test").unwrap();
+
+        let err = db.record_experience(NewExperience {
+            collective_id,
             content: "Test".into(),
             importance: 1.5,  // Invalid
+            embedding: Some(vec![0.1; 384]),
             ..Default::default()
-        };
-        
-        let err = exp.validate().unwrap_err();
-        assert!(matches!(err, ValidationError::InvalidField { field, .. } if field == "importance"));
+        }).unwrap_err();
+
+        assert!(matches!(
+            err,
+            PulseDBError::Validation(ValidationError::InvalidField { field, .. })
+                if field == "importance"
+        ));
     }
     
     #[test]
@@ -157,6 +178,7 @@ fn test_experience_crud_lifecycle() {
             technology: "Rust".into(),
             insight: "Great for systems".into(),
         },
+        embedding: Some(vec![0.1; 384]), // External provider — supply embedding
         ..Default::default()
     }).unwrap();
     
@@ -206,18 +228,19 @@ fn test_search_similar_returns_relevant_results() {
         db.record_experience(NewExperience {
             collective_id,
             content: content.into(),
+            embedding: Some(vec![0.1; 384]), // External provider — supply embedding
             ..Default::default()
         }).unwrap();
     }
     
-    // Search for auth-related
-    let query = db.embed("authentication").unwrap();
+    // Search for auth-related (External provider: supply the query embedding)
+    let query = vec![0.1_f32; 384];
     let results = db.search_similar(collective_id, &query, 2).unwrap();
     
     assert_eq!(results.len(), 2);
     // Auth-related should be top results
-    assert!(results[0].0.content.to_lowercase().contains("auth"));
-    assert!(results[1].0.content.to_lowercase().contains("auth"));
+    assert!(results[0].experience.content.to_lowercase().contains("auth"));
+    assert!(results[1].experience.content.to_lowercase().contains("auth"));
 }
 
 #[test]
@@ -231,6 +254,7 @@ fn test_collective_isolation() {
     db.record_experience(NewExperience {
         collective_id: collective_a,
         content: "Secret from project A".into(),
+        embedding: Some(vec![0.1; 384]), // External provider — supply embedding
         ..Default::default()
     }).unwrap();
     
@@ -238,16 +262,17 @@ fn test_collective_isolation() {
     db.record_experience(NewExperience {
         collective_id: collective_b,
         content: "Secret from project B".into(),
+        embedding: Some(vec![0.1; 384]),
         ..Default::default()
     }).unwrap();
     
     // Search in collective A should NOT return B's data
-    let query = db.embed("secret").unwrap();
+    let query = vec![0.1_f32; 384];
     let results = db.search_similar(collective_a, &query, 10).unwrap();
     
-    for (exp, _) in results {
-        assert_eq!(exp.collective_id, collective_a);
-        assert!(!exp.content.contains("project B"));
+    for result in results {
+        assert_eq!(result.experience.collective_id, collective_a);
+        assert!(!result.experience.content.contains("project B"));
     }
 }
 ```
@@ -277,11 +302,13 @@ fn test_multi_agent_hive_mind_workflow() {
         source_agent: AgentId("agent-1".into()),
         domain: vec!["prisma".into(), "nextjs".into()],
         importance: 0.9,
+        embedding: Some(vec![0.1; 384]), // External provider — supply embedding
         ..Default::default()
     }).unwrap();
     
     // Agent 2: Working on related task, gets context
-    let query = db.embed("database queries in Next.js API routes").unwrap();
+    // (External provider: supply the query embedding directly)
+    let query = vec![0.1_f32; 384];
     let candidates = db.get_context_candidates(ContextRequest {
         collective_id,
         query_embedding: query,
@@ -305,6 +332,7 @@ fn test_multi_agent_hive_mind_workflow() {
         source_agent: AgentId("agent-2".into()),
         domain: vec!["prisma".into(), "nextjs".into()],
         importance: 0.95,
+        embedding: Some(vec![0.1; 384]), // External provider — supply embedding
         ..Default::default()
     }).unwrap();
     
@@ -318,7 +346,7 @@ fn test_multi_agent_hive_mind_workflow() {
     }).unwrap();
     
     // Agent 3: Gets context for related work
-    let query = db.embed("edge runtime database access").unwrap();
+    let query = vec![0.1_f32; 384];
     let candidates = db.get_context_candidates(ContextRequest {
         collective_id,
         query_embedding: query,
@@ -358,10 +386,11 @@ fn test_watch_real_time_updates() {
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut stream = db_clone.watch_experiences(collective_id).await.unwrap();
+            // Subscription is synchronous; the WatchStream yields WatchEvent values.
+            let mut stream = db_clone.watch_experiences(collective_id).unwrap();
             let mut count = 0;
-            while let Some(exp) = stream.next().await {
-                received_clone.lock().unwrap().push(exp);
+            while let Some(event) = stream.next().await {
+                received_clone.lock().unwrap().push(event);
                 count += 1;
                 if count >= 3 {
                     break;
@@ -378,6 +407,7 @@ fn test_watch_real_time_updates() {
         db.record_experience(NewExperience {
             collective_id,
             content: format!("Experience {}", i),
+            embedding: Some(vec![0.1; 384]), // External provider — supply embedding
             ..Default::default()
         }).unwrap();
         std::thread::sleep(Duration::from_millis(50));
@@ -455,6 +485,7 @@ proptest! {
             collective_id,
             content: "Test".into(),
             importance,
+            embedding: Some(vec![0.1; 384]), // External provider — supply embedding
             ..Default::default()
         });
         
@@ -472,6 +503,7 @@ proptest! {
             collective_id,
             content: "Test".into(),
             importance,
+            embedding: Some(vec![0.1; 384]), // valid embedding — only `importance` is invalid
             ..Default::default()
         });
         
@@ -498,7 +530,10 @@ proptest! {
         let results = db.search_similar(collective_id, &query, k).unwrap();
         
         for i in 1..results.len() {
-            prop_assert!(results[i-1].1 >= results[i].1, "Results not sorted");
+            prop_assert!(
+                results[i-1].similarity >= results[i].similarity,
+                "Results not sorted"
+            );
         }
     }
 }
@@ -581,6 +616,8 @@ pub fn sample_experiences() -> Vec<NewExperience> {
             },
             importance: 0.8,
             domain: vec!["react".into()],
+            // Config::default() uses the External provider — supply an embedding.
+            embedding: Some(vec![0.1; 384]),
             ..Default::default()
         },
         NewExperience {
@@ -591,6 +628,7 @@ pub fn sample_experiences() -> Vec<NewExperience> {
             },
             importance: 0.9,
             domain: vec!["prisma".into(), "nextjs".into()],
+            embedding: Some(vec![0.1; 384]),
             ..Default::default()
         },
         // ... more fixtures
@@ -603,6 +641,8 @@ pub fn random_experience(collective_id: CollectiveId) -> NewExperience {
         content: format!("Random experience {}", rand::random::<u64>()),
         importance: rand::random::<f32>().clamp(0.0, 1.0),
         confidence: rand::random::<f32>().clamp(0.0, 1.0),
+        // Config::default() uses the External provider — supply an embedding.
+        embedding: Some(random_embedding(384)),
         ..Default::default()
     }
 }

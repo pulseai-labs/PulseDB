@@ -69,8 +69,9 @@ pub fn open(path: impl AsRef<Path>, config: Config) -> Result<PulseDB, PulseDBEr
 **Errors:**
 | Error | Condition |
 |-------|-----------|
-| `StorageError::Io` | File system error |
+| `PulseDBError::Io` | File system error |
 | `StorageError::Corrupted` | Database file corrupted |
+| `StorageError::SchemaVersionMismatch` | On-disk schema version differs from expected |
 | `ValidationError::DimensionMismatch` | Config dimension doesn't match existing |
 
 **Example:**
@@ -255,7 +256,7 @@ impl PulseDB {
     pub fn create_collective_with_owner(
         &self,
         name: &str,
-        owner_id: UserId,
+        owner_id: &str,
     ) -> Result<CollectiveId, PulseDBError>;
 }
 ```
@@ -264,7 +265,7 @@ impl PulseDB {
 | Name | Type | Description |
 |------|------|-------------|
 | `name` | `&str` | Human-readable name (max 256 chars) |
-| `owner_id` | `UserId` | Optional owner identifier |
+| `owner_id` | `&str` | Owner identifier |
 
 **Returns:** `Result<CollectiveId, PulseDBError>`
 
@@ -276,7 +277,7 @@ let collective_id = db.create_collective("my-project")?;
 // With owner
 let collective_id = db.create_collective_with_owner(
     "my-project",
-    UserId("user_123".into()),
+    "user_123",
 )?;
 ```
 
@@ -292,7 +293,7 @@ impl PulseDB {
     
     pub fn list_collectives_by_owner(
         &self,
-        owner_id: &UserId,
+        owner_id: &str,
     ) -> Result<Vec<Collective>, PulseDBError>;
 }
 ```
@@ -305,7 +306,7 @@ impl PulseDB {
 let collectives = db.list_collectives()?;
 
 // Filter by owner
-let my_collectives = db.list_collectives_by_owner(&UserId("user_123".into()))?;
+let my_collectives = db.list_collectives_by_owner("user_123")?;
 ```
 
 ---
@@ -339,12 +340,9 @@ impl PulseDB {
 #[derive(Clone, Debug)]
 pub struct CollectiveStats {
     pub experience_count: u64,
-    pub relation_count: u64,
-    pub insight_count: u64,
-    pub active_agent_count: u32,
     pub storage_bytes: u64,
-    pub created_at: Timestamp,
-    pub last_activity: Option<Timestamp>,
+    pub oldest_experience: Option<Timestamp>,
+    pub newest_experience: Option<Timestamp>,
 }
 ```
 
@@ -620,7 +618,7 @@ impl PulseDB {
         collective_id: CollectiveId,
         query_embedding: &[f32],
         k: usize,
-    ) -> Result<Vec<(Experience, f32)>, PulseDBError>;
+    ) -> Result<Vec<SearchResult>, PulseDBError>;
     
     pub fn search_similar_filtered(
         &self,
@@ -628,13 +626,26 @@ impl PulseDB {
         query_embedding: &[f32],
         k: usize,
         filter: SearchFilter,
-    ) -> Result<Vec<(Experience, f32)>, PulseDBError>;
+    ) -> Result<Vec<SearchResult>, PulseDBError>;
 }
 
-#[derive(Clone, Debug, Default)]
+/// A search result pairing an experience with its similarity score.
+#[derive(Clone, Debug)]
+pub struct SearchResult {
+    /// The full experience record.
+    pub experience: Experience,
+
+    /// Similarity score (1.0 - cosine_distance). Higher is more similar.
+    pub similarity: f32,
+}
+
+#[derive(Clone, Debug)]
 pub struct SearchFilter {
     /// Filter by domains (experience must have at least one)
     pub domains: Option<Vec<String>>,
+    
+    /// Experience types to include (matched on the type discriminant)
+    pub experience_types: Option<Vec<ExperienceType>>,
     
     /// Minimum importance threshold
     pub min_importance: Option<f32>,
@@ -642,15 +653,19 @@ pub struct SearchFilter {
     /// Minimum confidence threshold
     pub min_confidence: Option<f32>,
     
-    /// Experience types to include
-    pub experience_types: Option<Vec<ExperienceTypeFilter>>,
+    /// Only include experiences created at or after this timestamp
+    pub since: Option<Timestamp>,
     
-    /// Include archived experiences
-    pub include_archived: bool,
+    /// Whether to exclude archived experiences (default: `true`)
+    pub exclude_archived: bool,
 }
+
+// SearchFilter implements Default manually: all `Option` fields are `None`
+// and `exclude_archived` defaults to `true`.
 ```
 
-**Returns:** `Vec<(Experience, f32)>` sorted by similarity descending.
+**Returns:** `Vec<SearchResult>` sorted by `similarity` descending. Each result exposes
+`result.experience` (the full `Experience`) and `result.similarity` (the score).
 
 ---
 
@@ -733,11 +748,11 @@ impl PulseDB {
         direction: RelationDirection,
     ) -> Result<Vec<(Experience, ExperienceRelation)>, PulseDBError>;
     
-    pub fn get_related_experiences_by_type(
+    pub fn get_related_experiences_filtered(
         &self,
         experience_id: ExperienceId,
-        relation_type: RelationType,
         direction: RelationDirection,
+        relation_type: Option<RelationType>,
     ) -> Result<Vec<(Experience, ExperienceRelation)>, PulseDBError>;
 }
 
@@ -778,8 +793,10 @@ impl PulseDB {
 pub struct NewDerivedInsight {
     pub collective_id: CollectiveId,
     pub content: String,
-    pub embedding: Vec<f32>,
-    pub source_experiences: Vec<ExperienceId>,
+    /// Pre-computed embedding (required for External provider)
+    pub embedding: Option<Vec<f32>>,
+    pub source_experience_ids: Vec<ExperienceId>,
+    pub insight_type: InsightType,
     pub confidence: f32,
     pub domain: Vec<String>,
 }
@@ -829,10 +846,10 @@ impl PulseDB {
 
 #[derive(Clone, Debug)]
 pub struct NewActivity {
-    pub agent_id: AgentId,
+    pub agent_id: String,
     pub collective_id: CollectiveId,
-    pub task_description: String,
-    pub working_on: Vec<String>,
+    pub current_task: Option<String>,
+    pub context_summary: Option<String>,
 }
 ```
 
@@ -844,14 +861,7 @@ Updates activity heartbeat.
 
 ```rust
 impl PulseDB {
-    pub fn update_heartbeat(&self, agent_id: &AgentId, collective_id: CollectiveId) -> Result<(), PulseDBError>;
-    
-    pub fn update_heartbeat_with_files(
-        &self,
-        agent_id: &AgentId,
-        collective_id: CollectiveId,
-        working_on: Vec<String>,
-    ) -> Result<(), PulseDBError>;
+    pub fn update_heartbeat(&self, agent_id: &str, collective_id: CollectiveId) -> Result<(), PulseDBError>;
 }
 ```
 
@@ -863,7 +873,7 @@ Ends an agent's activity.
 
 ```rust
 impl PulseDB {
-    pub fn end_activity(&self, agent_id: &AgentId, collective_id: CollectiveId) -> Result<(), PulseDBError>;
+    pub fn end_activity(&self, agent_id: &str, collective_id: CollectiveId) -> Result<(), PulseDBError>;
 }
 ```
 
@@ -876,14 +886,12 @@ Gets currently active agents.
 ```rust
 impl PulseDB {
     pub fn get_active_agents(&self, collective_id: CollectiveId) -> Result<Vec<Activity>, PulseDBError>;
-    
-    pub fn get_active_agents_with_threshold(
-        &self,
-        collective_id: CollectiveId,
-        stale_threshold: Duration,
-    ) -> Result<Vec<Activity>, PulseDBError>;
 }
 ```
+
+**Note:** The staleness window (activities with no heartbeat newer than
+`now - stale_threshold` are excluded) is configured globally via
+`Config.activity.stale_threshold` (default: 5 minutes), not passed per call.
 
 ---
 
@@ -895,34 +903,67 @@ Subscribes to new experiences.
 
 ```rust
 impl PulseDB {
-    pub async fn watch_experiences(
+    pub fn watch_experiences(
         &self,
         collective_id: CollectiveId,
-    ) -> Result<impl Stream<Item = Experience>, PulseDBError>;
+    ) -> Result<WatchStream, PulseDBError>;
     
-    pub async fn watch_experiences_filtered(
+    pub fn watch_experiences_filtered(
         &self,
         collective_id: CollectiveId,
         filter: WatchFilter,
-    ) -> Result<impl Stream<Item = Experience>, PulseDBError>;
+    ) -> Result<WatchStream, PulseDBError>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct WatchFilter {
     pub domains: Option<Vec<String>>,
-    pub experience_types: Option<Vec<ExperienceTypeFilter>>,
+    pub experience_types: Option<Vec<ExperienceType>>,
     pub min_importance: Option<f32>,
+}
+```
+
+`WatchStream` implements `futures_core::Stream<Item = WatchEvent>`. Subscription is
+synchronous (no `.await` to subscribe); the resulting stream is consumed
+asynchronously.
+
+```rust
+#[derive(Clone, Debug)]
+pub struct WatchEvent {
+    pub experience_id: ExperienceId,
+    pub collective_id: CollectiveId,
+    pub event_type: WatchEventType,
+    pub timestamp: Timestamp,
+    /// Full experience data for `Created`/`Updated`; `None` for `Deleted`.
+    pub experience: Option<Experience>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchEventType {
+    Created,
+    Updated,
+    Archived,
+    Deleted,
 }
 ```
 
 **Example:**
 ```rust
 use futures::StreamExt;
+use pulsedb::WatchEventType;
 
-let mut stream = db.watch_experiences(collective_id).await?;
+let mut stream = db.watch_experiences(collective_id)?;
 
-while let Some(experience) = stream.next().await {
-    println!("New experience: {}", experience.content);
+while let Some(event) = stream.next().await {
+    match event.event_type {
+        WatchEventType::Created => {
+            if let Some(exp) = event.experience {
+                println!("New experience: {}", exp.content);
+            }
+        }
+        WatchEventType::Deleted => println!("Removed: {}", event.experience_id),
+        _ => {}
+    }
 }
 ```
 
@@ -967,7 +1008,7 @@ pub trait SubstrateProvider: Send + Sync {
     // Experience Operations
     // ─────────────────────────────────────────────────────────────
     
-    async fn store_experience(&self, exp: Experience) -> Result<ExperienceId, PulseDBError>;
+    async fn store_experience(&self, exp: NewExperience) -> Result<ExperienceId, PulseDBError>;
     
     async fn get_experience(&self, id: ExperienceId) -> Result<Option<Experience>, PulseDBError>;
     
@@ -988,7 +1029,7 @@ pub trait SubstrateProvider: Send + Sync {
     // Relation Operations
     // ─────────────────────────────────────────────────────────────
     
-    async fn store_relation(&self, rel: ExperienceRelation) -> Result<RelationId, PulseDBError>;
+    async fn store_relation(&self, rel: NewExperienceRelation) -> Result<RelationId, PulseDBError>;
     
     async fn get_related(
         &self,
@@ -999,14 +1040,14 @@ pub trait SubstrateProvider: Send + Sync {
     // Insight Operations
     // ─────────────────────────────────────────────────────────────
     
-    async fn store_insight(&self, insight: DerivedInsight) -> Result<InsightId, PulseDBError>;
+    async fn store_insight(&self, insight: NewDerivedInsight) -> Result<InsightId, PulseDBError>;
     
     async fn get_insights(
         &self,
         collective: CollectiveId,
         embedding: &[f32],
         k: usize,
-    ) -> Result<Vec<DerivedInsight>, PulseDBError>;
+    ) -> Result<Vec<(DerivedInsight, f32)>, PulseDBError>;
     
     // ─────────────────────────────────────────────────────────────
     // Activity Operations
@@ -1021,30 +1062,39 @@ pub trait SubstrateProvider: Send + Sync {
     async fn watch(
         &self,
         collective: CollectiveId,
-    ) -> Result<Pin<Box<dyn Stream<Item = Experience> + Send>>, PulseDBError>;
+    ) -> Result<Pin<Box<dyn Stream<Item = WatchEvent> + Send>>, PulseDBError>;
 }
 ```
+
+> **Note:** The trait declares additional methods (e.g. `get_context_candidates`,
+> `create_collective`, `get_or_create_collective`, `list_collectives`) and several
+> defaulted methods; only the core surface is shown here.
 
 **Implementation:**
 ```rust
 pub struct PulseDBSubstrate {
-    db: PulseDB,
+    db: Arc<PulseDB>,
 }
 
 impl PulseDBSubstrate {
-    pub fn new(path: impl AsRef<Path>, config: Config) -> Result<Self, PulseDBError> {
-        Ok(Self {
-            db: PulseDB::open(path, config)?,
-        })
+    /// Wraps a shared `PulseDB` reference.
+    pub fn new(db: Arc<PulseDB>) -> Self {
+        Self { db }
+    }
+
+    /// Wraps an owned `PulseDB` in an `Arc`.
+    pub fn from_db(db: PulseDB) -> Self {
+        Self { db: Arc::new(db) }
     }
 }
 
 #[async_trait]
 impl SubstrateProvider for PulseDBSubstrate {
-    // Async wrappers over sync core
-    async fn store_experience(&self, exp: Experience) -> Result<ExperienceId, PulseDBError> {
-        // Sync operation, wrapped for async trait
-        self.db.record_experience(exp.into())
+    // Each async method delegates to PulseDB's sync API via spawn_blocking.
+    async fn store_experience(&self, exp: NewExperience) -> Result<ExperienceId, PulseDBError> {
+        let db = self.db.clone();
+        // (runs on the blocking thread pool)
+        db.record_experience(exp)
     }
     // ... other implementations
 }
@@ -1065,14 +1115,34 @@ pub enum PulseDBError {
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
     
-    #[error("Not found: {0}")]
-    NotFound(NotFoundError),
+    #[error("Configuration error: {reason}")]
+    Config { reason: String },
     
-    #[error("Concurrency error: {0}")]
-    Concurrency(#[from] ConcurrencyError),
+    #[error("{0}")]
+    NotFound(#[from] NotFoundError),
+    
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     
     #[error("Embedding error: {0}")]
-    Embedding(#[from] EmbeddingError),
+    Embedding(String),
+    
+    #[error("Vector index error: {0}")]
+    Vector(String),
+    
+    #[error("Watch error: {0}")]
+    Watch(String),
+    
+    #[error("Internal error: {0}")]
+    Internal(String),
+    
+    #[error("Database is in read-only mode")]
+    ReadOnly,
+    
+    /// Only available when the `sync` feature is enabled.
+    #[cfg(feature = "sync")]
+    #[error("Sync error: {0}")]
+    Sync(#[from] SyncError),
 }
 ```
 
@@ -1084,14 +1154,26 @@ pub enum StorageError {
     #[error("Database corrupted: {0}")]
     Corrupted(String),
     
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("Database not found: {0}")]
+    DatabaseNotFound(PathBuf),
+    
+    #[error("Database is locked by another writer")]
+    DatabaseLocked,
     
     #[error("Transaction failed: {0}")]
     Transaction(String),
     
     #[error("Serialization error: {0}")]
     Serialization(String),
+    
+    #[error("Storage engine error: {0}")]
+    Redb(String),
+    
+    #[error("Schema version mismatch: expected {expected}, found {found}")]
+    SchemaVersionMismatch { expected: u32, found: u32 },
+    
+    #[error("Table not found: {0}")]
+    TableNotFound(String),
 }
 ```
 
@@ -1103,32 +1185,32 @@ pub enum ValidationError {
     #[error("Embedding dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
     
-    #[error("Invalid {field}: {reason}")]
+    #[error("Invalid field '{field}': {reason}")]
     InvalidField { field: String, reason: String },
     
-    #[error("Content too large: {size} bytes (max: {max})")]
+    #[error("Content too large: {size} bytes (max: {max} bytes)")]
     ContentTooLarge { size: usize, max: usize },
     
-    #[error("Collective not found: {0}")]
-    CollectiveNotFound(CollectiveId),
+    #[error("Required field missing: {field}")]
+    RequiredField { field: String },
     
-    #[error("Experience not found: {0}")]
-    ExperienceNotFound(ExperienceId),
+    #[error("Too many items in '{field}': {count} (max: {max})")]
+    TooManyItems { field: String, count: usize, max: usize },
 }
 ```
 
 ### 11.4 Error Handling Example
 
 ```rust
-use pulsedb::{PulseDB, PulseDBError, ValidationError};
+use pulsedb::{PulseDB, PulseDBError, ValidationError, NotFoundError};
 
 match db.record_experience(exp) {
     Ok(id) => println!("Recorded: {:?}", id),
     Err(PulseDBError::Validation(ValidationError::DimensionMismatch { expected, got })) => {
         eprintln!("Wrong embedding dimension: expected {}, got {}", expected, got);
     }
-    Err(PulseDBError::Validation(ValidationError::CollectiveNotFound(id))) => {
-        eprintln!("Collective {:?} does not exist", id);
+    Err(PulseDBError::NotFound(NotFoundError::Collective(id))) => {
+        eprintln!("Collective {} does not exist", id);
     }
     Err(e) => eprintln!("Unexpected error: {}", e),
 }
