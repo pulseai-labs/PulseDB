@@ -16,6 +16,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# Least-privilege default for the automatic GITHUB_TOKEN.
+# Jobs that need more (e.g. publish) opt in explicitly.
+permissions:
+  contents: read
+
 jobs:
   # ─────────────────────────────────────────────
   # Job 1: Format & Lint (fast-fail gate)
@@ -177,6 +182,20 @@ jobs:
         run: cargo audit
 
   # ─────────────────────────────────────────────
+  # Job 5b: Dependency policy (cargo-deny)
+  # Secret scanning is handled by GitHub-native secret scanning + push protection
+  # (enabled on the repo). .gitleaks.toml is provided for optional local scans.
+  # ─────────────────────────────────────────────
+  cargo-deny:
+    name: Dependency Policy (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+        with:
+          command: check advisories bans sources
+
+  # ─────────────────────────────────────────────
   # Job 6: Benchmarks
   # ─────────────────────────────────────────────
   bench:
@@ -252,8 +271,11 @@ jobs:
   publish:
     name: Publish to crates.io
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, test, test-msrv, coverage, security]
+    needs: [lint, test, test-msrv, coverage, security, cargo-deny]
     runs-on: ubuntu-latest
+    # Gated by the 'crates-io' GitHub Environment (manual approval required before
+    # the irreversible crates.io publish). CARGO_TOKEN may be scoped to this environment.
+    environment: crates-io
     permissions:
       contents: write
     steps:

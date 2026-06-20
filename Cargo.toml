@@ -1,12 +1,12 @@
 [package]
 name = "pulsehive-db"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.89"
 authors = ["PulseDB Team"]
 description = "Embedded database for agentic AI systems — collective memory for multi-agent coordination"
 license = "AGPL-3.0-only"
-repository = "https://github.com/pulsehive/pulsedb"
+repository = "https://github.com/pulseai-labs/PulseDB"
 documentation = "https://docs.rs/pulsehive-db"
 keywords = ["database", "embedded", "ai", "agents", "vector"]
 categories = ["database", "embedded"]
