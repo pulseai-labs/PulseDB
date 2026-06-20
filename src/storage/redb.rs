@@ -71,6 +71,16 @@ fn legacy_applications_instance_id() -> InstanceId {
 #[derive(Debug, Deserialize, Serialize)]
 struct StoredDecayConfig {
     half_life_secs: u64,
+    half_life_nanos: u32,
+    freq_weight: f32,
+    floor: f32,
+    auto_archive_below_floor: bool,
+    default_recall_weights: Option<RecallWeights>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredDecayConfigV1 {
+    half_life_secs: u64,
     freq_weight: f32,
     floor: f32,
     auto_archive_below_floor: bool,
@@ -81,6 +91,19 @@ impl From<&DecayConfig> for StoredDecayConfig {
     fn from(config: &DecayConfig) -> Self {
         Self {
             half_life_secs: config.half_life.as_secs(),
+            half_life_nanos: config.half_life.subsec_nanos(),
+            freq_weight: config.freq_weight,
+            floor: config.floor,
+            auto_archive_below_floor: config.auto_archive_below_floor,
+            default_recall_weights: config.default_recall_weights,
+        }
+    }
+}
+
+impl From<StoredDecayConfigV1> for DecayConfig {
+    fn from(config: StoredDecayConfigV1) -> Self {
+        Self {
+            half_life: std::time::Duration::from_secs(config.half_life_secs),
             freq_weight: config.freq_weight,
             floor: config.floor,
             auto_archive_below_floor: config.auto_archive_below_floor,
@@ -92,7 +115,7 @@ impl From<&DecayConfig> for StoredDecayConfig {
 impl From<StoredDecayConfig> for DecayConfig {
     fn from(config: StoredDecayConfig) -> Self {
         Self {
-            half_life: std::time::Duration::from_secs(config.half_life_secs),
+            half_life: std::time::Duration::new(config.half_life_secs, config.half_life_nanos),
             freq_weight: config.freq_weight,
             floor: config.floor,
             auto_archive_below_floor: config.auto_archive_below_floor,
@@ -197,6 +220,51 @@ impl RedbStorage {
         Ok(db)
     }
 
+    fn read_metadata(db: &Database) -> Result<DatabaseMetadata> {
+        let read_txn = db.begin_read().map_err(StorageError::from)?;
+        let meta_table = read_txn
+            .open_table(METADATA_TABLE)
+            .map_err(|e| StorageError::corrupted(format!("Cannot open metadata table: {}", e)))?;
+
+        let metadata_bytes = meta_table
+            .get(METADATA_KEY)
+            .map_err(StorageError::from)?
+            .ok_or_else(|| StorageError::corrupted("Missing database metadata"))?;
+
+        bincode::deserialize::<DatabaseMetadata>(metadata_bytes.value())
+            .map_err(|e| StorageError::corrupted(format!("Invalid metadata format: {}", e)).into())
+    }
+
+    fn validate_existing_metadata(metadata: &DatabaseMetadata, config: &Config) -> Result<()> {
+        if !matches!(metadata.schema_version, 1..=SCHEMA_VERSION) {
+            warn!(
+                expected = SCHEMA_VERSION,
+                found = metadata.schema_version,
+                "Schema version mismatch"
+            );
+            return Err(PulseDBError::Storage(StorageError::SchemaVersionMismatch {
+                expected: SCHEMA_VERSION,
+                found: metadata.schema_version,
+            }));
+        }
+
+        if metadata.embedding_dimension != config.embedding_dimension {
+            warn!(
+                expected = config.embedding_dimension.size(),
+                found = metadata.embedding_dimension.size(),
+                "Embedding dimension mismatch"
+            );
+            return Err(PulseDBError::Validation(
+                ValidationError::DimensionMismatch {
+                    expected: config.embedding_dimension.size(),
+                    got: metadata.embedding_dimension.size(),
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Initializes a new database with tables and metadata.
     #[instrument(skip(db, config), fields(path = %path.display()))]
     fn initialize_new(db: Database, path: PathBuf, config: &Config) -> Result<Self> {
@@ -272,54 +340,10 @@ impl RedbStorage {
     fn open_existing(db: Database, path: PathBuf, config: &Config) -> Result<Self> {
         info!("Opening existing database");
 
-        // Read metadata from the database
-        let read_txn = db.begin_read().map_err(StorageError::from)?;
-
-        let metadata = {
-            let meta_table = read_txn.open_table(METADATA_TABLE).map_err(|e| {
-                StorageError::corrupted(format!("Cannot open metadata table: {}", e))
-            })?;
-
-            let metadata_bytes = meta_table
-                .get(METADATA_KEY)
-                .map_err(StorageError::from)?
-                .ok_or_else(|| StorageError::corrupted("Missing database metadata"))?;
-
-            bincode::deserialize::<DatabaseMetadata>(metadata_bytes.value())
-                .map_err(|e| StorageError::corrupted(format!("Invalid metadata format: {}", e)))?
-        };
-
-        drop(read_txn);
-
-        // Validate schema version (allow migration from v1 → v2 → v3).
-        if !matches!(metadata.schema_version, 1..=SCHEMA_VERSION) {
-            warn!(
-                expected = SCHEMA_VERSION,
-                found = metadata.schema_version,
-                "Schema version mismatch"
-            );
-            return Err(PulseDBError::Storage(StorageError::SchemaVersionMismatch {
-                expected: SCHEMA_VERSION,
-                found: metadata.schema_version,
-            }));
-        }
-        let needs_v2_migration = metadata.schema_version == 1;
-        let needs_v3_migration = metadata.schema_version <= 2;
-
-        // Validate embedding dimension
-        if metadata.embedding_dimension != config.embedding_dimension {
-            warn!(
-                expected = config.embedding_dimension.size(),
-                found = metadata.embedding_dimension.size(),
-                "Embedding dimension mismatch"
-            );
-            return Err(PulseDBError::Validation(
-                ValidationError::DimensionMismatch {
-                    expected: config.embedding_dimension.size(),
-                    got: metadata.embedding_dimension.size(),
-                },
-            ));
-        }
+        let mut metadata = Self::read_metadata(&db)?;
+        Self::validate_existing_metadata(&metadata, config)?;
+        let mut needs_v2_migration = metadata.schema_version == 1;
+        let mut needs_v3_migration = metadata.schema_version <= 2;
 
         if needs_v3_migration && config.read_only {
             return Err(PulseDBError::ReadOnly);
@@ -334,13 +358,18 @@ impl RedbStorage {
         let db = if needs_v3_migration {
             drop(db);
             std::fs::copy(&path, pre_v3_backup_path(&path)).map_err(PulseDBError::Io)?;
-            Self::create_database(&path, config)?
+            let reopened = Self::create_database(&path, config)?;
+            let reopened_metadata = Self::read_metadata(&reopened)?;
+            Self::validate_existing_metadata(&reopened_metadata, config)?;
+            metadata = reopened_metadata;
+            needs_v2_migration = metadata.schema_version == 1;
+            needs_v3_migration = metadata.schema_version <= 2;
+            reopened
         } else {
             db
         };
 
         // Update last_opened_at timestamp and bump schema version if migrating.
-        let mut metadata = metadata;
         metadata.touch();
         if needs_v2_migration || needs_v3_migration {
             metadata.schema_version = SCHEMA_VERSION;
@@ -532,18 +561,22 @@ impl RedbStorage {
     fn migrate_experiences_v2_to_v3(write_txn: &::redb::WriteTransaction) -> Result<()> {
         let experiences_table = write_txn.open_table(EXPERIENCES_TABLE)?;
 
-        let mut entries: Vec<([u8; 16], ExperienceV2)> = Vec::new();
+        let mut experience_ids: Vec<[u8; 16]> = Vec::new();
         for entry in experiences_table.iter()? {
-            let (key, value) = entry.map_err(StorageError::from)?;
-            let experience_id = *key.value();
-            let experience: ExperienceV2 = bincode::deserialize(value.value())
-                .map_err(|e| StorageError::serialization(format!("v2 experience record: {}", e)))?;
-            entries.push((experience_id, experience));
+            let (key, _) = entry.map_err(StorageError::from)?;
+            experience_ids.push(*key.value());
         }
         drop(experiences_table);
 
         let mut experiences_table = write_txn.open_table(EXPERIENCES_TABLE)?;
-        for (experience_id, v2) in entries {
+        for experience_id in experience_ids {
+            let entry = experiences_table.get(&experience_id)?.ok_or_else(|| {
+                StorageError::corrupted("experience disappeared during migration")
+            })?;
+            let v2: ExperienceV2 = bincode::deserialize(entry.value())
+                .map_err(|e| StorageError::serialization(format!("v2 experience record: {}", e)))?;
+            drop(entry);
+
             let mut applications = BTreeMap::new();
             applications.insert(legacy_applications_instance_id(), v2.applications);
 
@@ -683,11 +716,19 @@ impl StorageEngine for RedbStorage {
         let table = read_txn.open_table(DECAY_CONFIGS_TABLE)?;
 
         match table.get(collective_id.as_bytes())? {
-            Some(value) => {
-                let stored: StoredDecayConfig = bincode::deserialize(value.value())
-                    .map_err(|e| StorageError::serialization(e.to_string()))?;
-                Ok(Some(stored.into()))
-            }
+            Some(value) => match bincode::deserialize::<StoredDecayConfig>(value.value()) {
+                Ok(stored) => Ok(Some(stored.into())),
+                Err(current_error) => {
+                    let legacy: StoredDecayConfigV1 =
+                        bincode::deserialize(value.value()).map_err(|legacy_error| {
+                            StorageError::serialization(format!(
+                                "decay config current format: {}; legacy format: {}",
+                                current_error, legacy_error
+                            ))
+                        })?;
+                    Ok(Some(legacy.into()))
+                }
+            },
             None => Ok(None),
         }
     }
@@ -2020,6 +2061,15 @@ mod tests {
         archived: bool,
     }
 
+    #[derive(Serialize)]
+    struct LegacyStoredDecayConfig {
+        half_life_secs: u64,
+        freq_weight: f32,
+        floor: f32,
+        auto_archive_below_floor: bool,
+        default_recall_weights: Option<RecallWeights>,
+    }
+
     fn default_config() -> Config {
         Config::default()
     }
@@ -2387,6 +2437,90 @@ mod tests {
         assert_eq!(restored, Some(config));
 
         Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_decay_config_preserves_subsecond_half_life() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        let collective_id = CollectiveId::new();
+
+        let config = crate::config::DecayConfig {
+            half_life: std::time::Duration::from_millis(750),
+            ..crate::config::DecayConfig::default()
+        };
+
+        storage
+            .set_decay_config(collective_id, config.clone())
+            .unwrap();
+
+        let restored = storage.get_decay_config(collective_id).unwrap();
+        assert_eq!(restored, Some(config));
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_decay_config_reads_legacy_second_precision_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let storage = RedbStorage::open(&path, &default_config()).unwrap();
+        let collective_id = CollectiveId::new();
+
+        let legacy = LegacyStoredDecayConfig {
+            half_life_secs: 42,
+            freq_weight: 0.5,
+            floor: 0.2,
+            auto_archive_below_floor: true,
+            default_recall_weights: Some(RecallWeights::new(0.7, 0.3)),
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let write_txn = storage.db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(DECAY_CONFIGS_TABLE).unwrap();
+            table
+                .insert(collective_id.as_bytes(), bytes.as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+
+        let restored = storage.get_decay_config(collective_id).unwrap().unwrap();
+        assert_eq!(restored.half_life, std::time::Duration::from_secs(42));
+        assert_eq!(restored.freq_weight, 0.5);
+        assert_eq!(restored.floor, 0.2);
+        assert!(restored.auto_archive_below_floor);
+        assert_eq!(
+            restored.default_recall_weights,
+            Some(RecallWeights::new(0.7, 0.3))
+        );
+
+        Box::new(storage).close().unwrap();
+    }
+
+    #[test]
+    fn test_schema_v3_reopen_skips_pre_v3_migration_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let (experience_id, _, _) = seed_schema_v2_store(&path, 11);
+
+        let backup_path = pre_v3_backup_path(&path);
+        let db = RedbStorage::open(&path, &default_config()).unwrap();
+        assert_eq!(db.metadata().schema_version, SCHEMA_VERSION);
+        assert!(backup_path.exists());
+        Box::new(db).close().unwrap();
+
+        let reopened = RedbStorage::open(&path, &default_config()).unwrap();
+        assert_eq!(reopened.metadata().schema_version, SCHEMA_VERSION);
+        let experience = reopened.get_experience(experience_id).unwrap().unwrap();
+        assert_eq!(
+            experience
+                .applications
+                .get(&legacy_applications_instance_id()),
+            Some(&11)
+        );
+
+        Box::new(reopened).close().unwrap();
     }
 
     #[test]

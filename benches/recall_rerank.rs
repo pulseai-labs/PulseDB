@@ -60,8 +60,9 @@ use pulsedb::{
     CollectiveId, Config, NewExperience, PulseDB, RecallWeights, SearchFilter, SearchOptions,
     Timestamp,
 };
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -73,6 +74,18 @@ const DIM: usize = 384;
 /// This intentionally stays above BRUTE_FORCE_THRESHOLD = 128 so the benchmark
 /// measures the HNSW path rather than the brute-force path.
 const SCALE_N: usize = 1_000;
+const DEFAULT_NFR018_N: usize = 2_000;
+const LITERAL_NFR018_N: usize = 1_000_000;
+const FIXTURE_MARKER_VERSION: u32 = 1;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FixtureMarker {
+    marker_version: u32,
+    n: usize,
+    dim: usize,
+    embedding_seed: String,
+    build_wall_ms: u128,
+}
 
 /// Generates a deterministic embedding from a seed.
 fn make_embedding(seed: u64) -> Vec<f32> {
@@ -198,26 +211,25 @@ fn weighted_search_at_scale(c: &mut Criterion) {
 //   The build happens in UNMEASURED setup so the (minutes + GBs) build cost
 //   never lands inside a measured sample. An open-cost probe records whether
 //   `PulseDB::open()` on the persisted file rebuilds the HNSW graph or loads it.
-// - C1: feasibility floor. The target N is read from `NFR018_N` (default 1M);
-//   if 1M is infeasible in the local build budget, re-run with a smaller
-//   `NFR018_N` (>= BRUTE_FORCE_THRESHOLD = 128) and record the fallback + a
-//   linear-extrapolation-to-1M caveat. The chosen N is stamped into the
-//   fixture filename and printed, so a sub-1M run is acceptable-with-caveat.
+// - C1: feasibility floor. The target N is read from `NFR018_N`; the default is
+//   a small smoke size so unfiltered `cargo bench` stays safe. Set
+//   `NFR018_N=1000000` for the literal manual gate run. The chosen N is stamped
+//   into the fixture filename and completion marker, so a sub-1M run is explicit.
 // - C6: tail hygiene. The first NFR018_WARMUP (~100) queries are discarded as
-//   warm-up; >= NFR018_SAMPLES (default 1000) post-warm-up queries are measured.
-//   P95 / P99 / max are recorded together. Query vectors are RANDOM fixed-seed
+//   warm-up. NFR018_SAMPLES is honored exactly; without an override the literal
+//   1M run measures 1000 samples and smoke/fallback runs measure 200. P95 / P99
+//   / max are recorded together. Query vectors are RANDOM fixed-seed
 //   (`make_embedding(N + q)`), NOT one repeated vector (tail realism).
 
-/// Target fixture size for the NFR-018 1M bench. Default 1_000_000.
+/// Target fixture size for the NFR-018 bench.
 ///
-/// Overridable via the `NFR018_N` env var for the C1 fallback path: if a 1M
-/// fixture cannot build/measure within budget locally, set e.g. `NFR018_N=50000`
-/// to record the largest feasible N (must stay >= BRUTE_FORCE_THRESHOLD = 128).
+/// Default is a safe smoke size so unfiltered `cargo bench` does not build the
+/// literal 1M fixture. Set `NFR018_N=1000000` for the manual source-of-truth run.
 fn target_n() -> usize {
     std::env::var("NFR018_N")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1_000_000)
+        .unwrap_or(DEFAULT_NFR018_N)
         .max(128)
 }
 
@@ -229,13 +241,16 @@ fn warmup_queries() -> usize {
         .unwrap_or(100)
 }
 
-/// Number of post-warm-up queries to MEASURE for the percentile (C6). Default 1000.
-fn sample_queries() -> usize {
+/// Number of post-warm-up queries to MEASURE for the percentile (C6).
+///
+/// `NFR018_SAMPLES` is honored exactly (minimum 1). Without an override, the
+/// literal 1M run uses 1000 samples and smoke/fallback runs use 200.
+fn sample_queries(n: usize) -> usize {
     std::env::var("NFR018_SAMPLES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1_000)
-        .max(1_000)
+        .unwrap_or_else(|| if n == LITERAL_NFR018_N { 1_000 } else { 200 })
+        .max(1)
 }
 
 /// Stable on-disk location for the persisted, seed-stamped 1M fixture (D5).
@@ -248,6 +263,51 @@ fn fixture_path(n: usize) -> PathBuf {
         .join(format!("nfr018-1m-seed{n}.db"))
 }
 
+fn fixture_marker_path(path: &Path) -> PathBuf {
+    let mut marker = path.as_os_str().to_owned();
+    marker.push(".complete.json");
+    PathBuf::from(marker)
+}
+
+fn temporary_fixture_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "nfr018-fixture.db".into());
+    path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
+}
+
+fn hnsw_dir_for_path(path: &Path) -> PathBuf {
+    let mut hnsw = path.as_os_str().to_owned();
+    hnsw.push(".hnsw");
+    PathBuf::from(hnsw)
+}
+
+fn remove_fixture_artifacts(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(fixture_marker_path(path));
+    let _ = std::fs::remove_dir_all(hnsw_dir_for_path(path));
+}
+
+fn fixture_marker_is_valid(path: &Path, n: usize) -> bool {
+    if !path.exists() {
+        return false;
+    }
+
+    let marker_path = fixture_marker_path(path);
+    let Ok(bytes) = std::fs::read(&marker_path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<FixtureMarker>(&bytes) else {
+        return false;
+    };
+
+    marker.marker_version == FIXTURE_MARKER_VERSION
+        && marker.n == n
+        && marker.dim == DIM
+        && marker.embedding_seed == "make_embedding-v1"
+}
+
 /// Builds the persisted N-experience fixture if absent, else reuses it (D5).
 ///
 /// The build runs in UNMEASURED setup. Returns the fixture path plus the build
@@ -255,19 +315,33 @@ fn fixture_path(n: usize) -> PathBuf {
 /// caller can record the C1 budget figure.
 fn build_or_load_fixture(n: usize) -> (PathBuf, Option<Duration>) {
     let path = fixture_path(n);
-    if path.exists() {
+    if fixture_marker_is_valid(&path, n) {
         eprintln!(
-            "NFR-018 fixture: reusing persisted {} (N={n}, no rebuild of redb rows)",
-            path.display()
+            "NFR-018 fixture: reusing completed persisted {} (N={n}, marker={})",
+            path.display(),
+            fixture_marker_path(&path).display()
         );
         return (path, None);
     }
 
+    if path.exists() || fixture_marker_path(&path).exists() {
+        eprintln!(
+            "NFR-018 fixture: removing incomplete/stale fixture artifacts for {}",
+            path.display()
+        );
+        remove_fixture_artifacts(&path);
+    }
+
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    eprintln!("NFR-018 fixture: building N={n} at {} ...", path.display());
+    let tmp_path = temporary_fixture_path(&path);
+    remove_fixture_artifacts(&tmp_path);
+    eprintln!(
+        "NFR-018 fixture: building N={n} at temporary path {} ...",
+        tmp_path.display()
+    );
     let start = Instant::now();
 
-    let db = PulseDB::open(&path, Config::default()).unwrap();
+    let db = PulseDB::open(&tmp_path, Config::default()).unwrap();
     let cid = db.create_collective("nfr018").unwrap();
     // Populate in chunks; progress every 100k so a slow 1M build is observable
     // (and a stall is distinguishable from progress per C1).
@@ -290,7 +364,22 @@ fn build_or_load_fixture(n: usize) -> (PathBuf, Option<Duration>) {
     }
     db.close().unwrap();
     let build = start.elapsed();
-    eprintln!("NFR-018 fixture: build complete in {build:?}");
+    std::fs::rename(&tmp_path, &path).unwrap();
+    let _ = std::fs::remove_dir_all(hnsw_dir_for_path(&tmp_path));
+
+    let marker = FixtureMarker {
+        marker_version: FIXTURE_MARKER_VERSION,
+        n,
+        dim: DIM,
+        embedding_seed: "make_embedding-v1".to_string(),
+        build_wall_ms: build.as_millis(),
+    };
+    let marker_bytes = serde_json::to_vec_pretty(&marker).unwrap();
+    std::fs::write(fixture_marker_path(&path), marker_bytes).unwrap();
+    eprintln!(
+        "NFR-018 fixture: build complete in {build:?}; promoted to {}",
+        path.display()
+    );
     (path, Some(build))
 }
 
@@ -333,9 +422,10 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
 /// Manual P99 sampling loop — the SOURCE OF TRUTH for the NFR-018 gate (D2/C6).
 ///
 /// Runs in criterion's UNMEASURED setup-and-print form: it does its own timing
-/// (not `b.iter`), discards warm-up queries, samples >= 1000 post-warm-up, and
-/// prints `NFR-018 1M P99 = <ms>ms (budget 50ms)`. It NEVER asserts/panics on
-/// the value (the gate verdict is 1.04's, D1).
+/// (not `b.iter`) and discards warm-up queries. Literal 1M runs print
+/// `NFR-018 1M P99 = <ms>ms (budget 50ms)`; smoke/fallback runs print an
+/// explicit non-1M marker. It NEVER asserts/panics on the value (the gate
+/// verdict is 1.04's, D1).
 fn search_1m_p99_manual(c: &mut Criterion) {
     let n = target_n();
     let (path, build_wall) = build_or_load_fixture(n);
@@ -348,7 +438,7 @@ fn search_1m_p99_manual(c: &mut Criterion) {
     };
 
     let warmup = warmup_queries();
-    let samples = sample_queries();
+    let samples = sample_queries(n);
 
     // Warm-up: discard the first `warmup` queries (cold cache / lazy init / the
     // first-query open-cost tail) so the recorded P99 is a property of the WARM
@@ -358,7 +448,7 @@ fn search_1m_p99_manual(c: &mut Criterion) {
         let _ = black_box(db.search(cid, &query, opts.clone()).unwrap());
     }
 
-    // Measured window: >= 1000 post-warm-up queries, each timed individually.
+    // Measured window: post-warm-up queries, each timed individually.
     let mut latencies_ms: Vec<f64> = Vec::with_capacity(samples);
     for q in 0..samples {
         let query = make_embedding(n as u64 + (warmup + q) as u64);
@@ -374,16 +464,21 @@ fn search_1m_p99_manual(c: &mut Criterion) {
     let p99 = percentile(&latencies_ms, 0.99);
     let max = *latencies_ms.last().unwrap();
 
-    // The canonical marker (D2). NON-panicking: print + record only.
-    eprintln!("NFR-018 1M P99 = {p99:.3}ms (budget 50ms)");
+    // The canonical marker (D2). NON-panicking: print + record only. For smoke
+    // or fallback runs, avoid claiming a literal 1M measurement.
+    if n == LITERAL_NFR018_N {
+        eprintln!("NFR-018 1M P99 = {p99:.3}ms (budget 50ms)");
+    } else {
+        eprintln!("NFR-018 smoke/fallback P99 = {p99:.3}ms (N={n}; literal 1M not measured)");
+    }
     eprintln!(
         "NFR-018 1M latency summary: N={n} (measured{}) warmup={warmup} samples={samples} \
          P50={p50:.3}ms P95={p95:.3}ms P99={p99:.3}ms max={max:.3}ms \
          | build_wall={:?} open_cost={open_cost:?} query_dist=random-fixed-seed",
-        if n == 1_000_000 {
+        if n == LITERAL_NFR018_N {
             ""
         } else {
-            ", FALLBACK<1M — linear extrapolation to 1M is a caveat, not measured"
+            ", SMOKE/FALLBACK<1M — literal 1M not measured"
         },
         build_wall.unwrap_or(Duration::ZERO),
     );
