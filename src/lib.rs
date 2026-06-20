@@ -135,8 +135,8 @@ pub use db::PulseDB;
 
 // Configuration
 pub use config::{
-    ActivityConfig, Config, EmbeddingDimension, EmbeddingProvider, HnswConfig, SyncMode,
-    WatchConfig,
+    ActivityConfig, Config, DecayConfig, EmbeddingDimension, EmbeddingProvider, HnswConfig,
+    RecallWeights, SyncMode, WatchConfig,
 };
 
 // Error handling
@@ -144,13 +144,15 @@ pub use error::{NotFoundError, PulseDBError, Result, StorageError, ValidationErr
 
 // Core types
 pub use types::{
-    AgentId, CollectiveId, Embedding, ExperienceId, InsightId, RelationId, TaskId, Timestamp,
-    UserId,
+    AgentId, CollectiveId, Embedding, ExperienceId, InsightId, InstanceId, RelationId, TaskId,
+    Timestamp, UserId,
 };
 
 // Domain types
 pub use collective::{Collective, CollectiveStats};
-pub use experience::{Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity};
+pub use experience::{
+    energy, Experience, ExperienceType, ExperienceUpdate, NewExperience, Severity,
+};
 
 // Relations
 pub use relation::{ExperienceRelation, NewExperienceRelation, RelationDirection, RelationType};
@@ -162,7 +164,7 @@ pub use insight::{DerivedInsight, InsightType, NewDerivedInsight};
 pub use activity::{Activity, NewActivity};
 
 // Search & Context
-pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
+pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult};
 
 // Watch (real-time notifications + cross-process change detection)
 pub use watch::{ChangePoller, WatchEvent, WatchEventType, WatchFilter, WatchLock, WatchStream};
@@ -187,7 +189,9 @@ pub mod prelude {
     pub use crate::db::PulseDB;
     pub use crate::error::{PulseDBError, Result};
     pub use crate::experience::{Experience, ExperienceType, NewExperience};
-    pub use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
+    pub use crate::search::{
+        ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult,
+    };
     pub use crate::substrate::{PulseDBSubstrate, SubstrateProvider};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};
     pub use crate::watch::{ChangePoller, WatchEvent, WatchEventType, WatchFilter, WatchLock};

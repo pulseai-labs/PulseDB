@@ -58,6 +58,7 @@
 //! # }
 //! ```
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -69,18 +70,21 @@ use tracing::{info, instrument, warn};
 use crate::activity::{validate_new_activity, Activity, NewActivity};
 use crate::collective::types::CollectiveStats;
 use crate::collective::{validate_collective_name, Collective};
-use crate::config::{Config, EmbeddingProvider};
+use crate::config::{Config, DecayConfig, EmbeddingProvider, RecallWeights};
 use crate::embedding::{create_embedding_service, EmbeddingService};
 use crate::error::{NotFoundError, PulseDBError, Result, ValidationError};
 use crate::experience::{
-    validate_experience_update, validate_new_experience, Experience, ExperienceUpdate,
-    NewExperience,
+    energy as experience_energy, validate_experience_update, validate_new_experience, Experience,
+    ExperienceUpdate, NewExperience,
 };
 use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
 #[cfg(feature = "sync")]
 use crate::relation::ExperienceRelation;
-use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchResult};
+use crate::search::rerank::{self, is_legacy_recall, resolve_recall_weights};
+use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
+#[cfg(feature = "sync")]
+use crate::types::InstanceId;
 #[cfg(feature = "sync")]
 use crate::types::RelationId;
 use crate::types::{CollectiveId, ExperienceId, InsightId, Timestamp};
@@ -837,6 +841,8 @@ impl PulseDB {
         let embedding_for_hnsw = embedding.clone();
         let collective_id = exp.collective_id;
 
+        let timestamp = Timestamp::now();
+
         // Construct the full experience record
         let experience = Experience {
             id: ExperienceId::new(),
@@ -846,12 +852,13 @@ impl PulseDB {
             experience_type: exp.experience_type,
             importance: exp.importance,
             confidence: exp.confidence,
-            applications: 0,
+            applications: BTreeMap::new(),
             domain: exp.domain,
             related_files: exp.related_files,
             source_agent: exp.source_agent,
             source_task: exp.source_task,
-            timestamp: Timestamp::now(),
+            timestamp,
+            last_reinforced: timestamp,
             archived: false,
         };
 
@@ -1072,6 +1079,163 @@ impl PulseDB {
         Ok(new_count)
     }
 
+    /// Computes the current temporal energy for an experience.
+    ///
+    /// This is a read-only diagnostic: it never writes to storage and does not
+    /// require a writable database handle. Per-collective decay configuration
+    /// takes precedence over the database's global default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
+    #[instrument(skip(self))]
+    pub fn energy(&self, id: ExperienceId) -> Result<f32> {
+        let experience = self
+            .storage
+            .get_experience(id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::experience(id)))?;
+        let decay_config = self
+            .storage
+            .get_decay_config(experience.collective_id)?
+            .unwrap_or_else(|| self.config.decay.clone());
+
+        Ok(experience_energy(
+            experience.importance,
+            experience.applications(),
+            experience.last_reinforced,
+            Timestamp::now(),
+            &decay_config,
+        ))
+    }
+
+    /// Surfaces prune-eligible cold experiences in a collective, coldest-first.
+    ///
+    /// Returns lightweight `(ExperienceId, energy)` pairs — **never** full
+    /// [`Experience`] records — for every experience whose current temporal
+    /// energy is `< below` **and** that is **not already archived**
+    /// (`energy < below && !archived`). Results are sorted ascending by energy
+    /// (coldest first) and truncated to `limit`.
+    ///
+    /// This is a **human-triggered review tool**, not an automatic actuator: it
+    /// merely *surfaces* candidates a consumer may choose to archive/prune. It
+    /// **does not archive** anything and never mutates storage — the
+    /// `auto_archive_below_floor` flag is inert and read by no actuator.
+    ///
+    /// # Archived exclusion
+    ///
+    /// Already-archived experiences are excluded even when their energy is
+    /// `< below`: re-listing them is noise that would double-count a consumer's
+    /// prune loop. Only *cold AND not-yet-archived* experiences are returned.
+    ///
+    /// # Performance
+    ///
+    /// This is a **deliberate `O(n)` single-pass full-collective scan** (enumerate
+    /// all experience IDs → load each → compute scalar energy → filter). There is
+    /// **no energy index**; the scan is acceptable precisely because this is a
+    /// human-triggered review tool invoked rarely, not a hot query path. The
+    /// `DecayConfig` is resolved once and `Timestamp::now()` is captured once for
+    /// the whole scan (scalar `experience_energy` per candidate), mirroring
+    /// [`energy()`](Self::energy) — never a per-item `self.energy(id)` re-resolve.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # fn main() -> pulsedb::Result<()> {
+    /// # let dir = tempfile::tempdir().unwrap();
+    /// # let db = pulsedb::PulseDB::open(dir.path().join("cold.db"), pulsedb::Config::default())?;
+    /// let collective = db.create_collective("my-project")?;
+    ///
+    /// // Surface up to 100 prune-eligible candidates with energy < 0.05,
+    /// // coldest-first. Returns lightweight (ExperienceId, energy) pairs —
+    /// // not full Experience records. Read-only: nothing is archived.
+    /// for (id, energy) in db.list_cold_experiences(collective, 0.05, 100)? {
+    ///     println!("cold candidate {id} @ energy {energy}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to scan.
+    /// * `below` - Energy threshold in `[0.0, 1.0]`; experiences with current
+    ///   energy strictly below this are surfaced.
+    /// * `limit` - Maximum number of pairs to return (1-1000).
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if `limit` is 0 or > 1000, or if
+    ///   `below` is NaN or outside `[0.0, 1.0]`.
+    /// - [`NotFoundError::Collective`] if the collective doesn't exist.
+    #[instrument(skip(self))]
+    pub fn list_cold_experiences(
+        &self,
+        collective_id: CollectiveId,
+        below: f32,
+        limit: usize,
+    ) -> Result<Vec<(ExperienceId, f32)>> {
+        // Validate limit (mirror get_recent_experiences_filtered).
+        if limit == 0 || limit > 1000 {
+            return Err(
+                ValidationError::invalid_field("limit", "must be between 1 and 1000").into(),
+            );
+        }
+
+        // Validate threshold: reject NaN and out-of-range.
+        if below.is_nan() || !(0.0..=1.0).contains(&below) {
+            return Err(
+                ValidationError::invalid_field("below", "must be between 0.0 and 1.0").into(),
+            );
+        }
+
+        // Verify collective exists.
+        self.storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        // Resolve decay config ONCE and capture `now` ONCE for the whole scan
+        // (hot-path rule: never re-resolve per item via self.energy(id)).
+        let decay_config = self
+            .storage
+            .get_decay_config(collective_id)?
+            .unwrap_or_else(|| self.config.decay.clone());
+        let now = Timestamp::now();
+
+        // Single-pass full-collective scan. Stream every experience ID in ONE
+        // index iteration (limit = usize::MAX, offset = 0) — offset-restart
+        // pagination was quadratic (each page re-skipped from the start). The
+        // remaining per-row-txn / embedding-hauling / snapshot-safety rework is
+        // tracked in #21. Load each, compute scalar energy, keep
+        // `energy < below && !archived`.
+        let mut cold: Vec<(ExperienceId, f32)> = Vec::new();
+        let ids = self
+            .storage
+            .list_experience_ids_paginated(collective_id, usize::MAX, 0)?;
+        for id in ids {
+            let Some(experience) = self.storage.get_experience(id)? else {
+                continue;
+            };
+            if experience.archived {
+                continue;
+            }
+            let energy = experience_energy(
+                experience.importance,
+                experience.applications(),
+                experience.last_reinforced,
+                now,
+                &decay_config,
+            );
+            if energy < below {
+                cold.push((id, energy));
+            }
+        }
+
+        // Coldest-first (ascending energy), then truncate to limit.
+        cold.sort_by(|a, b| a.1.total_cmp(&b.1));
+        cold.truncate(limit);
+        Ok(cold)
+    }
+
     // =========================================================================
     // Recent Experiences
     // =========================================================================
@@ -1265,6 +1429,131 @@ impl PulseDB {
         k: usize,
     ) -> Result<Vec<SearchResult>> {
         self.search_similar_filtered(collective_id, query, k, SearchFilter::default())
+    }
+
+    /// Searches for experiences with optional recall weighting.
+    ///
+    /// This is the forward-compatible search entry for VS-3.5.2. When the
+    /// resolved energy weight is zero, it delegates to the unchanged legacy
+    /// similarity path. Positive energy weights over-fetch vector candidates,
+    /// blend similarity with temporal energy, then sort and truncate.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to search within
+    /// * `query` - Query embedding vector (must match collective's dimension)
+    /// * `options` - Result limit, filter, and optional recall weights
+    ///
+    /// # Errors
+    ///
+    /// - [`ValidationError::InvalidField`] if request weights are invalid
+    /// - [`ValidationError::DimensionMismatch`] if `query.len()` doesn't match
+    ///   the collective's embedding dimension
+    /// - Legacy search errors from [`search_similar_filtered`](Self::search_similar_filtered)
+    #[instrument(skip(self, query, options))]
+    pub fn search(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        // Effective per-collective decay config: a stored per-collective override
+        // wins; otherwise fall back to the global `Config.decay` — matching the
+        // record/energy reads elsewhere. This also honors the documented global
+        // `Config.decay.default_recall_weights` for collectives with no stored
+        // override (PR #23 review; precedence stored > global > none, relates to #16).
+        let decay_config = self
+            .storage
+            .get_decay_config(collective_id)?
+            .unwrap_or_else(|| self.config.decay.clone());
+        let collective_default =
+            decay_config.default_recall_weights.filter(|weights| {
+                match weights.validate("decay.default_recall_weights") {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "ignoring invalid default_recall_weights (issue #14)"
+                        );
+                        false
+                    }
+                }
+            });
+
+        let effective = resolve_recall_weights(options.weights, collective_default)?;
+        if is_legacy_recall(effective) {
+            return self.search_similar_filtered(collective_id, query, options.k, options.filter);
+        }
+
+        let weights = effective.expect("non-legacy recall implies weights are present");
+        self.search_similar_weighted(
+            collective_id,
+            query,
+            options.k,
+            options.filter,
+            weights,
+            decay_config,
+        )
+    }
+
+    fn search_similar_weighted(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        k: usize,
+        filter: SearchFilter,
+        weights: RecallWeights,
+        decay_config: DecayConfig,
+    ) -> Result<Vec<SearchResult>> {
+        if k == 0 || k > 1000 {
+            return Err(ValidationError::invalid_field("k", "must be between 1 and 1000").into());
+        }
+
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+
+        let expected_dim = collective.embedding_dimension as usize;
+        if query.len() != expected_dim {
+            return Err(ValidationError::dimension_mismatch(expected_dim, query.len()).into());
+        }
+
+        let over_fetch = std::cmp::max(k.saturating_mul(4), k.saturating_add(16)).min(2000);
+        let ef_search = self.config.hnsw.ef_search.max(over_fetch);
+        let now = Timestamp::now();
+
+        let candidates = self
+            .with_vector_index(collective_id, |index| {
+                index.search_experiences(query, over_fetch, ef_search)
+            })?
+            .unwrap_or_default();
+
+        let mut scored = Vec::with_capacity(candidates.len());
+        for (exp_id, distance) in candidates {
+            if let Some(experience) = self.storage.get_experience(exp_id)? {
+                if filter.matches(&experience) {
+                    let similarity = 1.0 - distance;
+                    let energy = experience_energy(
+                        experience.importance,
+                        experience.applications(),
+                        experience.last_reinforced,
+                        now,
+                        &decay_config,
+                    );
+                    let score = rerank::blend_score(similarity, energy, weights);
+                    scored.push((
+                        SearchResult {
+                            experience,
+                            similarity,
+                        },
+                        score,
+                    ));
+                }
+            }
+        }
+
+        Ok(rerank::rerank(scored, k))
     }
 
     /// Searches for semantically similar experiences with additional filtering.
@@ -1959,7 +2248,7 @@ impl PulseDB {
             .collect();
 
         // Sort by last_heartbeat descending (most recently active first)
-        active.sort_by(|a, b| b.last_heartbeat.cmp(&a.last_heartbeat));
+        active.sort_by_key(|a| std::cmp::Reverse(a.last_heartbeat));
 
         Ok(active)
     }
@@ -2052,11 +2341,14 @@ impl PulseDB {
         }
 
         // ── 1. Similar experiences (HNSW vector search) ──────────
-        let similar_experiences = self.search_similar_filtered(
+        let similar_experiences = self.search(
             request.collective_id,
             &request.query_embedding,
-            request.max_similar,
-            request.filter.clone(),
+            SearchOptions {
+                k: request.max_similar,
+                filter: request.filter.clone(),
+                weights: request.recall_weights,
+            },
         )?;
 
         // ── 2. Recent experiences (timestamp index scan) ─────────
@@ -2124,6 +2416,62 @@ impl PulseDB {
             relations,
             active_agents,
         })
+    }
+
+    /// Inserts a backdated experience fixture into storage and the vector index.
+    #[cfg(test)]
+    pub(crate) fn insert_experience_backdated(
+        &self,
+        collective_id: CollectiveId,
+        content: &str,
+        embedding: Vec<f32>,
+        importance: f32,
+        applications: BTreeMap<crate::types::InstanceId, u32>,
+        last_reinforced: Timestamp,
+    ) -> Result<ExperienceId> {
+        self.check_writable()?;
+        let embedding_for_hnsw = embedding.clone();
+        let now = Timestamp::now();
+        let experience = Experience {
+            id: ExperienceId::new(),
+            collective_id,
+            content: content.to_string(),
+            embedding,
+            experience_type: crate::experience::ExperienceType::default(),
+            importance,
+            confidence: 0.8,
+            applications,
+            domain: vec![],
+            related_files: vec![],
+            source_agent: crate::types::AgentId::new("test"),
+            source_task: None,
+            timestamp: now,
+            last_reinforced,
+            archived: false,
+        };
+        let id = experience.id;
+
+        self.storage.save_experience(&experience)?;
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        let index = vectors
+            .get(&collective_id)
+            .ok_or_else(|| PulseDBError::vector("HNSW index missing for collective"))?;
+        index.insert_experience(id, &embedding_for_hnsw)?;
+
+        Ok(id)
+    }
+
+    /// Stores a collective decay config fixture for tests.
+    #[cfg(test)]
+    pub(crate) fn set_decay_config_for_test(
+        &self,
+        collective_id: CollectiveId,
+        config: DecayConfig,
+    ) -> Result<()> {
+        self.storage.set_decay_config(collective_id, config)
     }
 
     // =========================================================================
@@ -2382,6 +2730,25 @@ impl PulseDB {
         Ok(())
     }
 
+    /// Merges synced G-counter reinforcement fields from a remote peer.
+    ///
+    /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
+    #[cfg(feature = "sync")]
+    pub(crate) fn apply_synced_experience_counter_merge(
+        &self,
+        id: ExperienceId,
+        applications: &BTreeMap<InstanceId, u32>,
+        last_reinforced: Option<Timestamp>,
+    ) -> Result<bool> {
+        let merged =
+            self.storage
+                .merge_experience_applications(id, applications, last_reinforced)?;
+        if merged {
+            debug!(id = %id, "Synced experience counter merge applied");
+        }
+        Ok(merged)
+    }
+
     /// Applies a synced experience deletion from a remote peer.
     ///
     /// Removes from storage and soft-deletes from HNSW.
@@ -2612,5 +2979,226 @@ mod tests {
     fn test_pulsedb_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PulseDB>();
+    }
+
+    // =========================================================================
+    // list_cold_experiences — conservative-lifecycle surfacing (VS-3.5.3 / FR-034)
+    // =========================================================================
+
+    /// A 384-d embedding fixture (dimension must match the default D384 index).
+    fn cold_test_embedding() -> Vec<f32> {
+        let mut embedding = vec![0.0f32; 384];
+        embedding[0] = 1.0;
+        embedding
+    }
+
+    /// Backdates `last_reinforced` by `days` so the fixture decays well below
+    /// the default `floor` (0.05) under a 30-day half-life.
+    fn days_ago(days: i64) -> Timestamp {
+        Timestamp::from_millis(Timestamp::now().as_millis() - days * 24 * 60 * 60 * 1000)
+    }
+
+    /// Opens a default-config db with a single collective.
+    fn open_cold_fixture(name: &str) -> (tempfile::TempDir, PulseDB, CollectiveId) {
+        let dir = tempdir().unwrap();
+        let db = PulseDB::open(dir.path().join(format!("{name}.db")), Config::default()).unwrap();
+        let collective_id = db.create_collective(name).unwrap();
+        (dir, db, collective_id)
+    }
+
+    #[test]
+    fn list_cold_experiences_surfaces_below_floor() {
+        let (_dir, db, collective_id) = open_cold_fixture("cold-surfaces");
+        let floor = Config::default().decay.floor; // 0.05
+
+        // A cold experience: importance 0.9 last reinforced ~365 days ago decays
+        // far below the 0.05 floor under the default 30-day half-life.
+        let cold_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold memory",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+
+        // A warm experience: importance 0.9 reinforced now stays at ~0.9 (> floor).
+        let warm_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "warm memory",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                Timestamp::now(),
+            )
+            .unwrap();
+
+        let cold = db.list_cold_experiences(collective_id, floor, 100).unwrap();
+
+        // Only the cold experience is surfaced, with its energy reported.
+        assert_eq!(cold.len(), 1, "exactly one experience is below the floor");
+        assert_eq!(cold[0].0, cold_id, "the cold experience is surfaced");
+        assert!(
+            cold[0].1 < floor,
+            "reported energy {} is below floor {floor}",
+            cold[0].1
+        );
+        assert!(
+            !cold.iter().any(|(id, _)| *id == warm_id),
+            "the warm experience is not surfaced"
+        );
+
+        // Coldest-first ordering: add a second, even-colder experience and assert
+        // the result is sorted ascending by energy.
+        let colder_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "even colder memory",
+                cold_test_embedding(),
+                0.1,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+        let cold = db.list_cold_experiences(collective_id, floor, 100).unwrap();
+        assert_eq!(cold.len(), 2, "both cold experiences are surfaced");
+        assert!(
+            cold[0].1 <= cold[1].1,
+            "results are coldest-first (ascending energy): {:?}",
+            cold
+        );
+        assert_eq!(cold[0].0, colder_id, "the coldest experience comes first");
+
+        // limit/below validation: limit 0 and out-of-range `below` are rejected.
+        assert!(db.list_cold_experiences(collective_id, floor, 0).is_err());
+        assert!(db.list_cold_experiences(collective_id, 1.5, 100).is_err());
+        assert!(db
+            .list_cold_experiences(collective_id, f32::NAN, 100)
+            .is_err());
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn cold_experience_not_auto_archived_by_default() {
+        // D3 invariant: under DEFAULT config, recording → searching → listing a
+        // cold experience NEVER flips `archived` — auto_archive_below_floor is
+        // inert (read by no actuator).
+        let (_dir, db, collective_id) = open_cold_fixture("auto-archive-off");
+        let floor = Config::default().decay.floor;
+
+        let cold_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold-but-not-archived",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+
+        // Freshly recorded: archived must be false.
+        assert!(
+            !db.storage
+                .get_experience(cold_id)
+                .unwrap()
+                .unwrap()
+                .archived,
+            "archived is false immediately after record"
+        );
+
+        // search: a query touching the collective must not flip archived.
+        let _ = db
+            .search_similar(collective_id, &cold_test_embedding(), 10)
+            .unwrap();
+        assert!(
+            !db.storage
+                .get_experience(cold_id)
+                .unwrap()
+                .unwrap()
+                .archived,
+            "archived is false after search"
+        );
+
+        // list_cold_experiences surfaces it but must NOT archive it.
+        let cold = db.list_cold_experiences(collective_id, floor, 100).unwrap();
+        assert!(
+            cold.iter().any(|(id, _)| *id == cold_id),
+            "the cold experience is surfaced"
+        );
+        assert!(
+            !db.storage
+                .get_experience(cold_id)
+                .unwrap()
+                .unwrap()
+                .archived,
+            "archived is STILL false after list_cold_experiences (no auto-archive)"
+        );
+
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn list_cold_excludes_archived_experiences() {
+        // C5: an experience that is cold (E < below) AND already archived is
+        // EXCLUDED from the result (prune-eligible = cold and not yet archived).
+        let (_dir, db, collective_id) = open_cold_fixture("cold-excludes-archived");
+        let floor = Config::default().decay.floor;
+
+        // Two genuinely-cold experiences (both would match E < below).
+        let surfaced_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold not archived",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+        let archived_id = db
+            .insert_experience_backdated(
+                collective_id,
+                "cold already archived",
+                cold_test_embedding(),
+                0.9,
+                std::collections::BTreeMap::new(),
+                days_ago(365),
+            )
+            .unwrap();
+
+        // Non-vacuity guard: confirm BOTH are below the floor BEFORE archiving —
+        // so the exclusion below is genuinely the !archived filter at work, not a
+        // side-effect of the archived experience being warm.
+        let before = db.list_cold_experiences(collective_id, floor, 100).unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "both cold experiences match E < below before archiving"
+        );
+
+        // Archive one of them — it now matches E < below but is archived.
+        db.archive_experience(archived_id).unwrap();
+
+        let after = db.list_cold_experiences(collective_id, floor, 100).unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "the archived cold experience is excluded by the !archived filter"
+        );
+        assert_eq!(
+            after[0].0, surfaced_id,
+            "only the non-archived cold exp remains"
+        );
+        assert!(
+            !after.iter().any(|(id, _)| *id == archived_id),
+            "the archived cold experience does NOT appear"
+        );
+
+        db.close().unwrap();
     }
 }

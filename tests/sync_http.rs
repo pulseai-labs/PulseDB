@@ -14,7 +14,8 @@ use axum::routing::{get, post};
 use axum::Router;
 use tokio::net::TcpListener;
 
-use pulsedb::sync::config::SyncConfig;
+use pulsedb::sync::config::{SyncConfig, SyncDirection};
+use pulsedb::sync::guard::SyncApplyGuard;
 use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::server::SyncServer;
 use pulsedb::sync::transport::SyncTransport;
@@ -198,6 +199,41 @@ async fn test_http_full_sync_via_manager() {
 }
 
 #[tokio::test]
+async fn test_http_reinforcement_gcounter_converges_exact_total() {
+    let server = start_test_server().await;
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let transport = HttpSyncTransport::new(&server.base_url);
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(transport),
+        SyncConfig::default(),
+    );
+
+    let cid = server.db.create_collective("http-gcounter").unwrap();
+    let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
+
+    let seed = server.db.get_experience(exp_id).unwrap().unwrap();
+    let guard = SyncApplyGuard::enter();
+    db_client.apply_synced_experience(seed).unwrap();
+    drop(guard);
+
+    server.db.reinforce_experience(exp_id).unwrap();
+    db_client.reinforce_experience(exp_id).unwrap();
+    db_client.reinforce_experience(exp_id).unwrap();
+
+    manager.sync_once().await.unwrap();
+
+    let server_exp = server.db.get_experience(exp_id).unwrap().unwrap();
+    let client_exp = db_client.get_experience(exp_id).unwrap().unwrap();
+    assert_eq!(server_exp.applications(), 3);
+    assert_eq!(client_exp.applications(), 3);
+    assert_eq!(server_exp.applications, client_exp.applications);
+}
+
+#[tokio::test]
 async fn test_http_auth_token() {
     // This test just verifies the transport sends the header without error.
     // Full auth verification would require server-side middleware.
@@ -226,7 +262,7 @@ async fn test_http_push_to_server() {
 
     let transport = HttpSyncTransport::new(&server.base_url);
     let config = SyncConfig {
-        direction: pulsedb::sync::config::SyncDirection::PushOnly,
+        direction: SyncDirection::PushOnly,
         ..SyncConfig::default()
     };
     let mut manager = SyncManager::new(Arc::clone(&db_client), Box::new(transport), config);

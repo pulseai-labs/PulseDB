@@ -28,15 +28,19 @@ pub mod schema;
 pub use self::redb::RedbStorage;
 pub use schema::{DatabaseMetadata, SCHEMA_VERSION};
 
+#[cfg(feature = "sync")]
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::activity::Activity;
 use crate::collective::Collective;
-use crate::config::Config;
+use crate::config::{Config, DecayConfig};
 use crate::error::Result;
 use crate::experience::{Experience, ExperienceUpdate};
 use crate::insight::DerivedInsight;
 use crate::relation::{ExperienceRelation, RelationType};
+#[cfg(feature = "sync")]
+use crate::types::InstanceId;
 use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId, Timestamp};
 
 /// Storage engine trait for PulseDB.
@@ -133,6 +137,23 @@ pub trait StorageEngine: Send + Sync {
     /// Returns an error if the write transaction fails.
     fn delete_collective(&self, id: CollectiveId) -> Result<bool>;
 
+    /// Retrieves the stored decay configuration for a collective.
+    ///
+    /// Returns `None` when no per-collective override has been stored; callers
+    /// should fall back to [`DecayConfig::default`] or their global config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read transaction or deserialization fails.
+    fn get_decay_config(&self, collective_id: CollectiveId) -> Result<Option<DecayConfig>>;
+
+    /// Saves the decay configuration override for a collective.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write transaction or serialization fails.
+    fn set_decay_config(&self, collective_id: CollectiveId, config: DecayConfig) -> Result<()>;
+
     // =========================================================================
     // Experience Index Operations (for collective stats & cascade delete)
     // =========================================================================
@@ -221,6 +242,19 @@ pub trait StorageEngine: Send + Sync {
     /// Returns `true` if the experience existed and was updated,
     /// `false` if not found.
     fn update_experience(&self, id: ExperienceId, update: &ExperienceUpdate) -> Result<bool>;
+
+    /// Merges synced G-counter fields into an experience.
+    ///
+    /// Each incoming applications bucket is merged with per-key max semantics.
+    /// `last_reinforced`, when supplied, is merged by max timestamp. Returns
+    /// `true` when the experience existed and was merged.
+    #[cfg(feature = "sync")]
+    fn merge_experience_applications(
+        &self,
+        id: ExperienceId,
+        applications: &BTreeMap<InstanceId, u32>,
+        last_reinforced: Option<Timestamp>,
+    ) -> Result<bool>;
 
     /// Permanently deletes an experience and its embedding.
     ///

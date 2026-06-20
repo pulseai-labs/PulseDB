@@ -5,11 +5,45 @@
 
 mod context;
 mod filter;
+pub(crate) mod rerank;
 
 pub use context::{ContextCandidates, ContextRequest};
 pub use filter::SearchFilter;
 
+use crate::config::RecallWeights;
 use crate::experience::Experience;
+
+/// Options for recall search.
+///
+/// `SearchOptions` is the call-time configuration for [`PulseDB::search()`].
+/// Recall-weight precedence is: explicit `weights` here > the collective's
+/// configured `DecayConfig.default_recall_weights` (per-collective stored config,
+/// else the global `Config.decay`) > legacy pure-similarity ranking. So
+/// `weights: None` preserves legacy ranking only when no default is configured.
+///
+/// [`PulseDB::search()`]: crate::PulseDB::search
+#[derive(Clone, Debug)]
+pub struct SearchOptions {
+    /// Maximum number of results to return.
+    pub k: usize,
+
+    /// Filter criteria applied after vector retrieval.
+    pub filter: SearchFilter,
+
+    /// Optional recall weights for similarity and temporal energy. `None` falls
+    /// back to the configured `default_recall_weights`, then to legacy ranking.
+    pub weights: Option<RecallWeights>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            k: 10,
+            filter: SearchFilter::default(),
+            weights: None,
+        }
+    }
+}
 
 /// A search result pairing an experience with its similarity score.
 ///
@@ -68,6 +102,7 @@ mod tests {
 
     /// Helper to create a SearchResult with a given similarity.
     fn make_result(similarity: f32) -> SearchResult {
+        let timestamp = Timestamp::now();
         SearchResult {
             experience: Experience {
                 id: ExperienceId::new(),
@@ -77,12 +112,13 @@ mod tests {
                 experience_type: ExperienceType::default(),
                 importance: 0.5,
                 confidence: 0.8,
-                applications: 0,
+                applications: std::collections::BTreeMap::new(),
                 domain: vec!["test".to_string()],
                 related_files: vec![],
                 source_agent: AgentId::new("agent-1"),
                 source_task: None,
-                timestamp: Timestamp::now(),
+                timestamp,
+                last_reinforced: timestamp,
                 archived: false,
             },
             similarity,

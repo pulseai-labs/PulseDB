@@ -7,6 +7,7 @@
 //! - Dimension mismatch detection
 //! - Proper resource cleanup on close
 
+use pulsedb::storage::SCHEMA_VERSION;
 use pulsedb::{Config, EmbeddingDimension, PulseDB, PulseDBError, SyncMode, ValidationError};
 use tempfile::tempdir;
 
@@ -265,7 +266,7 @@ fn test_close_flushes_data() {
 
     // Reopen and verify metadata was persisted
     let db = PulseDB::open(&path, Config::default()).unwrap();
-    assert_eq!(db.metadata().schema_version, 2);
+    assert_eq!(db.metadata().schema_version, SCHEMA_VERSION);
     db.close().unwrap();
 }
 

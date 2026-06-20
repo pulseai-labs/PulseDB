@@ -86,6 +86,28 @@ pub trait SubstrateProvider: Send + Sync {
     /// Retrieves an experience by ID, or `None` if it doesn't exist.
     async fn get_experience(&self, id: ExperienceId) -> Result<Option<Experience>, PulseDBError>;
 
+    /// Reinforces an experience and returns its summed application count.
+    ///
+    /// The default implementation returns an unsupported-operation error so
+    /// existing custom providers remain source-compatible without pretending a
+    /// mutation succeeded.
+    async fn reinforce_experience(&self, _id: ExperienceId) -> Result<u32, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::reinforce_experience is not supported by this implementation",
+        ))
+    }
+
+    /// Computes the current temporal energy for an experience.
+    ///
+    /// The default implementation returns an unsupported-operation error so
+    /// existing custom providers remain source-compatible without inventing a
+    /// misleading energy value.
+    async fn energy(&self, _id: ExperienceId) -> Result<f32, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::energy is not supported by this implementation",
+        ))
+    }
+
     /// Searches for experiences similar to the given embedding.
     ///
     /// Returns up to `k` results as `(Experience, similarity_score)` tuples,
@@ -203,5 +225,173 @@ pub trait SubstrateProvider: Send + Sync {
         _offset: usize,
     ) -> Result<Vec<DerivedInsight>, PulseDBError> {
         Ok(vec![])
+    }
+
+    /// Lists cold (prune-eligible) experiences whose temporal energy is below a
+    /// threshold, coldest-first.
+    ///
+    /// Returns up to `limit` lightweight `(ExperienceId, energy)` pairs sorted by
+    /// energy ascending — the read-only signal a reviewer uses to surface
+    /// prune-eligible candidates. The substrate exposes only this signal; it
+    /// deliberately offers **no** archive/prune mutation (read-only consistency
+    /// surface).
+    ///
+    /// The default implementation returns an unsupported-operation error so
+    /// existing custom providers remain source-compatible without inventing a
+    /// misleading candidate list.
+    async fn list_cold_experiences(
+        &self,
+        _collective: CollectiveId,
+        _below: f32,
+        _limit: usize,
+    ) -> Result<Vec<(ExperienceId, f32)>, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::list_cold_experiences is not supported by this implementation",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal non-PulseDB provider that implements ONLY the required (non-default)
+    /// trait methods, leaving every defaulted method — including
+    /// `list_cold_experiences` — at its trait default. Exists solely to assert the
+    /// read-only cold-list default returns the unsupported-operation `Err` and that
+    /// `SubstrateProvider` stays object-safe (`Box<dyn …>`-able).
+    struct StubProvider;
+
+    #[async_trait]
+    impl SubstrateProvider for StubProvider {
+        async fn store_experience(
+            &self,
+            _exp: NewExperience,
+        ) -> Result<ExperienceId, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn get_experience(
+            &self,
+            _id: ExperienceId,
+        ) -> Result<Option<Experience>, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn search_similar(
+            &self,
+            _collective: CollectiveId,
+            _embedding: &[f32],
+            _k: usize,
+        ) -> Result<Vec<(Experience, f32)>, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn get_recent(
+            &self,
+            _collective: CollectiveId,
+            _limit: usize,
+        ) -> Result<Vec<Experience>, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn store_relation(
+            &self,
+            _rel: NewExperienceRelation,
+        ) -> Result<RelationId, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn get_related(
+            &self,
+            _exp_id: ExperienceId,
+        ) -> Result<Vec<(Experience, ExperienceRelation)>, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn store_insight(
+            &self,
+            _insight: NewDerivedInsight,
+        ) -> Result<InsightId, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn get_insights(
+            &self,
+            _collective: CollectiveId,
+            _embedding: &[f32],
+            _k: usize,
+        ) -> Result<Vec<(DerivedInsight, f32)>, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn get_activities(
+            &self,
+            _collective: CollectiveId,
+        ) -> Result<Vec<Activity>, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn get_context_candidates(
+            &self,
+            _request: ContextRequest,
+        ) -> Result<ContextCandidates, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn watch(
+            &self,
+            _collective: CollectiveId,
+        ) -> Result<Pin<Box<dyn Stream<Item = WatchEvent> + Send>>, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn create_collective(&self, _name: &str) -> Result<CollectiveId, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn get_or_create_collective(
+            &self,
+            _name: &str,
+        ) -> Result<CollectiveId, PulseDBError> {
+            unimplemented!("stub")
+        }
+
+        async fn list_collectives(&self) -> Result<Vec<Collective>, PulseDBError> {
+            unimplemented!("stub")
+        }
+        // NOTE: list_cold_experiences is intentionally NOT overridden — the test
+        // exercises the trait DEFAULT.
+    }
+
+    /// The default `list_cold_experiences` must return the unsupported-operation
+    /// `Err` for a non-PulseDB provider (read-only signal stays inert unless a
+    /// concrete impl wires it through). Non-vacuous: a real provider, real call,
+    /// real assertion on the `Err` payload.
+    #[tokio::test]
+    async fn default_list_cold_experiences_is_unsupported() {
+        let provider = StubProvider;
+        let result = provider
+            .list_cold_experiences(CollectiveId::nil(), 0.5, 10)
+            .await;
+
+        let err = result.expect_err("default list_cold_experiences must return an Err");
+        assert!(
+            err.to_string()
+                .contains("not supported by this implementation"),
+            "expected unsupported-operation error, got: {err}"
+        );
+    }
+
+    /// Guards trait object-safety: `SubstrateProvider` must remain
+    /// `Box<dyn …>`-able after adding the cold-list method, and the default is
+    /// reachable through the trait object.
+    #[tokio::test]
+    async fn cold_list_default_is_object_safe() {
+        let provider: Box<dyn SubstrateProvider> = Box::new(StubProvider);
+        let result = provider
+            .list_cold_experiences(CollectiveId::nil(), 0.25, 5)
+            .await;
+        assert!(result.is_err(), "default via trait object must be Err");
     }
 }

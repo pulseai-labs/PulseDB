@@ -90,6 +90,16 @@ impl SubstrateProvider for PulseDBSubstrate {
         blocking(move || db.get_experience(id)).await
     }
 
+    async fn reinforce_experience(&self, id: ExperienceId) -> Result<u32, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.reinforce_experience(id)).await
+    }
+
+    async fn energy(&self, id: ExperienceId) -> Result<f32, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.energy(id)).await
+    }
+
     async fn search_similar(
         &self,
         collective: CollectiveId,
@@ -227,5 +237,15 @@ impl SubstrateProvider for PulseDBSubstrate {
     ) -> Result<Vec<DerivedInsight>, PulseDBError> {
         let db = Arc::clone(&self.db);
         blocking(move || db.list_insights(collective, limit, offset)).await
+    }
+
+    async fn list_cold_experiences(
+        &self,
+        collective: CollectiveId,
+        below: f32,
+        limit: usize,
+    ) -> Result<Vec<(ExperienceId, f32)>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.list_cold_experiences(collective, below, limit)).await
     }
 }

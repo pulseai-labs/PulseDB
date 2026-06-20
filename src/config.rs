@@ -80,6 +80,12 @@ pub struct Config {
     /// See [`WatchConfig`] for details.
     pub watch: WatchConfig,
 
+    /// Temporal decay parameters.
+    ///
+    /// Controls closed-form energy decay for experiences. See [`DecayConfig`]
+    /// for defaults and tuning guidance.
+    pub decay: DecayConfig,
+
     /// Read-only mode.
     ///
     /// When `true`, all mutation methods (`record_experience`, `store_relation`,
@@ -105,6 +111,7 @@ impl Default for Config {
             hnsw: HnswConfig::default(),
             activity: ActivityConfig::default(),
             watch: WatchConfig::default(),
+            decay: DecayConfig::default(),
             read_only: false,
         }
     }
@@ -223,6 +230,29 @@ impl Config {
                 "watch.poll_interval_ms",
                 "must be greater than 0",
             ));
+        }
+
+        // Validate temporal decay parameters
+        if self.decay.half_life.is_zero() {
+            return Err(ValidationError::invalid_field(
+                "decay.half_life",
+                "must be greater than 0",
+            ));
+        }
+        if !self.decay.freq_weight.is_finite() || self.decay.freq_weight < 0.0 {
+            return Err(ValidationError::invalid_field(
+                "decay.freq_weight",
+                "must be finite and non-negative",
+            ));
+        }
+        if !self.decay.floor.is_finite() || !(0.0..=1.0).contains(&self.decay.floor) {
+            return Err(ValidationError::invalid_field(
+                "decay.floor",
+                "must be finite and between 0 and 1",
+            ));
+        }
+        if let Some(weights) = self.decay.default_recall_weights {
+            weights.validate("decay.default_recall_weights")?;
         }
 
         // Validate custom dimension bounds
@@ -517,6 +547,102 @@ impl Default for WatchConfig {
     }
 }
 
+/// Weighting factors for energy-aware recall.
+///
+/// This config type is stored as part of [`DecayConfig`], but recall ranking
+/// uses it only once the energy-weighted search surface is enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecallWeights {
+    /// Similarity-score contribution.
+    pub similarity: f32,
+
+    /// Energy-score contribution.
+    pub energy: f32,
+}
+
+impl RecallWeights {
+    /// Creates recall weights.
+    pub const fn new(similarity: f32, energy: f32) -> Self {
+        Self { similarity, energy }
+    }
+
+    pub(crate) fn validate(&self, field: &'static str) -> Result<(), ValidationError> {
+        if !self.similarity.is_finite()
+            || !self.energy.is_finite()
+            || self.similarity < 0.0
+            || self.energy < 0.0
+        {
+            return Err(ValidationError::invalid_field(
+                field,
+                "weights must be finite and non-negative",
+            ));
+        }
+
+        let sum = self.similarity + self.energy;
+        if (sum - 1.0).abs() > 0.000_1 {
+            return Err(ValidationError::invalid_field(
+                field,
+                "similarity and energy weights must sum to 1",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for RecallWeights {
+    fn default() -> Self {
+        Self {
+            similarity: 0.7,
+            energy: 0.3,
+        }
+    }
+}
+
+/// Temporal decay configuration.
+///
+/// The defaults model a 30-day half-life, logarithmic reinforcement boost,
+/// and a conservative cold-memory floor without automatic archiving.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecayConfig {
+    /// Half-life for exponential energy decay.
+    ///
+    /// Default: 30 days.
+    pub half_life: Duration,
+
+    /// Logarithmic frequency weight `k` in `1 + k * ln(1 + applications)`.
+    ///
+    /// Default: `0.25`.
+    pub freq_weight: f32,
+
+    /// Energy floor below which experiences are cold.
+    ///
+    /// Default: `0.05`.
+    pub floor: f32,
+
+    /// Whether cold experiences should be archived automatically.
+    ///
+    /// Default: `false`.
+    pub auto_archive_below_floor: bool,
+
+    /// Default recall weights for energy-aware ranking.
+    ///
+    /// `None` preserves legacy pure-similarity ranking.
+    pub default_recall_weights: Option<RecallWeights>,
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            half_life: Duration::from_secs(30 * 24 * 60 * 60),
+            freq_weight: 0.25,
+            floor: 0.05,
+            auto_archive_below_floor: false,
+            default_recall_weights: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +744,73 @@ mod tests {
     fn test_config_includes_hnsw() {
         let config = Config::default();
         assert_eq!(config.hnsw.max_nb_connection, 16);
+    }
+
+    #[test]
+    fn test_decay_config_defaults() {
+        let config = DecayConfig::default();
+        assert_eq!(config.half_life, Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(config.freq_weight, 0.25);
+        assert_eq!(config.floor, 0.05);
+        assert!(!config.auto_archive_below_floor);
+        assert!(config.default_recall_weights.is_none());
+    }
+
+    #[test]
+    fn test_config_includes_decay() {
+        let config = Config::default();
+        assert_eq!(
+            config.decay.half_life,
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn test_validate_decay_zero_half_life() {
+        let config = Config {
+            decay: DecayConfig {
+                half_life: Duration::ZERO,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidField { field, .. } if field == "decay.half_life"
+        ));
+    }
+
+    #[test]
+    fn test_validate_decay_negative_freq_weight() {
+        let config = Config {
+            decay: DecayConfig {
+                freq_weight: -0.01,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidField { field, .. } if field == "decay.freq_weight"
+        ));
+    }
+
+    #[test]
+    fn test_validate_decay_floor_out_of_range() {
+        let config = Config {
+            decay: DecayConfig {
+                floor: 1.01,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ValidationError::InvalidField { field, .. } if field == "decay.floor"
+        ));
     }
 
     #[test]

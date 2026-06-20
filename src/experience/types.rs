@@ -12,10 +12,12 @@
 //! ExperienceTypeTag (compact 1-byte discriminant for index keys)
 //! ```
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::storage::schema::ExperienceTypeTag;
-use crate::types::{AgentId, CollectiveId, ExperienceId, TaskId, Timestamp};
+use crate::types::{AgentId, CollectiveId, ExperienceId, InstanceId, TaskId, Timestamp};
 
 // ============================================================================
 // Severity
@@ -208,8 +210,10 @@ pub struct Experience {
     /// Confidence score (0.0–1.0). Higher = more confident.
     pub confidence: f32,
 
-    /// Number of times this experience has been applied/reinforced.
-    pub applications: u32,
+    /// Per-instance application/reinforcement counters.
+    ///
+    /// The total application count is available via [`applications()`](Self::applications).
+    pub applications: BTreeMap<InstanceId, u32>,
 
     /// Domain tags for categorical filtering (e.g., ["rust", "async"]).
     pub domain: Vec<String>,
@@ -226,11 +230,24 @@ pub struct Experience {
     /// When this experience was recorded.
     pub timestamp: Timestamp,
 
+    /// Last time this experience was explicitly reinforced.
+    pub last_reinforced: Timestamp,
+
     /// Whether this experience is archived (soft-deleted).
     ///
     /// Archived experiences are excluded from search results but remain
     /// in storage and can be restored via `unarchive_experience()`.
     pub archived: bool,
+}
+
+impl Experience {
+    /// Returns the total application count across all instance buckets.
+    pub fn applications(&self) -> u32 {
+        self.applications
+            .values()
+            .copied()
+            .fold(0u32, u32::saturating_add)
+    }
 }
 
 // ============================================================================
@@ -239,8 +256,8 @@ pub struct Experience {
 
 /// Input for creating a new experience via [`PulseDB::record_experience()`](crate::PulseDB).
 ///
-/// Only the mutable fields are set here. The `id`, `timestamp`, `applications`,
-/// and `archived` fields are set automatically by the storage layer.
+/// Only the mutable fields are set here. The `id`, `timestamp`, `last_reinforced`,
+/// `applications`, and `archived` fields are set automatically by the storage layer.
 ///
 /// # Embedding
 ///
@@ -491,6 +508,7 @@ mod tests {
 
     #[test]
     fn test_experience_bincode_roundtrip() {
+        let timestamp = Timestamp::now();
         let exp = Experience {
             id: ExperienceId::new(),
             collective_id: CollectiveId::new(),
@@ -502,12 +520,13 @@ mod tests {
             },
             importance: 0.8,
             confidence: 0.9,
-            applications: 5,
+            applications: BTreeMap::from([(InstanceId::new(), 5)]),
             domain: vec!["rust".into(), "safety".into()],
             related_files: vec!["src/main.rs".into()],
             source_agent: AgentId::new("agent-1"),
             source_task: Some(TaskId::new("task-42")),
-            timestamp: Timestamp::now(),
+            timestamp,
+            last_reinforced: timestamp,
             archived: false,
         };
 
@@ -526,6 +545,7 @@ mod tests {
         assert_eq!(exp.importance, restored.importance);
         assert_eq!(exp.confidence, restored.confidence);
         assert_eq!(exp.applications, restored.applications);
+        assert_eq!(exp.applications(), restored.applications());
         assert_eq!(exp.domain, restored.domain);
         assert_eq!(exp.related_files, restored.related_files);
         assert_eq!(exp.source_agent, restored.source_agent);
@@ -536,6 +556,7 @@ mod tests {
 
     #[test]
     fn test_experience_embedding_skipped_in_serialization() {
+        let timestamp = Timestamp::now();
         let exp = Experience {
             id: ExperienceId::new(),
             collective_id: CollectiveId::new(),
@@ -544,12 +565,13 @@ mod tests {
             experience_type: ExperienceType::default(),
             importance: 0.5,
             confidence: 0.5,
-            applications: 0,
+            applications: BTreeMap::new(),
             domain: vec![],
             related_files: vec![],
             source_agent: AgentId::new("a"),
             source_task: None,
-            timestamp: Timestamp::now(),
+            timestamp,
+            last_reinforced: timestamp,
             archived: false,
         };
 

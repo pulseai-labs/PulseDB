@@ -4,8 +4,7 @@ AGENTS.md
 SPEC.md
 .claude/
 
-# Internal planning docs (keep locally, not public)
-docs/
+# Legacy MCP config (deprecated — keep ignored)
 .mcp.json
 opencode.json
 .opencode/

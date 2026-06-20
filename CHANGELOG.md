@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Sprint 3.5 — Temporal Dynamics** (targets v0.5.0). Three vertical slices: decay core + schema v3 (VS-3.5.1), energy-weighted recall (VS-3.5.2), lifecycle surfacing + 1M bench guard (VS-3.5.3).
+
+### Added
+
+#### Temporal energy & decay (VS-3.5.1)
+- `PulseDB::energy(id) -> f32` — temporal-energy diagnostic for an experience, derived-on-read (never stored): `E = clamp(importance · (1 + freq_weight · ln(1 + applications)) · exp(−ln2 · Δt / half_life), 0, 1)`.
+- `PulseDB::reinforce_experience(id) -> u32` — reinforcement now increments the local instance's bucket in a per-instance G-counter and returns the new total application count (CRDT-safe across instances).
+- `Experience::applications() -> u32` — total application count summed across all instance buckets.
+- `DecayConfig` — per-collective decay configuration: `half_life` (default 30 days), `freq_weight` (`k` in `1 + k·ln(1 + applications)`, default 0.25), `floor` (cold threshold, default 0.05), `auto_archive_below_floor` (default `false`), `default_recall_weights` (default `None`). Configured via `Config.decay`.
+- `SubstrateProvider::reinforce_experience()` and `SubstrateProvider::energy()` — async substrate surfaces (trait default returns unsupported-operation; `PulseDBSubstrate` delegates to the blocking core; backward compatible).
+- Exact G-counter merge for `applications` under sync — bidirectional replication converges via per-instance max, with no lost or doubled increments (assumes a distinct `InstanceId` per replica; see #10).
+
+#### Energy-weighted recall (VS-3.5.2)
+- `RecallWeights { similarity, energy }` (with `RecallWeights::new`) — blend weights for energy-aware ranking.
+- `SearchOptions.weights: Option<RecallWeights>` — opt-in energy-weighted ranking on `PulseDB::search`. Default `None` preserves the legacy pure-similarity path **byte-for-byte** (as does `{ similarity: 1.0, energy: 0.0 }`).
+- `DecayConfig.default_recall_weights: Option<RecallWeights>` — per-collective default blend, resolved per query (invalid stored weights are ignored; see #16).
+- `get_context_candidates` honors recall weights for energy-aware context retrieval.
+- Ranking blends `similarity·sim + energy·E` over the cosine top-`k′` candidate frontier (over-fetch-then-re-rank): energy reorders admitted candidates but does not itself retrieve high-energy/low-similarity records (known limitation; see #15).
+
+#### Temporal lifecycle surface (VS-3.5.3)
+- `PulseDB::list_cold_experiences(collective_id, below, limit)` — read-only, coldest-first surfacing of prune-eligible cold experiences. Returns lightweight `(ExperienceId, energy)` pairs (not full `Experience` records) for experiences whose current temporal energy is `< below` and that are not already archived. A human/agent-triggered review tool: it surfaces candidates a consumer may choose to archive, but never mutates storage. `below` ∈ `[0.0, 1.0]`, `limit` ∈ `1..=1000`; deliberate `O(n)` full-collective scan.
+- `SubstrateProvider::list_cold_experiences()` — async substrate mirror of the cold-experience surfacing API, with a trait default (unsupported-operation) and a `PulseDBSubstrate` override that delegates to the blocking core (backward compatible).
+
+#### Performance guard (VS-3.5.3)
+- NFR-018 1M P99 search-latency criterion bench guard (`cargo bench search`) — the 1M-experience P99 search latency is measured and recorded against the 50 ms budget. Verdict: **MET @ 9.35 ms** (~5.3x headroom). The guard prints the measured P99 and does not panic on regression (records the verdict for review; no forward CI enforcement yet — see #19).
+
+### Changed
+- **BREAKING — schema v3.** The on-disk schema bumps to v3 with an automatic, one-time `v1/v2 → v3` migration on `open()` (a `.pre-v3.bak` sidecar is retained; read-only databases refuse the migration). `Experience` is reshaped: the former scalar reinforcement counter is replaced by a per-instance G-counter `applications: BTreeMap<InstanceId, u32>` (totalled via `Experience::applications()`), and a `last_reinforced: Timestamp` field is added. Code that constructed or pattern-matched `Experience` directly, or read the old scalar counter, must migrate to the new fields.
+
+### Notes
+- `auto_archive_below_floor` ships **inert** (default OFF): the flag round-trips through config but wires **no** automatic archive trigger. `list_cold_experiences` only surfaces candidates; no auto-archive actuator exists (rustdoc follow-up: #22).
+- Per-collective `DecayConfig` is **local and unsynced** by design — energy is advisory/derived-on-read and may legitimately differ across replicas (DECAY_SPEC D4).
+
 ## [0.4.0] - 2026-03-26
 
 ### Added

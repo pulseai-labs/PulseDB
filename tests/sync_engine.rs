@@ -9,12 +9,13 @@
 use std::sync::Arc;
 
 use pulsedb::sync::config::{ConflictResolution, SyncConfig, SyncDirection};
+use pulsedb::sync::guard::SyncApplyGuard;
 use pulsedb::sync::manager::SyncManager;
 use pulsedb::sync::transport_mem::InMemorySyncTransport;
 use pulsedb::sync::SyncStatus;
 use pulsedb::{
-    CollectiveId, Config, ExperienceType, ExperienceUpdate, InsightType, NewDerivedInsight,
-    NewExperience, NewExperienceRelation, PulseDB, RelationType, Timestamp,
+    CollectiveId, Config, ExperienceUpdate, InsightType, NewDerivedInsight, NewExperience,
+    NewExperienceRelation, PulseDB, RelationType,
 };
 use tempfile::tempdir;
 
@@ -99,7 +100,7 @@ async fn test_basic_experience_sync() {
     // Verify B has the experience
     let exp = pair.db_b.get_experience(exp_id).unwrap();
     assert!(exp.is_some(), "Experience should have synced to DB-B");
-    assert_eq!(exp.unwrap().content.starts_with("experience-"), true);
+    assert!(exp.unwrap().content.starts_with("experience-"));
 }
 
 #[tokio::test]
@@ -314,13 +315,14 @@ async fn test_echo_prevention() {
     // be pushed back (echo prevention)
     let seq_before = pair.db_b.get_current_sequence().unwrap();
     pair.manager_b.sync_once().await.unwrap();
+    assert_eq!(pair.db_b.get_current_sequence().unwrap(), seq_before);
 
     // A syncs again — should have NO new changes from B
     pair.manager_a.sync_once().await.unwrap();
 
     // The experience on A should still be the original (not duplicated)
     let exp = pair.db_a.get_experience(exp_id).unwrap().unwrap();
-    assert_eq!(exp.applications, 0); // Not modified
+    assert_eq!(exp.applications(), 0); // Not modified
 }
 
 // ============================================================================
@@ -439,6 +441,137 @@ async fn test_bidirectional_sync() {
     assert!(db_b.get_experience(id_b).unwrap().is_some());
 }
 
+#[tokio::test]
+async fn test_bidirectional_reinforcement_gcounter_converges_exact_total() {
+    let (db_a, _dir_a) = open_db();
+    let (db_b, _dir_b) = open_db();
+
+    let (transport_a_push, transport_b_pull) = InMemorySyncTransport::new_pair();
+    let (transport_b_push, transport_a_pull) = InMemorySyncTransport::new_pair();
+
+    let mut mgr_a_push = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(transport_a_push),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    );
+    let mut mgr_b_pull = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(transport_b_pull),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+    let mut mgr_b_push = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(transport_b_push),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    );
+    let mut mgr_a_pull = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(transport_a_pull),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+
+    let cid = db_a.create_collective("reinforce-gcounter").unwrap();
+    let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
+    mgr_a_push.sync_once().await.unwrap();
+    mgr_b_pull.sync_once().await.unwrap();
+
+    db_a.reinforce_experience(exp_id).unwrap();
+    db_b.reinforce_experience(exp_id).unwrap();
+    db_b.reinforce_experience(exp_id).unwrap();
+
+    mgr_a_push.sync_once().await.unwrap();
+    mgr_b_pull.sync_once().await.unwrap();
+    mgr_b_push.sync_once().await.unwrap();
+    mgr_a_pull.sync_once().await.unwrap();
+
+    let exp_a = db_a.get_experience(exp_id).unwrap().unwrap();
+    let exp_b = db_b.get_experience(exp_id).unwrap().unwrap();
+    assert_eq!(exp_a.applications(), 3);
+    assert_eq!(exp_b.applications(), 3);
+    assert_eq!(exp_a.applications, exp_b.applications);
+}
+
+#[tokio::test]
+async fn test_create_collision_sentinel_merge_does_not_double_count() {
+    use std::collections::BTreeMap;
+
+    let (db_a, _dir_a) = open_db();
+    let (db_b, _dir_b) = open_db();
+    let (transport_a, transport_b) = InMemorySyncTransport::new_pair();
+
+    let mut manager_a = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(transport_a),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    );
+    let mut manager_b = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(transport_b),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+
+    let cid = db_a.create_collective("sentinel-collision").unwrap();
+    let exp_id = db_a.record_experience(minimal_exp(cid)).unwrap();
+    manager_a.sync_once().await.unwrap();
+    manager_b.sync_once().await.unwrap();
+
+    let legacy_key = pulsedb::InstanceId::nil();
+    let remote_key = pulsedb::InstanceId::new();
+    let mut remote = db_a.get_experience(exp_id).unwrap().unwrap();
+    remote.applications = BTreeMap::from([(legacy_key, 5), (remote_key, 7)]);
+    let mut local = db_b.get_experience(exp_id).unwrap().unwrap();
+    local.applications = BTreeMap::from([(legacy_key, 5)]);
+
+    let guard = SyncApplyGuard::enter();
+    db_a.apply_synced_experience(remote).unwrap();
+    db_b.apply_synced_experience(local).unwrap();
+    drop(guard);
+
+    let (collision_push, collision_pull) = InMemorySyncTransport::new_pair();
+    let mut collision_sender = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(collision_push),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..sync_config()
+        },
+    );
+    let mut collision_receiver = SyncManager::new(
+        Arc::clone(&db_b),
+        Box::new(collision_pull),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    );
+
+    collision_sender.sync_once().await.unwrap();
+    collision_receiver.sync_once().await.unwrap();
+
+    let merged = db_b.get_experience(exp_id).unwrap().unwrap();
+    assert_eq!(merged.applications.get(&legacy_key), Some(&5));
+    assert_eq!(merged.applications.get(&remote_key), Some(&7));
+    assert_eq!(merged.applications(), 12);
+}
+
 // ============================================================================
 // Initial sync
 // ============================================================================
@@ -487,7 +620,7 @@ async fn test_initial_sync_catchup() {
 
 #[tokio::test]
 async fn test_sync_manager_status() {
-    let mut pair = setup_sync_pair();
+    let pair = setup_sync_pair();
     assert_eq!(pair.manager_a.status(), SyncStatus::Idle);
 }
 

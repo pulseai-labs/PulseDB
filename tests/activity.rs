@@ -201,8 +201,11 @@ fn test_get_active_agents() {
 
 #[test]
 fn test_stale_activity_excluded() {
-    // Use a very short stale threshold (50ms)
-    let (db, dir) = open_db_with_threshold(Duration::from_millis(50));
+    // Stale threshold wide enough that the register→check step below can never
+    // lose the timing race on a loaded CI runner (a 50ms threshold flaked: the
+    // first get_active_agents could land >50ms after register and see 0). The
+    // staleness check still holds because the sleep below exceeds the threshold.
+    let (db, dir) = open_db_with_threshold(Duration::from_millis(1000));
     let cid = db.create_collective("test").unwrap();
 
     db.register_activity(NewActivity {
@@ -216,8 +219,8 @@ fn test_stale_activity_excluded() {
     // Verify it's initially active
     assert_eq!(db.get_active_agents(cid).unwrap().len(), 1);
 
-    // Wait for it to become stale
-    std::thread::sleep(Duration::from_millis(80));
+    // Wait for it to become stale (must exceed the 1000ms threshold above).
+    std::thread::sleep(Duration::from_millis(1300));
 
     // Should be filtered out
     assert!(db.get_active_agents(cid).unwrap().is_empty());
