@@ -187,7 +187,7 @@ An **experience** is a unit of learned knowledge. It contains content (text), an
 
 ### Temporal lifecycle
 
-Each experience has a temporal **energy** that decays when unused and is reinforced on access. `list_cold_experiences()` surfaces prune-eligible candidates (energy below a threshold, not yet archived), coldest-first, as lightweight `(id, energy)` pairs for a human/agent to review:
+Each experience has a temporal **energy** that decays over time and is boosted only by an explicit `reinforce_experience()` call — reads (`get_experience`, `search`, `list_cold_experiences`) do **not** reinforce, so a memory keeps decaying unless a consumer reinforces it. `list_cold_experiences()` surfaces prune-eligible candidates (energy below a threshold, not yet archived), coldest-first, as lightweight `(id, energy)` pairs for a human/agent to review:
 
 ```rust
 let collective = db.create_collective("my-project")?;

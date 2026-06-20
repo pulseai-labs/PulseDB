@@ -357,7 +357,15 @@ impl RedbStorage {
         // so dropping and reopening loses no state.
         let db = if needs_v3_migration {
             drop(db);
-            std::fs::copy(&path, pre_v3_backup_path(&path)).map_err(PulseDBError::Io)?;
+            // Don't clobber an existing pre-v3 backup. The copy happens in the
+            // lock-release window before the re-read below can confirm migration is
+            // still needed; if a concurrent upgrader already migrated the file and
+            // wrote the backup, copying now would overwrite the genuine pre-v3
+            // sidecar with already-migrated v3 data. The first writer's backup wins.
+            let backup_path = pre_v3_backup_path(&path);
+            if !backup_path.exists() {
+                std::fs::copy(&path, &backup_path).map_err(PulseDBError::Io)?;
+            }
             let reopened = Self::create_database(&path, config)?;
             let reopened_metadata = Self::read_metadata(&reopened)?;
             Self::validate_existing_metadata(&reopened_metadata, config)?;

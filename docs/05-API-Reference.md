@@ -491,15 +491,11 @@ impl PulseDB {
 
 ### 4.7 reinforce_experience
 
-Increments the application count (experience was useful).
+Records that an experience was useful: increments the calling instance's bucket in the per-instance application G-counter (schema v3) and refreshes `last_reinforced`, boosting the experience's temporal energy. Returns the new total application count across all instance buckets.
 
 ```rust
 impl PulseDB {
-    pub fn reinforce_experience(
-        &self,
-        id: ExperienceId,
-        importance_boost: Option<f32>,
-    ) -> Result<(), PulseDBError>;
+    pub fn reinforce_experience(&self, id: ExperienceId) -> Result<u32, PulseDBError>;
 }
 ```
 
@@ -507,7 +503,8 @@ impl PulseDB {
 | Name | Type | Description |
 |------|------|-------------|
 | `id` | `ExperienceId` | Experience to reinforce |
-| `importance_boost` | `Option<f32>` | Optional importance increase (capped at 1.0) |
+
+**Returns:** `u32` — the total application count after the increment (sum across all instance buckets).
 
 ---
 

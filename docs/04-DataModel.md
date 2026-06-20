@@ -184,9 +184,14 @@ pub struct Experience {
     /// How reliable is this learning
     pub confidence: f32,
     
-    /// Application count
-    /// Times this experience helped other agents
-    pub applications: u32,
+    /// Per-instance application counters (schema v3 G-counter)
+    /// Times this experience helped agents, bucketed by InstanceId so counts
+    /// merge exactly under multi-instance sync. Total via Experience::applications().
+    pub applications: BTreeMap<InstanceId, u32>,
+
+    /// Timestamp of the last explicit reinforce_experience() call (schema v3)
+    /// Drives temporal energy decay.
+    pub last_reinforced: Timestamp,
     
     // ─────────────────────────────────────────────────────────────
     // Context for Retrieval
