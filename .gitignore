@@ -30,3 +30,18 @@ Thumbs.db
 
 # Benchmark results (can regenerate)
 /benches/results/
+
+# Secrets & credentials (never commit — push protection + gitleaks also guard these)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.secrets/
+.env
+.env.*
+*.secret
+secrets.*
+credentials.json

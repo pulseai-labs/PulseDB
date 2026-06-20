@@ -1,0 +1,15 @@
+# gitleaks configuration for PulseDB.
+# Extends the built-in default ruleset; add repo-specific allowlist entries below.
+title = "PulseDB gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist for known-safe matches"
+# Synthetic example vectors / fixtures in docs and tests are not secrets.
+paths = [
+  '''docs/.*\.md''',
+  '''(^|/)tests/.*''',
+  '''(^|/)benches/.*''',
+]

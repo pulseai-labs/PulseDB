@@ -2,7 +2,7 @@
 
 An embedded database purpose-built for agentic AI systems.
 
-[![CI](https://github.com/pulsehive/pulsedb/actions/workflows/ci.yml/badge.svg)](https://github.com/pulsehive/pulsedb/actions/workflows/ci.yml)
+[![CI](https://github.com/pulseai-labs/PulseDB/actions/workflows/ci.yml/badge.svg)](https://github.com/pulseai-labs/PulseDB/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/pulsehive-db)](https://crates.io/crates/pulsehive-db)
 [![docs.rs](https://docs.rs/pulsehive-db/badge.svg)](https://docs.rs/pulsehive-db)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
@@ -214,9 +214,9 @@ Contributions are welcome! Please open an issue to discuss your idea before subm
 
 ## License
 
-PulseDB is dual-licensed:
+PulseDB is **dual-licensed** (see [LICENSING.md](LICENSING.md) for full details):
 
 - **Open Source**: [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE) — free for open-source projects and internal use. If you modify PulseDB and offer it as a network service, you must release your source code under AGPL-3.0.
-- **Commercial License**: For proprietary use without AGPL obligations, contact us for a commercial license.
+- **Commercial License**: For proprietary use without AGPL obligations, a commercial license is available — contact **praveensingh2897@gmail.com**.
 
 This ensures PulseDB remains free for the community while protecting against unauthorized commercial hosting.

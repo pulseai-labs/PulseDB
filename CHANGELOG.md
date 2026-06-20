@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-20
+
+> **Public-boundary hardening.** Metadata, licensing, and security-posture fixes only — no `src/`, API, or behavior changes.
+
+### Fixed
+- **Crate metadata**: corrected the `repository` URL to `https://github.com/pulseai-labs/PulseDB` (was a non-existent org) and the README CI badge to match. The crates.io / docs.rs "Repository" link now resolves.
+
+### Added
+- `LICENSING.md` — documents the AGPL-3.0 + commercial dual-license posture and the commercial-license contact.
+- `SECURITY.md` — responsible-disclosure policy (private vulnerability reporting is enabled on the repo).
+- `PUBLIC_BOUNDARY.md` — what is public vs. internal for the PulseDB open-source repo.
+- `CONTRIBUTING.md` — contribution guidelines.
+- `.gitignore` secret-file patterns (`*.pem`, `*.key`, `*.crt`, `id_rsa`, `.secrets/`, …).
+- Security CI: `gitleaks` secret scan + `cargo-deny` (advisories/licenses/bans); Dependabot config (`cargo` + `github-actions`).
+- CI hardening: least-privilege default `GITHUB_TOKEN` permissions; the publish job now runs through a manual-approval `crates-io` environment.
+
 ## [0.5.0] - 2026-06-20
 
 > **Sprint 3.5 — Temporal Dynamics.** Three vertical slices: decay core + schema v3 (VS-3.5.1), energy-weighted recall (VS-3.5.2), lifecycle surfacing + 1M bench guard (VS-3.5.3).
