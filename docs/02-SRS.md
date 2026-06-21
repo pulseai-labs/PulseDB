@@ -1,8 +1,8 @@
 # PulseDB: Software Requirements Specification
 
-> **Version:** 1.0.0  
+> **Version:** 1.2.0  
 > **Status:** Approved  
-> **Last Updated:** February 2026  
+> **Last Updated:** June 2026  
 > **Owner:** PulseDB Team
 
 ---
@@ -1109,6 +1109,15 @@ pub trait SubstrateProvider: Send + Sync {
 | Requirement | Detect and report database corruption |
 | Measurement | Error returned, not silent corruption |
 
+#### NFR-020: Storage-Format Upgrade Safety
+
+| Attribute | Value |
+|-----------|-------|
+| ID | NFR-020 |
+| Requirement | A substrate-format change (the redb file format, or the value serialization format — including replacing the serializer) preserves readability of databases created by prior releases — read unchanged or migrate on open via backup-before-migrate; never silently mis-decode. A *writable* open never fails on a prior-release store; a *read-only* open of an un-migrated store returns `ReadOnly` per FR-035 (migration needs write access) — a defined outcome, not data loss |
+| Measurement | Golden-fixture upgrade test: a full prior-release database file (a real on-disk file for the redb-format case, not just serialized value bytes) opens writable under the new format and every entity reads back identically (`MIGRATE-020`); fresh-DB tests do not satisfy this gate |
+| Conditions | Applies to redb file-format changes and serialization-format changes (e.g. a redb major, or replacing the unmaintained bincode serializer); sits beneath the logical schema-version migration framework (v1→v2→v3), which covers in-file schema |
+
 ### 4.4 Usability Requirements
 
 #### NFR-013: API Ergonomics
@@ -1269,6 +1278,7 @@ See [04-DataModel.md](./04-DataModel.md) for complete data model specification.
 | FR-035 | - | TC-035 |
 | NFR-018 | - | BENCH-018 |
 | NFR-019 | - | TC-019 |
+| NFR-020 | - | MIGRATE-020 |
 
 ---
 
@@ -1278,3 +1288,4 @@ See [04-DataModel.md](./04-DataModel.md) for complete data model specification.
 |---------|------|--------|---------|
 | 1.0.0 | February 2026 | PulseDB Team | Initial SRS |
 | 1.1.0 | June 2026 | PulseDB Team | Added §3.9 Temporal Dynamics (FR-030–035) + §4.6 (NFR-018/019) for v0.5.0 energy & decay — source `DECAY_SPEC.md`. Incorporates D7 (per-instance G-counter `applications` + `{LEGACY}` sentinel-bucket migration), weight-precedence/β=0 short-circuit, and mixed-version-sync decisions from the integration audit. |
+| 1.2.0 | June 2026 | PulseDB Team | Added §4.3 NFR-020 (Storage-Format Upgrade Safety) for the Phase-4 storage-format modernization (redb 2.x→4.x file format + replacing the unmaintained `bincode` serializer with a maintained one): substrate-format changes ship with a tested upgrade-on-open path; replacing bincode clears `RUSTSEC-2025-0141` (the crate is unmaintained at all versions, so a version bump would not). Tracking `pulseai-labs/PulseDB#40` (redb) + `#30` (serializer). |

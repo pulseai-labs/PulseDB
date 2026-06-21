@@ -62,7 +62,71 @@ Conservative lifecycle: floor config + list_cold_experiences(below) helper surfa
 
 ## Phase 4: Production Reach — ~12 months (2026–2027)
 
-Harden PulseDB to production-grade reliability and broaden its reach. By the end of Phase 4 the core has fault-injection-tested error and recovery paths at high coverage, a real-time WebSocket sync transport alongside HTTP, and Python bindings so non-Rust consumers can adopt the substrate.
+Harden PulseDB to production-grade reliability and broaden its reach. By the end of Phase 4 the core has a modernized on-disk substrate behind a tested upgrade path, fault-injection-tested error and recovery paths at high coverage, a real-time WebSocket sync transport alongside HTTP, and Python bindings so non-Rust consumers can adopt the substrate.
+
+### Sprint 4.0: Storage-Format Modernization
+
+Adopt the redb `2.x→4.x` file-format major and **replace the unmaintained `bincode` serializer with a maintained one** (e.g. `postcard` / `bitcode` / `rkyv`), both behind a tested upgrade-on-open path, so databases created by prior releases survive the upgrade. Replacing bincode is what actually clears the `RUSTSEC-2025-0141` advisory: the whole crate is unmaintained (all versions; `3.0.0` is a non-functional tombstone), so a 1.x→2.x/3.x bump would not clear it. Sequenced at the head of Phase 4 (substrate-first) because every later sprint sits on this on-disk format and Python bindings (Sprint 4.2) would add consumers of it. Demoable: a v0.5.1-created database opens and reads back identically under the new redb file format + replacement serializer. Tracking issues #40 (redb) + #30 (serializer replacement); detailed compat specs live in the paired AI workspace (`PulseDB-ai/docs/specs/`).
+
+#### VS-4.0.1: On-disk-format compatibility analysis & migration design
+
+Determine redb `2.x→4.x` file-format compatibility (auto-upgrade vs hard-refuse) and **select the replacement serializer** (`postcard` / `bitcode` / `rkyv` — evaluate wire-format stability, performance, and `serde` compatibility), then produce the upgrade-on-open migration design (detect prior format → read via bincode 1.3 → re-write via redb 4.x + the new serializer → backup sidecar) that slices 4.0.2–4.0.4 implement against.
+
+##### Traceability
+
+- FR: FR-001
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: the manifest pins redb 4.x and `cargo tree -i redb | grep -q 'redb v4'` (assert the resolved major, not just that redb is present); the selected serializer resolves with our feature set → expected: exit code 0
+- [ ] user: review the compatibility analysis (redb 2→4 auto-upgrade-vs-refuse) + the serializer selection (postcard/bitcode/rkyv tradeoffs) + the read-old/re-write-new upgrade-on-open + backup-sidecar design → expected: a complete migration plan with a backup/rollback path
+
+#### VS-4.0.2: redb 2→4 migration implementation
+
+Adopt redb 4.x: migrate the breaking API surface and implement upgrade-on-open for the 2.x file format (read-or-migrate behind a backup sidecar, reusing the existing backup-before-migrate machinery), so existing databases open under redb 4.x.
+
+##### Traceability
+
+- FR: FR-001
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: cargo test --lib storage:: → expected: exit code 0
+- [ ] user: open a v0.5.1 (redb-2.x) database under redb 4.x → expected: opens (read unchanged or migrated) with a backup sidecar, no data loss
+
+#### VS-4.0.3: Replace bincode with a maintained serializer
+
+Replace the unmaintained `bincode` (1.3.3) with the serializer selected in VS-4.0.1 at all ~14 serialization call sites **and the `sync-http` wire format** (the sync server deserializes the handshake body before it can check `SYNC_PROTOCOL_VERSION`, so cross-version sync wire compatibility is in scope). Migrate existing data on open via a **legacy read path that carries no maintained-crate dependency** (a vendored/minimal bincode-1.3 decoder, or a sequenced removal — decided in VS-4.0.1), then re-write via the new serializer. Dropping the `bincode` *crate* dependency is what lets the `RUSTSEC-2025-0141` ignore be removed from `deny.toml`.
+
+##### Traceability
+
+- FR: None
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: cargo deny check --all-features → expected: exit code 0 with the `RUSTSEC-2025-0141` ignore removed (no `bincode` *crate* dependency remains — the legacy decode path is vendored, not a crate dep)
+- [ ] user: a prior-release fixture (bincode 1.x bytes) migrates and reads back value-identical under the new serializer → expected: identical reads after on-open re-serialization
+
+#### VS-4.0.4: Golden-fixture / real-upgrade test harness
+
+Check in a **full v0.5.1-created redb-2.x database file** (a real prior-release on-disk file — not just serialized value bytes, so redb's file-format upgrade is actually exercised), open it under the new redb file format + replacement serializer in CI, and assert every entity reads back identically — closing the fresh-DB-only CI gap (MIGRATE-020).
+
+##### Traceability
+
+- FR: FR-001
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: cargo test --test storage_format_upgrade → expected: exit code 0 (prior-release fixture opens + reads identically)
+- [ ] user: confirm the upgrade test is wired as a required CI gate → expected: CI fails if a prior-release fixture fails to open/migrate
 
 ### Sprint 4.1: Production Hardening
 
