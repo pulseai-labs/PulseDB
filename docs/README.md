@@ -1,22 +1,12 @@
 # PulseDB Documentation — Index & Map
 
-> **Agent-query entry point.** This file maps every doc, where each ID type is
-> defined, and how to trace a requirement → slice → test. Read this first when
+> **Entry point for this repo's docs.** Maps every document, where each ID type
+> is defined, and how to trace a requirement → slice → test. Read this first when
 > you need to find something; grep the specific doc second.
-
-PulseDB's docs live in **two repos**:
-
-- **This repo (canonical / product docs)** — what consumers and contributors
-  read. The authoritative product contract: PRD, SRS, Architecture, ADRs, and
-  the `ROADMAP.md` Phase→Sprint→Slice plan.
-- **The paired AI workspace (`PulseDB-ai`, separate repo — process / SSoT)** —
-  `MASTER-SPEC.md` (the prose source-of-truth the docs below are derived from),
-  the tiered `memory-bank/`, and per-sprint `docs/specs/`. Not in this repo; see
-  [§4](#4-the-ssot-lives-in-the-ai-workspace).
 
 ---
 
-## 1. Where to look for X (quick agent lookup)
+## 1. Where to look for X
 
 | You need… | Go to | Find it by |
 |-----------|-------|-----------|
@@ -31,30 +21,28 @@ PulseDB's docs live in **two repos**:
 | **Performance targets & benchmarks** | [`docs/06-Performance.md`](./06-Performance.md) | — |
 | **Security model / threat surface** | [`docs/07-Security.md`](./07-Security.md) | — |
 | **Testing strategy** | [`docs/08-Testing.md`](./08-Testing.md) | — |
-| **Backlog items** (`E#-S#` / epics) | [`docs/10-Backlog.md`](./10-Backlog.md) | — |
+| **Backlog** (epic-story `E#-S##`) | [`docs/10-Backlog.md`](./10-Backlog.md) | — |
 | **Operations / observability / support** | [`docs/12-Operations.md`](./12-Operations.md) | — |
-| The **prose source-of-truth** (FR/NFR are *derived* from it) | `PulseDB-ai/MASTER-SPEC.md` | (AI workspace repo) |
 
 ---
 
-## 2. The governance docs (this repo, `docs/`)
+## 2. The governance docs (`docs/`)
 
-The 12 numbered docs are **derived from `MASTER-SPEC.md`** (in the AI workspace) and
-hold the formal, ID-tagged product contract.
+The 12 numbered docs hold the formal, ID-tagged product contract.
 
-| Doc | Purpose | Owns IDs |
-|-----|---------|----------|
+| Doc | Purpose | Defines IDs |
+|-----|---------|-------------|
 | [`01-PRD.md`](./01-PRD.md) | Product Requirements — vision, users, goals | — |
-| [`02-SRS.md`](./02-SRS.md) | **Software Requirements Spec — the FR/NFR registry** | `FR-NNN` (§3), `NFR-NNN` (§4), traceability matrix (§7) |
+| [`02-SRS.md`](./02-SRS.md) | **Software Requirements Spec — the FR/NFR registry** | `FR-NNN` (§3), `NFR-NNN` (§4); the §7 matrix maps requirements → test IDs (`TC-`, `PERF-`, `BENCH-`, `MIGRATE-`) |
 | [`03-Architecture.md`](./03-Architecture.md) | System architecture & component shape | — |
 | [`04-DataModel.md`](./04-DataModel.md) | Entities, schema, on-disk layout | — |
 | [`05-API-Reference.md`](./05-API-Reference.md) | Public API surface (`PulseDB`, `SubstrateProvider`) | — |
-| [`06-Performance.md`](./06-Performance.md) | Perf targets + benchmark methodology | `PERF-`, `BENCH-` |
+| [`06-Performance.md`](./06-Performance.md) | Perf targets + benchmark methodology | — |
 | [`07-Security.md`](./07-Security.md) | Security model, sensitivity, threat surface | — |
-| [`08-Testing.md`](./08-Testing.md) | Test pyramid & strategy | `TC-`, `MIGRATE-` |
+| [`08-Testing.md`](./08-Testing.md) | Test pyramid & strategy | — |
 | [`09-Developer-Guide.md`](./09-Developer-Guide.md) | Contributor / build guide | — |
-| [`10-Backlog.md`](./10-Backlog.md) | Backlog & epics | `E#-S#` |
-| [`11-ProjectPlan.md`](./11-ProjectPlan.md) | v0.1.0 timeline doc (Phase-2-Strategy-derived; **not** the roadmap) | — |
+| [`10-Backlog.md`](./10-Backlog.md) | Backlog & epics | `E#-S##` |
+| [`11-ProjectPlan.md`](./11-ProjectPlan.md) | v0.1.0 timeline doc (**not** the roadmap) | — |
 | [`12-Operations.md`](./12-Operations.md) | Rollout, observability, support, deprecation/migration | — |
 
 **ADRs** — [`docs/adr/`](./adr/) (ADR-001 redb storage · ADR-002 hnswlib · ADR-003
@@ -63,50 +51,40 @@ single-writer · ADR-004 rich experience types · ADR-005 pure-Rust HNSW). Index
 
 **Historical build-phase notes** — [`docs/phases/`](./phases/) (Phase 1 Foundation,
 Phase 2 Substrate, Phase 3 Release; the original Weeks 1–10 MVP timeline). See the
-disambiguation in [§3](#3-phase-means-three-different-things).
+disambiguation in [§3](#3-phase-means-two-things-here).
 
 ---
 
-## 3. "Phase" means three different things ⚠️
+## 3. "Phase" means two things here ⚠️
 
-The word **Phase** is overloaded across the project. When you read "Phase N",
-check which axis it's on:
+The word **Phase** appears on two different axes — check which one you're reading:
 
 | "Phase" usage | Where | Meaning | Example |
 |---------------|-------|---------|---------|
-| **Product / delivery phases** | [`../ROADMAP.md`](../ROADMAP.md) | Forward-looking Phase→Sprint→Slice plan | Phase 4 = "Production Reach"; Phase 5 = "Collective Intelligence" |
-| **Onboarding phases (1–10)** | `PulseDB-ai/MASTER-SPEC.md` | The `/onboard` spec structure | Phase 4 = "Security & Compliance"; Phase 5 = "Architecture" |
+| **Product / delivery phases** | [`../ROADMAP.md`](../ROADMAP.md) | The forward-looking Phase → Sprint → Slice plan | Phase 4 = "Production Reach"; Phase 5 = "Collective Intelligence" |
 | **Historical build phases (1–3)** | [`docs/phases/`](./phases/) | The original MVP delivery timeline (Weeks 1–10) | Phase 2 = "Substrate" (Weeks 5–8) |
 
-**Default:** unqualified "Phase 4/5/6" almost always means the **ROADMAP product
-phases**. The roadmap is the live planning artifact; the other two are spec
-structure and history.
+**Default:** unqualified "Phase 4/5/6" means the **ROADMAP product phases** (the live
+planning artifact). The `docs/phases/` notes are historical.
 
 ---
 
-## 4. The SSoT lives in the AI workspace
+## 4. ID conventions
 
-These product docs are **derived**, not authored from scratch. The source-of-truth
-is `MASTER-SPEC.md` in the paired AI workspace repo (`PulseDB-ai`), and the docs
-here are regenerated/amended from it (see each doc's revision history). That repo
-also holds:
-
-- `MASTER-SPEC.md` — prose SSoT (onboarding phases 1–10).
-- `.claude/memory-bank/` — tiered context router (`index.md` + `00`–`10` + live
-  `05-active-context.md` / `06-progress.md`); the agent-query index for *process*
-  state.
-- `docs/specs/` — per-sprint vertical-slice specs, work-items, retrospectives.
-
-**Editing rule:** to change a requirement, amend `MASTER-SPEC.md` first, then
-amend the affected governance doc here (targeted amendment + a revision-history
-entry — see `02-SRS.md`'s revision history for the pattern). Do not edit a
-derived doc as if it were the source.
+| ID | Lives in | Meaning |
+|----|----------|---------|
+| `FR-NNN` | `02-SRS.md` §3 | Functional requirement |
+| `NFR-NNN` | `02-SRS.md` §4 | Non-functional requirement |
+| `VS-N.M.K` | `ROADMAP.md` | Vertical slice (phase.sprint.slice) |
+| `ADR-NNN` | `docs/adr/` | Architecture decision |
+| `E#-S##` | `10-Backlog.md` | Epic-story backlog item |
+| `TC-` / `PERF-` / `BENCH-` / `MIGRATE-` | `02-SRS.md` §7 matrix | Test/verification IDs that a requirement traces to |
 
 ---
 
 ## 5. Tracing a requirement end-to-end (worked example)
 
-> *"What does slice `VS-4.0.3` guarantee, and where's it tested?"*
+> *"What does slice `VS-4.0.3` guarantee, and where's it verified?"*
 
 1. **Slice → requirement:** read `VS-4.0.3`'s **Traceability** block in
    [`../ROADMAP.md`](../ROADMAP.md) → it cites `NFR-020`.
@@ -116,5 +94,5 @@ derived doc as if it were the source.
 4. **Demo bar:** the slice's **Demo criteria** block in `ROADMAP.md` gives the
    `auto:` / `user:` acceptance checks.
 
-That chain — **slice (ROADMAP) → requirement (SRS) → test (SRS §7 / Testing)** —
-is the canonical query path. Keep it intact when adding work.
+That chain — **slice (ROADMAP) → requirement (SRS) → test (SRS §7)** — is the
+canonical query path. Keep it intact when adding work.
