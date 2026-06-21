@@ -62,7 +62,71 @@ Conservative lifecycle: floor config + list_cold_experiences(below) helper surfa
 
 ## Phase 4: Production Reach — ~12 months (2026–2027)
 
-Harden PulseDB to production-grade reliability and broaden its reach. By the end of Phase 4 the core has fault-injection-tested error and recovery paths at high coverage, a real-time WebSocket sync transport alongside HTTP, and Python bindings so non-Rust consumers can adopt the substrate.
+Harden PulseDB to production-grade reliability and broaden its reach. By the end of Phase 4 the core has a modernized on-disk substrate behind a tested upgrade path, fault-injection-tested error and recovery paths at high coverage, a real-time WebSocket sync transport alongside HTTP, and Python bindings so non-Rust consumers can adopt the substrate.
+
+### Sprint 4.0: Storage-Format Modernization
+
+Adopt the redb `2.x→4.x` file-format and bincode `1.x→3.x` wire-format majors behind a tested upgrade-on-open path, so databases created by prior releases survive the upgrade; this clears the `RUSTSEC-2025-0141` advisory ignore in `deny.toml`. Sequenced at the head of Phase 4 (substrate-first) because every later sprint sits on this on-disk format and Python bindings (Sprint 4.2) would add consumers of it. Demoable: a v0.5.1-created database opens and reads back identically under the new redb + bincode majors. Companion specs: `PulseDB-ai/docs/specs/work-item-redb-2to4-storage-format-compat.md`, `work-item-bincode-1to3-wire-format-compat.md`; tracking issues #40 (redb) + #30 (bincode).
+
+#### VS-4.0.1: On-disk-format compatibility analysis & migration design
+
+Determine redb `2.x→4.x` file-format compatibility (auto-upgrade vs hard-refuse) and the bincode `config::legacy()` byte-compatibility decision, and produce the upgrade-on-open migration design (detect prior format → read-or-migrate → backup sidecar) that slices 4.0.2–4.0.4 implement against.
+
+##### Traceability
+
+- FR: FR-001
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: cargo tree -i redb && cargo tree -i bincode resolve at the target majors with our feature set → expected: exit code 0
+- [ ] user: review the compatibility analysis (redb 2→4 auto-upgrade-vs-refuse; bincode 1→3 `config::legacy()` byte-equivalence) + the upgrade-on-open + backup-sidecar design → expected: a complete migration plan with a backup/rollback path
+
+#### VS-4.0.2: redb 2→4 migration implementation
+
+Adopt redb 4.x: migrate the breaking API surface and implement upgrade-on-open for the 2.x file format (read-or-migrate behind a backup sidecar, reusing the existing backup-before-migrate machinery), so existing databases open under redb 4.x.
+
+##### Traceability
+
+- FR: FR-001
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: cargo test --lib storage:: → expected: exit code 0
+- [ ] user: open a v0.5.1 (redb-2.x) database under redb 4.x → expected: opens (read unchanged or migrated) with a backup sidecar, no data loss
+
+#### VS-4.0.3: bincode 1→3 migration implementation
+
+Adopt bincode 3.x with `config::legacy()` at all serialization call sites to preserve the on-disk byte layout (no data rewrite), and drop the `RUSTSEC-2025-0141` ignore from `deny.toml`.
+
+##### Traceability
+
+- FR: None
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: cargo deny check --all-features → expected: exit code 0 (RUSTSEC-2025-0141 ignore removed, still green)
+- [ ] user: values written by bincode 1.x decode identically under bincode 3.x `config::legacy()` → expected: value-identical reads from a golden fixture
+
+#### VS-4.0.4: Golden-fixture / real-upgrade test harness
+
+Check in a v0.5.1-created database (or fixture bytes), open it under the new redb + bincode majors in CI, and assert every entity reads back identically — closing the fresh-DB-only CI gap (MIGRATE-020).
+
+##### Traceability
+
+- FR: FR-001
+- NFR: NFR-020
+- Backlog: None
+
+##### Demo criteria
+
+- [ ] auto: cargo test --test storage_format_upgrade → expected: exit code 0 (prior-release fixture opens + reads identically)
+- [ ] user: confirm the upgrade test is wired as a required CI gate → expected: CI fails if a prior-release fixture fails to open/migrate
 
 ### Sprint 4.1: Production Hardening
 
