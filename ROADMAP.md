@@ -80,7 +80,7 @@ Determine redb `2.x→4.x` file-format compatibility (auto-upgrade vs hard-refus
 
 ##### Demo criteria
 
-- [ ] auto: cargo tree -i redb resolves at 4.x and the selected serializer resolves with our feature set → expected: exit code 0
+- [ ] auto: the manifest pins redb 4.x and `cargo tree -i redb | grep -q 'redb v4'` (assert the resolved major, not just that redb is present); the selected serializer resolves with our feature set → expected: exit code 0
 - [ ] user: review the compatibility analysis (redb 2→4 auto-upgrade-vs-refuse) + the serializer selection (postcard/bitcode/rkyv tradeoffs) + the read-old/re-write-new upgrade-on-open + backup-sidecar design → expected: a complete migration plan with a backup/rollback path
 
 #### VS-4.0.2: redb 2→4 migration implementation
@@ -100,7 +100,7 @@ Adopt redb 4.x: migrate the breaking API surface and implement upgrade-on-open f
 
 #### VS-4.0.3: Replace bincode with a maintained serializer
 
-Replace the unmaintained `bincode` (1.3.3) with the serializer selected in VS-4.0.1 at all ~14 serialization call sites, migrating existing data on open (read via bincode 1.3 → re-write via the new serializer), and **remove** the `RUSTSEC-2025-0141` ignore from `deny.toml` (the unmaintained dependency is gone).
+Replace the unmaintained `bincode` (1.3.3) with the serializer selected in VS-4.0.1 at all ~14 serialization call sites **and the `sync-http` wire format** (the sync server deserializes the handshake body before it can check `SYNC_PROTOCOL_VERSION`, so cross-version sync wire compatibility is in scope). Migrate existing data on open via a **legacy read path that carries no maintained-crate dependency** (a vendored/minimal bincode-1.3 decoder, or a sequenced removal — decided in VS-4.0.1), then re-write via the new serializer. Dropping the `bincode` *crate* dependency is what lets the `RUSTSEC-2025-0141` ignore be removed from `deny.toml`.
 
 ##### Traceability
 
@@ -110,12 +110,12 @@ Replace the unmaintained `bincode` (1.3.3) with the serializer selected in VS-4.
 
 ##### Demo criteria
 
-- [ ] auto: cargo deny check --all-features → expected: exit code 0 with the `RUSTSEC-2025-0141` ignore removed (no bincode dependency remains)
+- [ ] auto: cargo deny check --all-features → expected: exit code 0 with the `RUSTSEC-2025-0141` ignore removed (no `bincode` *crate* dependency remains — the legacy decode path is vendored, not a crate dep)
 - [ ] user: a prior-release fixture (bincode 1.x bytes) migrates and reads back value-identical under the new serializer → expected: identical reads after on-open re-serialization
 
 #### VS-4.0.4: Golden-fixture / real-upgrade test harness
 
-Check in a v0.5.1-created database (or fixture bytes), open it under the new redb file format + replacement serializer in CI, and assert every entity reads back identically — closing the fresh-DB-only CI gap (MIGRATE-020).
+Check in a **full v0.5.1-created redb-2.x database file** (a real prior-release on-disk file — not just serialized value bytes, so redb's file-format upgrade is actually exercised), open it under the new redb file format + replacement serializer in CI, and assert every entity reads back identically — closing the fresh-DB-only CI gap (MIGRATE-020).
 
 ##### Traceability
 

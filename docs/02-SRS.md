@@ -1114,8 +1114,8 @@ pub trait SubstrateProvider: Send + Sync {
 | Attribute | Value |
 |-----------|-------|
 | ID | NFR-020 |
-| Requirement | A substrate-format change (the redb file format, or the value serialization format — including replacing the serializer) preserves readability of databases created by prior releases — read unchanged or migrate on open via backup-before-migrate; never fail to open or silently mis-decode |
-| Measurement | Golden-fixture upgrade test: a database (or fixture bytes) from the prior release opens under the new format and every entity reads back identically (`MIGRATE-020`); fresh-DB tests do not satisfy this gate |
+| Requirement | A substrate-format change (the redb file format, or the value serialization format — including replacing the serializer) preserves readability of databases created by prior releases — read unchanged or migrate on open via backup-before-migrate; never silently mis-decode. A *writable* open never fails on a prior-release store; a *read-only* open of an un-migrated store returns `ReadOnly` per FR-035 (migration needs write access) — a defined outcome, not data loss |
+| Measurement | Golden-fixture upgrade test: a full prior-release database file (a real on-disk file for the redb-format case, not just serialized value bytes) opens writable under the new format and every entity reads back identically (`MIGRATE-020`); fresh-DB tests do not satisfy this gate |
 | Conditions | Applies to redb file-format changes and serialization-format changes (e.g. a redb major, or replacing the unmaintained bincode serializer); sits beneath the logical schema-version migration framework (v1→v2→v3), which covers in-file schema |
 
 ### 4.4 Usability Requirements
