@@ -1114,9 +1114,9 @@ pub trait SubstrateProvider: Send + Sync {
 | Attribute | Value |
 |-----------|-------|
 | ID | NFR-020 |
-| Requirement | A substrate-format change (redb file format or bincode serialization wire format, via a dependency major bump) preserves readability of databases created by prior releases — read unchanged or migrate on open via backup-before-migrate; never fail to open or silently mis-decode |
+| Requirement | A substrate-format change (the redb file format, or the value serialization format — including replacing the serializer) preserves readability of databases created by prior releases — read unchanged or migrate on open via backup-before-migrate; never fail to open or silently mis-decode |
 | Measurement | Golden-fixture upgrade test: a database (or fixture bytes) from the prior release opens under the new format and every entity reads back identically (`MIGRATE-020`); fresh-DB tests do not satisfy this gate |
-| Conditions | Applies to redb file-format and bincode wire-format majors; sits beneath the logical schema-version migration framework (v1→v2→v3), which covers in-file schema |
+| Conditions | Applies to redb file-format changes and serialization-format changes (e.g. a redb major, or replacing the unmaintained bincode serializer); sits beneath the logical schema-version migration framework (v1→v2→v3), which covers in-file schema |
 
 ### 4.4 Usability Requirements
 
@@ -1288,4 +1288,4 @@ See [04-DataModel.md](./04-DataModel.md) for complete data model specification.
 |---------|------|--------|---------|
 | 1.0.0 | February 2026 | PulseDB Team | Initial SRS |
 | 1.1.0 | June 2026 | PulseDB Team | Added §3.9 Temporal Dynamics (FR-030–035) + §4.6 (NFR-018/019) for v0.5.0 energy & decay — source `DECAY_SPEC.md`. Incorporates D7 (per-instance G-counter `applications` + `{LEGACY}` sentinel-bucket migration), weight-precedence/β=0 short-circuit, and mixed-version-sync decisions from the integration audit. |
-| 1.2.0 | June 2026 | PulseDB Team | Added §4.3 NFR-020 (Storage-Format Upgrade Safety) for the Phase-4 storage-format modernization (redb 2.x→4.x file format + bincode 1.x→3.x wire format): substrate-format changes ship with a tested upgrade-on-open path; clears the `RUSTSEC-2025-0141` ignore. Tracking `pulseai-labs/PulseDB#40` (redb) + `#30` (bincode). |
+| 1.2.0 | June 2026 | PulseDB Team | Added §4.3 NFR-020 (Storage-Format Upgrade Safety) for the Phase-4 storage-format modernization (redb 2.x→4.x file format + replacing the unmaintained `bincode` serializer with a maintained one): substrate-format changes ship with a tested upgrade-on-open path; replacing bincode clears `RUSTSEC-2025-0141` (the crate is unmaintained at all versions, so a version bump would not). Tracking `pulseai-labs/PulseDB#40` (redb) + `#30` (serializer). |

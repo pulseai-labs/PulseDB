@@ -66,11 +66,11 @@ Harden PulseDB to production-grade reliability and broaden its reach. By the end
 
 ### Sprint 4.0: Storage-Format Modernization
 
-Adopt the redb `2.x→4.x` file-format and bincode `1.x→3.x` wire-format majors behind a tested upgrade-on-open path, so databases created by prior releases survive the upgrade; this clears the `RUSTSEC-2025-0141` advisory ignore in `deny.toml`. Sequenced at the head of Phase 4 (substrate-first) because every later sprint sits on this on-disk format and Python bindings (Sprint 4.2) would add consumers of it. Demoable: a v0.5.1-created database opens and reads back identically under the new redb + bincode majors. Companion specs: `PulseDB-ai/docs/specs/work-item-redb-2to4-storage-format-compat.md`, `work-item-bincode-1to3-wire-format-compat.md`; tracking issues #40 (redb) + #30 (bincode).
+Adopt the redb `2.x→4.x` file-format major and **replace the unmaintained `bincode` serializer with a maintained one** (e.g. `postcard` / `bitcode` / `rkyv`), both behind a tested upgrade-on-open path, so databases created by prior releases survive the upgrade. Replacing bincode is what actually clears the `RUSTSEC-2025-0141` advisory: the whole crate is unmaintained (all versions; `3.0.0` is a non-functional tombstone), so a 1.x→2.x/3.x bump would not clear it. Sequenced at the head of Phase 4 (substrate-first) because every later sprint sits on this on-disk format and Python bindings (Sprint 4.2) would add consumers of it. Demoable: a v0.5.1-created database opens and reads back identically under the new redb file format + replacement serializer. Tracking issues #40 (redb) + #30 (serializer replacement); detailed compat specs live in the paired AI workspace (`PulseDB-ai/docs/specs/`).
 
 #### VS-4.0.1: On-disk-format compatibility analysis & migration design
 
-Determine redb `2.x→4.x` file-format compatibility (auto-upgrade vs hard-refuse) and the bincode `config::legacy()` byte-compatibility decision, and produce the upgrade-on-open migration design (detect prior format → read-or-migrate → backup sidecar) that slices 4.0.2–4.0.4 implement against.
+Determine redb `2.x→4.x` file-format compatibility (auto-upgrade vs hard-refuse) and **select the replacement serializer** (`postcard` / `bitcode` / `rkyv` — evaluate wire-format stability, performance, and `serde` compatibility), then produce the upgrade-on-open migration design (detect prior format → read via bincode 1.3 → re-write via redb 4.x + the new serializer → backup sidecar) that slices 4.0.2–4.0.4 implement against.
 
 ##### Traceability
 
@@ -80,8 +80,8 @@ Determine redb `2.x→4.x` file-format compatibility (auto-upgrade vs hard-refus
 
 ##### Demo criteria
 
-- [ ] auto: cargo tree -i redb && cargo tree -i bincode resolve at the target majors with our feature set → expected: exit code 0
-- [ ] user: review the compatibility analysis (redb 2→4 auto-upgrade-vs-refuse; bincode 1→3 `config::legacy()` byte-equivalence) + the upgrade-on-open + backup-sidecar design → expected: a complete migration plan with a backup/rollback path
+- [ ] auto: cargo tree -i redb resolves at 4.x and the selected serializer resolves with our feature set → expected: exit code 0
+- [ ] user: review the compatibility analysis (redb 2→4 auto-upgrade-vs-refuse) + the serializer selection (postcard/bitcode/rkyv tradeoffs) + the read-old/re-write-new upgrade-on-open + backup-sidecar design → expected: a complete migration plan with a backup/rollback path
 
 #### VS-4.0.2: redb 2→4 migration implementation
 
@@ -98,9 +98,9 @@ Adopt redb 4.x: migrate the breaking API surface and implement upgrade-on-open f
 - [ ] auto: cargo test --lib storage:: → expected: exit code 0
 - [ ] user: open a v0.5.1 (redb-2.x) database under redb 4.x → expected: opens (read unchanged or migrated) with a backup sidecar, no data loss
 
-#### VS-4.0.3: bincode 1→3 migration implementation
+#### VS-4.0.3: Replace bincode with a maintained serializer
 
-Adopt bincode 3.x with `config::legacy()` at all serialization call sites to preserve the on-disk byte layout (no data rewrite), and drop the `RUSTSEC-2025-0141` ignore from `deny.toml`.
+Replace the unmaintained `bincode` (1.3.3) with the serializer selected in VS-4.0.1 at all ~14 serialization call sites, migrating existing data on open (read via bincode 1.3 → re-write via the new serializer), and **remove** the `RUSTSEC-2025-0141` ignore from `deny.toml` (the unmaintained dependency is gone).
 
 ##### Traceability
 
@@ -110,12 +110,12 @@ Adopt bincode 3.x with `config::legacy()` at all serialization call sites to pre
 
 ##### Demo criteria
 
-- [ ] auto: cargo deny check --all-features → expected: exit code 0 (RUSTSEC-2025-0141 ignore removed, still green)
-- [ ] user: values written by bincode 1.x decode identically under bincode 3.x `config::legacy()` → expected: value-identical reads from a golden fixture
+- [ ] auto: cargo deny check --all-features → expected: exit code 0 with the `RUSTSEC-2025-0141` ignore removed (no bincode dependency remains)
+- [ ] user: a prior-release fixture (bincode 1.x bytes) migrates and reads back value-identical under the new serializer → expected: identical reads after on-open re-serialization
 
 #### VS-4.0.4: Golden-fixture / real-upgrade test harness
 
-Check in a v0.5.1-created database (or fixture bytes), open it under the new redb + bincode majors in CI, and assert every entity reads back identically — closing the fresh-DB-only CI gap (MIGRATE-020).
+Check in a v0.5.1-created database (or fixture bytes), open it under the new redb file format + replacement serializer in CI, and assert every entity reads back identically — closing the fresh-DB-only CI gap (MIGRATE-020).
 
 ##### Traceability
 
