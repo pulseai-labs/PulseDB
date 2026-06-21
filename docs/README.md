@@ -13,7 +13,7 @@
 | A **functional requirement** (`FR-NNN`) | [`docs/02-SRS.md`](./02-SRS.md) §3 | `grep -n "#### FR-001" docs/02-SRS.md` |
 | A **non-functional requirement** (`NFR-NNN`) | [`docs/02-SRS.md`](./02-SRS.md) §4 | `grep -n "#### NFR-020" docs/02-SRS.md` |
 | **Requirement → test traceability** | [`docs/02-SRS.md`](./02-SRS.md) §7 (matrix) | search `## 7. Traceability Matrix` |
-| The **roadmap** (phases, sprints, `VS-N.M.K` slices, demo criteria) | [`../ROADMAP.md`](../ROADMAP.md) | `grep -n "VS-4.0" ../ROADMAP.md` |
+| The **roadmap** (phases, sprints, `VS-N.M.K` slices, demo criteria) | [`../ROADMAP.md`](../ROADMAP.md) | `grep -n "VS-4.0" ROADMAP.md` (from repo root) |
 | An **architecture decision** (`ADR-NNN`) | [`docs/adr/`](./adr/) | [`docs/adr/README.md`](./adr/README.md) index |
 | **Product vision / goals / users** | [`docs/01-PRD.md`](./01-PRD.md) | — |
 | **Data model / entities / on-disk schema** | [`docs/04-DataModel.md`](./04-DataModel.md) | — |
