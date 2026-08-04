@@ -518,18 +518,36 @@ impl PulseDB {
                 )));
             }
             (Some(persisted), _) => {
-                if persisted.provider != injected.provider
+                // Check for the VS-4.3.1-era {builtin-onnx, main_graph}
+                // legacy marker FIRST (one-time migration), then the mismatch
+                // guard. Mirrors the `open` path's migration — both
+                // constructors must handle it consistently.
+                if persisted.provider == "builtin-onnx"
+                    && persisted.model_id == "main_graph"
+                    && injected.provider == "builtin-onnx"
+                    && injected.model_id
+                        == format!("onnx-{}", crate::embedding::BUNDLED_MINILM_FINGERPRINT)
+                {
+                    tracing::info!(
+                        persisted_model_id = %persisted.model_id,
+                        "open_with_embedder: migrating legacy {{builtin-onnx, main_graph}} \
+                         stamp to the injected model's onnx-<hash> identity"
+                    );
+                    // Re-stamp with the injected identity (the loaded MiniLM).
+                    true
+                } else if persisted.provider != injected.provider
                     || persisted.model_id != injected.model_id
                 {
                     return Err(PulseDBError::EmbeddingProviderMismatch {
                         persisted,
                         requested: injected,
                     });
+                } else {
+                    // Match — the persisted stamp already records this identity.
+                    // No stamp write needed: re-stamping identical bytes is a
+                    // write txn + fsync for no semantic gain (audit challenge 3).
+                    false
                 }
-                // Match — the persisted stamp already records this identity.
-                // No stamp write needed: re-stamping identical bytes is a
-                // write txn + fsync for no semantic gain (audit challenge 3).
-                false
             }
         };
 

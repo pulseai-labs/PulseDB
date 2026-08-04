@@ -76,12 +76,6 @@ const TOKENIZER_FILENAME: &str = "tokenizer.json";
 /// 90 405 214 bytes).
 const MINILM_HF_PINNED_SHA: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
 
-/// The construction-time fingerprint of the bundled all-MiniLM-L6-v2
-/// (length-framed model ‖ tokenizer SHA-256). Used by the one-time main_graph
-/// migration to recognize the bundled MiniLM. Verified 2026-07-31 against HF
-/// commit 1110a243fdf4706b3f48f1d95db1a4f5529b4d41.
-use super::BUNDLED_MINILM_FINGERPRINT;
-
 // ---------------------------------------------------------------------------
 // OnnxEmbedding struct
 // ---------------------------------------------------------------------------
@@ -310,21 +304,6 @@ impl OnnxEmbedding {
             max_length,
             identity_hash,
         })
-    }
-
-    /// One-time VS-4.3.1→VS-4.3.3 identity migration for the bundled MiniLM.
-    /// Delegates to the standalone [`migrate_legacy_main_graph_stamp`] with this
-    /// instance's construction-time fingerprint. Returns the new identity to
-    /// silently re-stamp a persisted `{builtin-onnx, "main_graph"}` marker, or
-    /// `None` for any other stamp. The call site (wiring this into the `db.rs`
-    /// open path) is work item 1.01 (R2), not this item — 1.04 only provides the
-    /// surface + tests it in isolation.
-    #[allow(dead_code)] // wired into the db.rs open path in work item 1.01 (R2)
-    pub(crate) fn migrate_legacy_main_graph_stamp(
-        &self,
-        stamp: &ProviderIdentity,
-    ) -> Option<ProviderIdentity> {
-        migrate_legacy_main_graph_stamp(&self.identity_hash, stamp)
     }
 }
 
@@ -668,33 +647,6 @@ fn compute_fingerprint(model_bytes: &[u8], tokenizer_bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// One-time VS-4.3.1→VS-4.3.3 identity migration. If a persisted stamp is the
-/// legacy `{builtin-onnx, "main_graph"}` marker AND the loaded model's
-/// fingerprint matches the bundled MiniLM, return the new identity to silently
-/// re-stamp. Returns `None` for any other stamp (non-MiniLM `main_graph` stores
-/// require consumer-side re-embed — see Known Limitations in the work-item
-/// report).
-///
-/// Kept as a standalone fn taking `identity_hash` so it is unit-testable without
-/// loading a 90 MB ONNX session; the [`OnnxEmbedding::migrate_legacy_main_graph_stamp`]
-/// method delegates to it from the open path (wired in work item 1.01, R2).
-fn migrate_legacy_main_graph_stamp(
-    identity_hash: &str,
-    stamp: &ProviderIdentity,
-) -> Option<ProviderIdentity> {
-    if stamp.provider == "builtin-onnx"
-        && stamp.model_id == "main_graph"
-        && identity_hash == BUNDLED_MINILM_FINGERPRINT
-    {
-        Some(ProviderIdentity {
-            provider: "builtin-onnx".to_string(),
-            model_id: format!("onnx-{}", identity_hash),
-        })
-    } else {
-        None
-    }
-}
-
 /// Downloads a file from a URL to a local path.
 ///
 /// Uses atomic write (temp file + rename) to prevent partial downloads
@@ -737,6 +689,7 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::BUNDLED_MINILM_FINGERPRINT;
     use super::*;
 
     // --- L2 normalization tests ---
@@ -906,56 +859,6 @@ mod tests {
         assert_ne!(
             fp_a, fp_b,
             "length-framing must disambiguate concatenation-colliding pairs"
-        );
-    }
-
-    #[test]
-    fn migrate_legacy_main_graph_stamp_recognizes_bundled_minilm() {
-        let legacy = ProviderIdentity {
-            provider: "builtin-onnx".to_string(),
-            model_id: "main_graph".to_string(),
-        };
-        let migrated = migrate_legacy_main_graph_stamp(BUNDLED_MINILM_FINGERPRINT, &legacy);
-        assert_eq!(
-            migrated,
-            Some(ProviderIdentity {
-                provider: "builtin-onnx".to_string(),
-                model_id: format!("onnx-{}", BUNDLED_MINILM_FINGERPRINT),
-            })
-        );
-    }
-
-    #[test]
-    fn migrate_legacy_main_graph_stamp_rejects_non_bundled() {
-        let legacy = ProviderIdentity {
-            provider: "builtin-onnx".to_string(),
-            model_id: "main_graph".to_string(),
-        };
-        // Non-matching fingerprint (not the bundled MiniLM) → None.
-        assert_eq!(
-            migrate_legacy_main_graph_stamp(
-                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-                &legacy
-            ),
-            None
-        );
-        // Already-new-style model_id → None.
-        let already_new = ProviderIdentity {
-            provider: "builtin-onnx".to_string(),
-            model_id: format!("onnx-{}", BUNDLED_MINILM_FINGERPRINT),
-        };
-        assert_eq!(
-            migrate_legacy_main_graph_stamp(BUNDLED_MINILM_FINGERPRINT, &already_new),
-            None
-        );
-        // Different provider → None.
-        let external = ProviderIdentity {
-            provider: "external".to_string(),
-            model_id: "main_graph".to_string(),
-        };
-        assert_eq!(
-            migrate_legacy_main_graph_stamp(BUNDLED_MINILM_FINGERPRINT, &external),
-            None
         );
     }
 
