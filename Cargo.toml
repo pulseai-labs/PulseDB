@@ -130,7 +130,7 @@ proptest = "1.4"
 
 # VS-4.0.4 (4.02) golden-fixture upgrade test only. Runtime deps are unchanged.
 # sha2: the C1 provenance hash-check (fixture SHA-256 vs manifest) before opening.
-sha2 = "0.10"
+sha2 = "0.11"
 # serde_json: parse the frozen manifest oracle (already a runtime dep; re-declared
 # here so the integration target can name it).
 serde_json = "1.0"
