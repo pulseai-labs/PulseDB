@@ -129,6 +129,28 @@ pub trait StorageEngine: Send + Sync {
     /// transaction or postcard deserialization fails.
     fn provider_identity(&self) -> Result<Option<ProviderIdentity>>;
 
+    /// Reads whether the provider-identity era marker is present
+    /// (VS-4.3.3 work 1.01).
+    ///
+    /// `true` means a post-0.7.0 stamp was (or should have been) written — the
+    /// era marker [`PROVIDER_IDENTITY_STAMPED_AT_KEY`](crate::storage::schema::PROVIDER_IDENTITY_STAMPED_AT_KEY)
+    /// is co-stamped atomically with [`provider_identity`](Self::provider_identity).
+    /// Combined with [`provider_identity`](Self::provider_identity), it
+    /// disambiguates genuine pre-0.7.0 stores (both absent → lenient adoption)
+    /// from lost/corrupted stamps (era present, identity absent → typed
+    /// corruption error, NOT silent adoption).
+    ///
+    /// The default `Ok(false)` preserves pre-1.01 behavior for any
+    /// non-`RedbStorage` impl (the era marker is a redb-metadata detail).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StorageError`](crate::error::StorageError) if the read
+    /// transaction fails.
+    fn provider_identity_era_marker(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     // =========================================================================
     // Collective Storage Operations
     // =========================================================================

@@ -288,12 +288,31 @@ pub const INSTANCE_ID_KEY: &str = "instance_id";
 ///
 /// Stored in `METADATA_TABLE` as postcard-encoded `ProviderIdentity` bytes
 /// (the round-trip shape 1.01's `test_provider_identity_postcard_roundtrip`
-/// proved). Lives alongside `"instance_id"` and `"substrate_format"`. Stamped
-/// by `RedbStorage::stamp_provider_identity` as the **last successful step**
-/// of `open_with_embedder`; absent for stores created via `open` (the lenient
-/// no-stamp path silently adopts the injected identity on first
-/// `open_with_embedder`).
+/// proved). Lives alongside `"instance_id"` and `"substrate_format"`. As of
+/// VS-4.3.3 work 1.01, **both** constructors stamp: `open_with_embedder`
+/// writes the injected embedder's identity, and `open` writes the
+/// config-derived identity. The stamp is the **last successful step** of each
+/// constructor — a failure in any prior step leaves the store unstamped
+/// (zero writes from that open).
+///
+/// Co-stamped atomically with [`PROVIDER_IDENTITY_STAMPED_AT_KEY`] in the same
+/// write transaction (see [`PROVIDER_IDENTITY_STAMPED_AT_KEY`] for the
+/// lenient-vs-corruption disambiguation it provides).
 pub const PROVIDER_IDENTITY_KEY: &str = "provider_identity";
+
+/// Metadata key for the provider-identity era marker (VS-4.3.3 work 1.01).
+///
+/// Co-stamped with [`PROVIDER_IDENTITY_KEY`] in the **same** write transaction
+/// by `RedbStorage::stamp_provider_identity`. Its presence distinguishes a
+/// genuine pre-0.7.0 store (**both** keys absent → lenient adoption) from a
+/// post-0.7.0 store whose stamp was lost or corrupted (era present but
+/// identity absent → typed corruption error, NOT silent adoption). This closes
+/// the `pulsedb-internal` #17 "absence is not provenance" hole.
+///
+/// Mirrors the [`SUBSTRATE_FORMAT_KEY`] provenance pattern from VS-4.0.x.
+/// Stored as postcard-encoded `u64` epoch-millis (the stamp time), written by
+/// `RedbStorage::stamp_provider_identity`.
+pub const PROVIDER_IDENTITY_STAMPED_AT_KEY: &str = "provider_identity_stamped_at";
 
 /// Sync cursors table — per-peer sync position tracking.
 ///

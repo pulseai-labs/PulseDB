@@ -67,6 +67,15 @@ const BGE_MAX_LENGTH: usize = 512;
 const MODEL_FILENAME: &str = "model.onnx";
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
 
+/// HuggingFace commit-SHA pin for the bundled all-MiniLM-L6-v2 (384d).
+/// Pinned (not `resolve/main`) so the download is byte-stable across HF revisions;
+/// a floating main revision would give two machines different fingerprints.
+/// Verified 2026-07-31: resolve/<sha>/onnx/model.onnx returns byte-identical
+/// content to the bundled model (model.onnx SHA-256
+/// 6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452,
+/// 90 405 214 bytes).
+const MINILM_HF_PINNED_SHA: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
+
 // ---------------------------------------------------------------------------
 // OnnxEmbedding struct
 // ---------------------------------------------------------------------------
@@ -98,10 +107,10 @@ pub struct OnnxEmbedding {
     /// Maximum sequence length the model accepts.
     max_length: usize,
 
-    /// Path to the loaded `model.onnx`. Retained so `identity()` can derive a
-    /// deterministic `model_id` from the file's bytes (SHA-256-prefix fallback
-    /// when the model's ONNX metadata is empty). Work item 1.01.
-    model_path: PathBuf,
+    /// Construction-time full SHA-256 (length-framed `model.onnx ‖ tokenizer.json`
+    /// bytes), retained so `identity()` is infallible and stable across later file
+    /// replacement on disk (closes the file-replacement attack, Codex #14).
+    identity_hash: String,
 }
 
 impl OnnxEmbedding {
@@ -180,16 +189,21 @@ impl OnnxEmbedding {
     ///
     /// The path to the model directory.
     pub fn download_default_model(dimension: usize) -> Result<PathBuf> {
-        let (model_name, model_url, tokenizer_url) = match dimension {
+        let (model_name, model_url, tokenizer_url): (&str, String, String) = match dimension {
             DEFAULT_DIMENSION => (
                 DEFAULT_MODEL_NAME,
-                "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx",
-                "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json",
+                format!("https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/{MINILM_HF_PINNED_SHA}/onnx/model.onnx"),
+                format!("https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/{MINILM_HF_PINNED_SHA}/tokenizer.json"),
             ),
             768 => (
+                // bge-base-en-v1.5 (768d) is out of scope for this slice's
+                // fingerprint pin (no bundled-model migration targets it); it
+                // stays on `resolve/main`. Known limitation — see report.
                 BGE_MODEL_NAME,
-                "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/onnx/model.onnx",
-                "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/tokenizer.json",
+                "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/onnx/model.onnx"
+                    .to_string(),
+                "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/tokenizer.json"
+                    .to_string(),
             ),
             _ => {
                 return Err(PulseDBError::embedding(format!(
@@ -230,14 +244,14 @@ impl OnnxEmbedding {
 
         // Download model if not present
         if !model_path.exists() {
-            info!(url = model_url, dest = %model_path.display(), "Downloading ONNX model");
-            download_file(model_url, &model_path)?;
+            info!(url = %model_url, dest = %model_path.display(), "Downloading ONNX model");
+            download_file(&model_url, &model_path)?;
         }
 
         // Download tokenizer if not present
         if !tokenizer_path.exists() {
-            info!(url = tokenizer_url, dest = %tokenizer_path.display(), "Downloading tokenizer");
-            download_file(tokenizer_url, &tokenizer_path)?;
+            info!(url = %tokenizer_url, dest = %tokenizer_path.display(), "Downloading tokenizer");
+            download_file(&tokenizer_url, &tokenizer_path)?;
         }
 
         info!(dir = %cache_dir.display(), "Model files ready");
@@ -269,6 +283,18 @@ impl OnnxEmbedding {
         let session = create_session(&model_path)?;
         let tokenizer = load_tokenizer(&tokenizer_path, max_length)?;
 
+        // Construction-time fingerprint: full SHA-256 of length-framed
+        // model+tokenizer bytes. Computed once here so `identity()` is infallible
+        // and the retained hash describes the exact artifacts loaded at construction
+        // (not whatever the file path points at later — closes the file-replacement
+        // attack, Codex #14). The file is read twice (once by `create_session`,
+        // once here for the hash); that is an acceptable one-time construction cost.
+        let model_bytes = std::fs::read(&model_path)
+            .map_err(|e| PulseDBError::embedding(format!("Failed to read model bytes: {e}")))?;
+        let tokenizer_bytes = std::fs::read(&tokenizer_path)
+            .map_err(|e| PulseDBError::embedding(format!("Failed to read tokenizer bytes: {e}")))?;
+        let identity_hash = compute_fingerprint(&model_bytes, &tokenizer_bytes);
+
         debug!(dimension, max_length, "ONNX embedding model loaded");
 
         Ok(Self {
@@ -276,7 +302,7 @@ impl OnnxEmbedding {
             tokenizer,
             dimension,
             max_length,
-            model_path,
+            identity_hash,
         })
     }
 }
@@ -443,43 +469,14 @@ impl EmbeddingService for OnnxEmbedding {
     }
 
     fn identity(&self) -> ProviderIdentity {
-        // Derivation rule (spec §3, audit challenge 6 — pinned):
-        //   1. ONNX model metadata `name` (or `doc_string`) if non-empty;
-        //   2. else SHA-256 prefix (first 16 hex chars) of the model file bytes;
-        //   3. else `builtin-default-{dimension}`.
-        //
-        // Smoke-tested against the bundled MiniLM (work item 1.01): the model's
-        // ONNX metadata `name` field is non-empty (`"main_graph"`, producer
-        // `pytorch`), so branch 1 fires and `model_id = "main_graph"`. The
-        // metadata is baked into the model file, which is content-addressed by
-        // HuggingFace's `resolve/main/onnx/model.onnx` URL — so this is stable
-        // across machines. (Bundled model SHA-256 prefix `6fd5d72fe4589f189`,
-        // 90 405 214 bytes, recorded 2026-07-25.) Branches 2/3 exist as
-        // deterministic fallbacks for models whose metadata is empty.
-        let model_id = self
-            .session
-            .lock()
-            .map(|session| {
-                let metadata = session.metadata().ok();
-                metadata
-                    .and_then(|m| {
-                        // Spec rule: prefer `name`, then `doc_string` (ort's
-                        // `description()` maps to the ONNX `doc_string` field).
-                        m.name()
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| m.description().filter(|s| !s.is_empty()))
-                    })
-                    .unwrap_or_else(|| {
-                        std::fs::read(&self.model_path)
-                            .map(|bytes| format!("sha256-{}", sha256_hex_prefix(&bytes, 16)))
-                            .unwrap_or_else(|_| format!("builtin-default-{}", self.dimension))
-                    })
-            })
-            .unwrap_or_else(|_| format!("builtin-default-{}", self.dimension));
-
+        // Identity is the construction-time full SHA-256 of length-framed
+        // model.onnx ‖ tokenizer.json bytes (computed once in `load_from_dir`),
+        // rendered as `onnx-<full hex sha256>`. The `onnx-` prefix carries the
+        // provider discriminator for human readability; the 64-char hex hash is
+        // the discriminator. Infallible — the hash was captured at construction.
         ProviderIdentity {
             provider: "builtin-onnx".to_string(),
-            model_id,
+            model_id: format!("onnx-{}", self.identity_hash),
         }
     }
 }
@@ -635,97 +632,19 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
     }
 }
 
-/// Returns the first `prefix_len` hex characters of SHA-256(`data`).
-///
-/// Pure-Rust SHA-256 (FIPS 180-4) inlined here because `sha2` is a dev-only
-/// dependency in this crate (VS-4.0.4's golden-fixture hash check) and work
-/// item 1.01's scope forbids touching `Cargo.toml`. The fallback is only
-/// exercised when an ONNX model's metadata is empty; for the bundled MiniLM
-/// the metadata branch fires, so this code path is cold in production.
-///
-/// Correctness spot-checked against the bundled MiniLM model file
-/// (SHA-256 prefix `6fd5d72fe4589f189` per `shasum -a 256`).
-fn sha256_hex_prefix(data: &[u8], prefix_len: usize) -> String {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-
-    // Pre-processing: pad to a multiple of 64 bytes with the 1-bit, zeroes,
-    // and the 64-bit big-endian message length.
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    // Process each 512-bit block.
-    for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
-
-    // Render digest as hex and truncate to the requested prefix length.
-    let hex: String = h
-        .iter()
-        .flat_map(|word| word.to_be_bytes())
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    hex.chars().take(prefix_len).collect()
+/// Construction-time fingerprint: full SHA-256 of length-framed
+/// `model_bytes ‖ tokenizer_bytes`. Length-framing (big-endian u64 lengths)
+/// prevents concatenation-ambiguity collisions — e.g. two file pairs whose
+/// plain concatenation is identical still hash differently because their
+/// per-file length prefixes differ. Full 256 bits are retained (NOT truncated).
+fn compute_fingerprint(model_bytes: &[u8], tokenizer_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((model_bytes.len() as u64).to_be_bytes());
+    hasher.update(model_bytes);
+    hasher.update((tokenizer_bytes.len() as u64).to_be_bytes());
+    hasher.update(tokenizer_bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Downloads a file from a URL to a local path.
@@ -770,6 +689,7 @@ fn download_file(url: &str, dest: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::BUNDLED_MINILM_FINGERPRINT;
     use super::*;
 
     // --- L2 normalization tests ---
@@ -885,23 +805,131 @@ mod tests {
         assert_send_sync::<OnnxEmbedding>();
     }
 
-    // --- SHA-256 helper (sha256_hex_prefix) correctness ---
+    // --- Fingerprint behavioral tests (portable — no model load) ---
 
     #[test]
-    fn test_sha256_hex_prefix_known_vectors() {
-        // FIPS 180-2 / NIST published test vectors, truncated to 16 hex chars.
-        assert_eq!(sha256_hex_prefix(b"", 16), "e3b0c44298fc1c14");
-        assert_eq!(sha256_hex_prefix(b"abc", 16), "ba7816bf8f01cfea");
+    fn fingerprint_shape_onnx_prefix_and_length() {
+        // AC-3 anchor: the identity model_id carries the `onnx-` prefix and a
+        // full 64-char hex SHA-256. println! so `--nocapture` emits "onnx-".
+        let hash = compute_fingerprint(&[1, 2, 3], &[4, 5, 6]);
+        let model_id = format!("onnx-{hash}");
+        println!("fingerprint model_id = {model_id}");
+        assert!(
+            model_id.starts_with("onnx-"),
+            "model_id must carry the onnx- prefix"
+        );
         assert_eq!(
-            sha256_hex_prefix(b"The quick brown fox jumps over the lazy dog", 16),
-            "d7a8fbb307d78094"
+            model_id.len(),
+            "onnx-".len() + 64,
+            "model_id must be onnx- + 64-char hex SHA-256"
         );
     }
 
     #[test]
-    fn test_sha256_hex_prefix_truncation() {
-        // Prefix length honored exactly.
-        assert_eq!(sha256_hex_prefix(b"abc", 8), "ba7816bf");
-        assert_eq!(sha256_hex_prefix(b"abc", 4), "ba78");
+    fn fingerprint_tokenizer_sensitivity() {
+        // Same model bytes, two different tokenizer byte slices → different.
+        let model = b"model-bytes";
+        let fp_a = compute_fingerprint(model, b"tokenizer-A");
+        let fp_b = compute_fingerprint(model, b"tokenizer-B");
+        assert_ne!(
+            fp_a, fp_b,
+            "different tokenizer bytes must yield different fingerprints"
+        );
+    }
+
+    #[test]
+    fn fingerprint_model_sensitivity() {
+        // Same tokenizer bytes, two different model byte slices → different.
+        let tokenizer = b"tokenizer-bytes";
+        let fp_a = compute_fingerprint(b"model-A", tokenizer);
+        let fp_b = compute_fingerprint(b"model-B", tokenizer);
+        assert_ne!(
+            fp_a, fp_b,
+            "different model bytes must yield different fingerprints"
+        );
+    }
+
+    #[test]
+    fn fingerprint_length_framing_disambiguates() {
+        // Both pairs' UNFRAMED concatenation is [0xAA, 0xBB, 0xCC] — without
+        // length-framing these would collide. The be64 per-file length prefixes
+        // make the framed inputs distinct → distinct fingerprints.
+        let fp_a = compute_fingerprint(&[0xAA, 0xBB], &[0xCC]);
+        let fp_b = compute_fingerprint(&[0xAA], &[0xBB, 0xCC]);
+        assert_ne!(
+            fp_a, fp_b,
+            "length-framing must disambiguate concatenation-colliding pairs"
+        );
+    }
+
+    // --- Model-gated tests (run only when the bundled MiniLM is cached) ---
+
+    /// Returns the bundled MiniLM cache dir iff both model.onnx + tokenizer.json
+    /// are present; model-gated tests skip (with an eprintln! note) otherwise.
+    fn bundled_minilm_dir() -> Option<PathBuf> {
+        let dir = default_cache_dir(DEFAULT_MODEL_NAME);
+        if dir.join(MODEL_FILENAME).exists() && dir.join(TOKENIZER_FILENAME).exists() {
+            Some(dir)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn bundled_minilm_fingerprint_pinned() {
+        // AC-1 anchor: the bundled MiniLM's construction-time fingerprint must
+        // match the pinned constant byte-for-byte.
+        let dir = match bundled_minilm_dir() {
+            Some(d) => d,
+            None => {
+                eprintln!("skip: bundled MiniLM not cached — pinned-fingerprint test not run");
+                return;
+            }
+        };
+        let emb = OnnxEmbedding::new(Some(dir)).expect("construct bundled MiniLM");
+        let identity = emb.identity();
+        assert_eq!(identity.provider, "builtin-onnx");
+        assert_eq!(
+            identity.model_id,
+            format!("onnx-{}", BUNDLED_MINILM_FINGERPRINT),
+            "bundled MiniLM fingerprint must match the pinned constant"
+        );
+    }
+
+    #[test]
+    fn identity_stable_across_file_replacement() {
+        // Codex #14: replacing model.onnx on disk AFTER construction must NOT
+        // change identity() — the retained hash describes the artifacts loaded
+        // at construction, not the file path's later contents.
+        let src_dir = match bundled_minilm_dir() {
+            Some(d) => d,
+            None => {
+                eprintln!("skip: bundled MiniLM not cached — file-replacement test not run");
+                return;
+            }
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::copy(
+            src_dir.join(MODEL_FILENAME),
+            tmp.path().join(MODEL_FILENAME),
+        )
+        .expect("copy model");
+        std::fs::copy(
+            src_dir.join(TOKENIZER_FILENAME),
+            tmp.path().join(TOKENIZER_FILENAME),
+        )
+        .expect("copy tokenizer");
+
+        let emb = OnnxEmbedding::new(Some(tmp.path().to_path_buf())).expect("construct");
+        let before = emb.identity();
+
+        // Tamper the model file on disk AFTER construction.
+        std::fs::write(tmp.path().join(MODEL_FILENAME), b"tampered").expect("overwrite");
+
+        let after = emb.identity();
+        assert_eq!(
+            before, after,
+            "identity must be construction-time-stable (Codex #14)"
+        );
     }
 }

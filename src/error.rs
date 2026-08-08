@@ -89,6 +89,29 @@ pub enum PulseDBError {
         requested: ProviderIdentity,
     },
 
+    /// Refusing `embedding: Some(vec)` under `open_with_embedder`
+    /// (VS-4.3.3 work 1.03 — cross-provider-mixing safety, API-surface half).
+    ///
+    /// The injected-embedder constructor's contract is "I embed everything":
+    /// every record is embedded through the injected service. A caller-supplied
+    /// vector bypasses that service, so the store's stamped identity can no
+    /// longer truthfully describe who embedded its vectors. Refused with this
+    /// typed error.
+    ///
+    /// The `PulseDB::open` + `Some(vec)` legacy API (since v0.1.0) stays legal —
+    /// its identity is config-derived, and `External`-via-`open` is explicitly
+    /// the caller-controlled path. Use `open` if you need the per-record vector
+    /// API.
+    #[error(
+        "cannot pass embedding: Some(vector) to {record_kind} under open_with_embedder \
+         (the injected embedder must embed everything); pass embedding: None to route \
+         through it, or use PulseDB::open to retain the per-record vector API"
+    )]
+    InjectedEmbedderPresent {
+        /// `"experience"` or `"insight"` — which write path was refused.
+        record_kind: &'static str,
+    },
+
     /// Vector index error (HNSW operations).
     #[error("Vector index error: {0}")]
     Vector(String),

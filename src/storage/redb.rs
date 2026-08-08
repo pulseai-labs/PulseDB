@@ -44,9 +44,9 @@ use super::schema::{
     DECAY_CONFIGS_TABLE, EMBEDDINGS_TABLE, EXPERIENCES_BY_COLLECTIVE_TABLE,
     EXPERIENCES_BY_TYPE_TABLE, EXPERIENCES_TABLE, INSIGHTS_BY_COLLECTIVE_TABLE, INSIGHTS_TABLE,
     INSTANCE_ID_KEY, LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, PROVIDER_IDENTITY_KEY,
-    RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE, RELATIONS_TABLE, SCHEMA_VERSION,
-    SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN, WAL_SEQUENCE_KEY,
-    WATCH_EVENTS_TABLE,
+    PROVIDER_IDENTITY_STAMPED_AT_KEY, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE,
+    RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN,
+    WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
@@ -2178,17 +2178,29 @@ impl StorageEngine for RedbStorage {
         let bytes = postcard::to_stdvec(identity)
             .map_err(|e| StorageError::serialization(e.to_string()))?;
 
+        // Era marker (VS-4.3.3/1.01): co-stamped atomically in the SAME write
+        // transaction as the identity, so a torn commit cannot leave one key
+        // without the other. The value is the stamp time as postcard-encoded
+        // `u64` epoch-millis (matches the schema doc).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let era_bytes =
+            postcard::to_stdvec(&now_ms).map_err(|e| StorageError::serialization(e.to_string()))?;
+
         let write_txn = self.db.begin_write().map_err(StorageError::from)?;
         {
             let mut meta_table = write_txn.open_table(METADATA_TABLE)?;
             meta_table.insert(PROVIDER_IDENTITY_KEY, bytes.as_slice())?;
+            meta_table.insert(PROVIDER_IDENTITY_STAMPED_AT_KEY, era_bytes.as_slice())?;
         }
         write_txn.commit().map_err(StorageError::from)?;
 
         debug!(
             provider = %identity.provider,
             model_id = %identity.model_id,
-            "Stamped provider identity into redb metadata"
+            "Stamped provider identity + era marker into redb metadata"
         );
         Ok(())
     }
@@ -2204,6 +2216,12 @@ impl StorageEngine for RedbStorage {
                 Ok(Some(identity))
             }
         }
+    }
+
+    fn provider_identity_era_marker(&self) -> Result<bool> {
+        let read_txn = self.db.begin_read().map_err(StorageError::from)?;
+        let meta_table = read_txn.open_table(METADATA_TABLE)?;
+        Ok(meta_table.get(PROVIDER_IDENTITY_STAMPED_AT_KEY)?.is_some())
     }
 
     // =========================================================================

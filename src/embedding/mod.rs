@@ -56,6 +56,15 @@ pub struct ProviderIdentity {
     pub model_id: String,
 }
 
+/// The construction-time fingerprint of the bundled all-MiniLM-L6-v2
+/// (length-framed `model.onnx ‖ tokenizer.json` SHA-256). Used by the one-time
+/// `{builtin-onnx, main_graph}` migration (VS-4.3.3/1.04) to recognize the
+/// bundled MiniLM — NOT feature-gated so the migration check in `db.rs` can
+/// reference it without `--features builtin-embeddings`.
+/// Verified 2026-07-31 against HF commit `1110a24…`.
+pub(crate) const BUNDLED_MINILM_FINGERPRINT: &str =
+    "589318e079c05f6ccede875658e0eeeb179945698317711efedd77c0111cacba";
+
 /// Embedding service trait for generating vector representations of text.
 ///
 /// This trait defines the contract for any embedding provider. Implementations

@@ -1,0 +1,67 @@
+name: Droid QA
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  qa:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: qa
+
+      - name: Run Droid QA
+        id: qa
+        continue-on-error: true
+        timeout-minutes: 18
+        uses: Factory-AI/droid-action@main
+        with:
+          factory_api_key: ${{ secrets.FACTORY_API_KEY }}
+          droid_args: "-m glm-5.2 -r high"
+          prompt: |
+            You are running in a NON-INTERACTIVE CI environment. There is NO human available.
+            Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input.
+
+            Run the project's `qa` skill at `.factory/skills/qa/SKILL.md`.
+            Read `.factory/skills/qa/config.yaml` for feature configuration.
+            Read `.factory/skills/qa-library/SKILL.md` for the flow menu.
+
+            Analyze the git diff `origin/main...HEAD`. Write consumer-simulation Rust
+            test programs that exercise the changed public API areas. Compile and run
+            them with cargo test across the relevant feature configurations.
+
+            Write the final report to stdout. Lead with a one-line verdict
+            (PASS / FAIL / INCONCLUSIVE), then findings with evidence.
+            Clean up any test files you create.
+
+      - name: Upload QA artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-results
+          path: qa-results/
+          retention-days: 14

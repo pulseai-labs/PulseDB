@@ -219,19 +219,112 @@ impl PulseDB {
         // `create_embedding_service` keeps its existing `Box<dyn>` return type.
         let embedding: Arc<dyn EmbeddingService> = Arc::from(create_embedding_service(&config)?);
 
-        // VS-4.3.1 work 1.03 (audit challenge 5 — deferred): the `open` path
-        // does NOT stamp identity, and does NOT run the cross-provider-mismatch
-        // guard. Rationale: `Builtin`/`External` providers are config-derived
-        // and their identity is reconstructible from `Config`; stamping for
-        // them is a nice-to-have that can follow. The mismatch guard is only
-        // load-bearing for the injected-embedder path (`open_with_embedder`),
-        // where identity is not in config. If a store opened via `open` is
-        // later opened via `open_with_embedder`, the lenient no-stamp path
-        // handles it (silently adopts the injected identity). Tracked as a
-        // follow-up: stamp a config-derived identity on the `open` path too,
-        // so every post-0.7.0 store carries a stamp and the lenient path
-        // never fires.
+        // VS-4.3.3 work 1.01 — the `open` path now stamps its config-derived
+        // identity AND runs the cross-provider-mismatch guard, mirroring
+        // [`open_with_embedder`]. This closes `pulsedb-internal` #7: a store
+        // stamped for provider A could previously be reopened via `open` with
+        // provider B and silently mixed in one HNSW index. The two paths now
+        // diverge only in *which* identity they stamp (config-derived here vs.
+        // injected in [`open_with_embedder`]), not in *whether* they stamp.
+        //
+        // The 4-state match on `(persisted identity, era marker)`:
+        //   - (None, false)         → genuine pre-0.7.0 store, BOTH keys absent;
+        //                             lenient adoption (stamp the requested).
+        //   - (None, true)          → post-0.7.0 store whose stamp was LOST or
+        //                             corrupted (era present, identity absent);
+        //                             typed corruption error, NOT silent adoption.
+        //   - (Some(persisted), _)  → a stamp exists; run the mismatch guard
+        //                             (with a one-time legacy `main_graph`
+        //                             migration). Re-stamp only on adoption.
         let (storage, vectors, insight_vectors, watch) = Self::open_parts(&path, &config)?;
+        let requested = Self::config_derived_identity(&*embedding);
+
+        let persisted = storage.provider_identity()?;
+        let era = storage.provider_identity_era_marker()?;
+        let should_stamp: Option<crate::embedding::ProviderIdentity> = match (persisted, era) {
+            (None, false) => {
+                // Genuine pre-0.7.0 store: BOTH keys absent. Lenient adoption.
+                tracing::debug!(
+                    "open: no provider-identity stamp and no era marker — \
+                     lenient adoption (genuine pre-0.7.0 store)"
+                );
+                Some(requested.clone())
+            }
+            (None, true) => {
+                // Post-0.7.0 store whose stamp was LOST/CORRUPTED (era marker
+                // present, identity absent). NOT silent re-adoption — typed
+                // corruption error (closes `pulsedb-internal` #17).
+                return Err(PulseDBError::Storage(StorageError::corrupted(
+                    "provider identity stamp missing but era marker present — \
+                     the stamp was lost or corrupted; refusing silent re-adoption",
+                )));
+            }
+            (Some(persisted), _) => {
+                // A stamp exists. Check for the VS-4.3.1-era
+                // {builtin-onnx, main_graph} legacy marker FIRST (one-time
+                // migration), then the mismatch guard.
+                if persisted.provider == "builtin-onnx"
+                    && persisted.model_id == "main_graph"
+                    && requested.provider == "builtin-onnx"
+                    && requested.model_id
+                        == format!("onnx-{}", crate::embedding::BUNDLED_MINILM_FINGERPRINT)
+                {
+                    tracing::info!(
+                        persisted_model_id = %persisted.model_id,
+                        "open: migrating legacy {{builtin-onnx, main_graph}} stamp to \
+                         the loaded model's onnx-<hash> identity"
+                    );
+                    // Re-stamp with whatever the LOADED model actually is
+                    // (requested), not an assumed fingerprint — feature-agnostic
+                    // and correct even if a non-MiniLM builtin is loaded.
+                    Some(requested.clone())
+                } else if persisted.provider != requested.provider
+                    || persisted.model_id != requested.model_id
+                {
+                    return Err(PulseDBError::EmbeddingProviderMismatch {
+                        persisted,
+                        requested,
+                    });
+                } else {
+                    // Match — the existing stamp is authoritative; skip the
+                    // redundant re-stamp (mirrors the open_with_embedder
+                    // audit-challenge-3 optimization).
+                    None
+                }
+            }
+        };
+
+        // STAMP — last successful step (mirrors open_with_embedder). Read-only
+        // guard: the lenient-adoption/migration path (a write) must not fire
+        // under a read-only config.
+        //
+        // Concurrency (pulsedb-internal #11): the check-then-set shape (read
+        // `provider_identity` + era marker → compare → stamp) is safe under
+        // redb 4.1's exclusive writable file lock — on supported platforms two
+        // processes cannot hold writable handles to the same store
+        // concurrently, so the read-then-write sequence is serialized by the
+        // lock. The "check-then-set race" only exists on platforms without
+        // file locking, where concurrent writable opens are explicitly the
+        // caller's responsibility per redb's contract. No CAS
+        // (compare-and-set) is needed; the lock is the serialization
+        // mechanism (Codex #11 closed the race; #12 dropped the trait break).
+        if let Some(to_stamp) = should_stamp {
+            if config.read_only {
+                return Err(PulseDBError::ReadOnly);
+            }
+            // VS-4.3.3/1.05 (#10): validate the embedder's dimension matches
+            // the configured dimension BEFORE stamping. Catches a 384-config +
+            // 768-embedder mismatch that would stamp successfully then corrupt
+            // the HNSW on the first record.
+            let expected = config.embedding_dimension.size();
+            let actual = embedding.dimension();
+            if actual != expected {
+                return Err(PulseDBError::Validation(
+                    ValidationError::dimension_mismatch(expected, actual),
+                ));
+            }
+            storage.stamp_provider_identity(&to_stamp)?;
+        }
 
         Ok(Self {
             storage,
@@ -247,15 +340,16 @@ impl PulseDB {
     /// Shared open prefix common to both [`open`] and [`open_with_embedder`]:
     /// validate config, open storage, load HNSW indexes, build watch.
     ///
-    /// Returns the four owned pieces a `PulseDB` is assembled from; the caller
-    /// decides whether to additionally run the cross-provider-mismatch guard
-    /// and stamp identity (the [`open_with_embedder`] path) or skip both (the
-    /// [`open`] path; see its doc comment for the deferral rationale).
+    /// Returns the four owned pieces a `PulseDB` is assembled from. Both
+    /// constructors run their own post-`open_parts` tail: the mismatch guard +
+    /// provider-identity stamp (`open_with_embedder` stamps the injected
+    /// identity; [`open`] stamps the config-derived identity — VS-4.3.3/1.01
+    /// closed the asymmetry so both post-0.7.0 opens stamp). `open_parts`
+    /// itself performs NO stamping, so it is also the seam the lenient-path
+    /// tests use to synthesize a genuine unstamped store.
     ///
     /// Split out in work 1.03 so that `open` no longer delegates through
-    /// `open_with_embedder` (which now stamps). Otherwise a store created via
-    /// `open` would already carry a stamp, breaking the lenient no-stamp
-    /// adoption path on a later `open_with_embedder`.
+    /// `open_with_embedder` (which stamps).
     #[allow(clippy::type_complexity)] // one-off private helper; a type alias adds friction.
     fn open_parts(
         path: impl AsRef<Path>,
@@ -285,6 +379,21 @@ impl PulseDB {
         ));
 
         Ok((storage, vectors, insight_vectors, watch))
+    }
+
+    /// Config-derived identity for the [`open`] path (VS-4.3.3/1.01).
+    ///
+    /// Routes to the embedder's [`identity`](EmbeddingService::identity) — for
+    /// `Builtin` this is `OnnxEmbedding`'s construction-time fingerprint
+    /// (`onnx-<hash>` post-1.04); for `External` it is `ExternalEmbedding`'s
+    /// `{external, external-{dim}}`. This does NOT introduce a third identity
+    /// source; it merely routes the config-built embedder's identity into the
+    /// stamp + mismatch-check path that previously only `open_with_embedder`
+    /// ran.
+    fn config_derived_identity(
+        embedder: &dyn EmbeddingService,
+    ) -> crate::embedding::ProviderIdentity {
+        embedder.identity()
     }
 
     /// Opens or creates a PulseDB database with a **caller-supplied** embedding
@@ -383,16 +492,15 @@ impl PulseDB {
         // lenient-adoption path (no prior stamp) writes; the Match arm
         // preserves the existing stamp untouched. The mismatch arm returns
         // before reaching `should_stamp`'s use site.
-        let should_stamp: bool = match storage.provider_identity()? {
-            None => {
-                // Lenient no-stamp path (grill-resolved): the store has no
-                // `PROVIDER_IDENTITY_KEY` (a pre-1.03 store, or a store opened
-                // via `open` which does not stamp). Silently adopt the injected
-                // identity — safe because no production users carry
-                // pre-existing stores. The adoption stamp happens only if the
-                // rest of this constructor succeeds (see the ordering note
-                // below). Do NOT add an `assume_identity` flag (grill
-                // rejected the strict path as unnecessary friction).
+        // VS-4.3.3/1.06 (slice-close fix-up): mirror the `open` path's era-
+        // marker check. A post-0.7.0 store whose stamp was lost (era present,
+        // identity absent) must NOT be silently re-adopted via
+        // open_with_embedder — that bypasses the cross-provider-mismatch guard.
+        let persisted_identity = storage.provider_identity()?;
+        let era = storage.provider_identity_era_marker()?;
+        let should_stamp: bool = match (persisted_identity, era) {
+            (None, false) => {
+                // Genuine pre-0.7.0 store: BOTH keys absent. Lenient adoption.
                 tracing::debug!(
                     provider = %injected.provider,
                     model_id = %injected.model_id,
@@ -400,19 +508,46 @@ impl PulseDB {
                 );
                 true
             }
-            Some(persisted) => {
-                if persisted.provider != injected.provider
+            (None, true) => {
+                // Post-0.7.0 store whose stamp was LOST/CORRUPTED (era marker
+                // present, identity absent). NOT silent re-adoption — typed
+                // corruption error (closes Codex #17 on BOTH constructors).
+                return Err(PulseDBError::Storage(StorageError::corrupted(
+                    "provider identity stamp missing but era marker present — \
+                     the stamp was lost or corrupted; refusing silent re-adoption",
+                )));
+            }
+            (Some(persisted), _) => {
+                // Check for the VS-4.3.1-era {builtin-onnx, main_graph}
+                // legacy marker FIRST (one-time migration), then the mismatch
+                // guard. Mirrors the `open` path's migration — both
+                // constructors must handle it consistently.
+                if persisted.provider == "builtin-onnx"
+                    && persisted.model_id == "main_graph"
+                    && injected.provider == "builtin-onnx"
+                    && injected.model_id
+                        == format!("onnx-{}", crate::embedding::BUNDLED_MINILM_FINGERPRINT)
+                {
+                    tracing::info!(
+                        persisted_model_id = %persisted.model_id,
+                        "open_with_embedder: migrating legacy {{builtin-onnx, main_graph}} \
+                         stamp to the injected model's onnx-<hash> identity"
+                    );
+                    // Re-stamp with the injected identity (the loaded MiniLM).
+                    true
+                } else if persisted.provider != injected.provider
                     || persisted.model_id != injected.model_id
                 {
                     return Err(PulseDBError::EmbeddingProviderMismatch {
                         persisted,
                         requested: injected,
                     });
+                } else {
+                    // Match — the persisted stamp already records this identity.
+                    // No stamp write needed: re-stamping identical bytes is a
+                    // write txn + fsync for no semantic gain (audit challenge 3).
+                    false
                 }
-                // Match — the persisted stamp already records this identity.
-                // No stamp write needed: re-stamping identical bytes is a
-                // write txn + fsync for no semantic gain (audit challenge 3).
-                false
             }
         };
 
@@ -431,9 +566,31 @@ impl PulseDB {
         // and mutate stores used by read-only observers. Refuse the unstamped
         // adoption in read-only mode — the caller can reopen writable to
         // stamp, then reopen read-only.
+        //
+        // Concurrency (pulsedb-internal #11): the check-then-set shape (read
+        // `provider_identity` → compare → stamp) is safe under redb 4.1's
+        // exclusive writable file lock — on supported platforms two processes
+        // cannot hold writable handles to the same store concurrently, so the
+        // read-then-write sequence is serialized by the lock. The
+        // "check-then-set race" only exists on platforms without file locking,
+        // where concurrent writable opens are explicitly the caller's
+        // responsibility per redb's contract. No CAS (compare-and-set) is
+        // needed; the lock is the serialization mechanism (Codex #11 closed
+        // the race; #12 dropped the trait break).
         if should_stamp {
             if config.read_only {
                 return Err(PulseDBError::ReadOnly);
+            }
+            // VS-4.3.3/1.05 (#10): validate the injected embedder's dimension
+            // against the configured dimension BEFORE stamping. Catches a
+            // 384-config + 768-embedder mismatch that would stamp successfully
+            // then corrupt the HNSW on the first record.
+            let expected = config.embedding_dimension.size();
+            let actual = embedder.dimension();
+            if actual != expected {
+                return Err(PulseDBError::Validation(
+                    ValidationError::dimension_mismatch(expected, actual),
+                ));
             }
             storage.stamp_provider_identity(&injected)?;
         }
@@ -1102,6 +1259,21 @@ impl PulseDB {
         self.check_writable()?;
         let is_external = !self.has_injected_embedder
             && matches!(self.config.embedding_provider, EmbeddingProvider::External);
+
+        // VS-4.3.3/1.03 (pulsedb-internal #8): refuse `embedding: Some(vec)`
+        // under `open_with_embedder`. The injected embedder's contract is "I
+        // embed everything"; a caller-supplied vector bypasses it, so the
+        // stamped identity could no longer truthfully describe who embedded the
+        // stored vectors. The `open` + `Some(vec)` legacy API stays legal (its
+        // identity is config-derived; `External`-via-`open` is the
+        // caller-controlled path). Placed before the collective fetch + dim
+        // validation so the gate fires first — catches `Some(vec![])` as
+        // misuse, not as a dim-0 error.
+        if self.has_injected_embedder && exp.embedding.is_some() {
+            return Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "experience",
+            });
+        }
 
         // Verify collective exists and get its dimension
         let collective = self
@@ -2207,6 +2379,18 @@ impl PulseDB {
         // equivalent; this asymmetry is intentional, not a bug to flatten.
         let is_external = !self.has_injected_embedder
             && matches!(self.config.embedding_provider, EmbeddingProvider::External);
+
+        // VS-4.3.3/1.03 (pulsedb-internal #8): refuse `embedding: Some(vec)`
+        // under `open_with_embedder`. Same gate as `record_experience` above
+        // (the asymmetry comment just above explains why the *external-embedder*
+        // gate is shaped differently here; THIS gate is identical at both sites
+        // — same condition, different `record_kind`). Placed before the
+        // collective fetch + dim validation so the gate fires first.
+        if self.has_injected_embedder && insight.embedding.is_some() {
+            return Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "insight",
+            });
+        }
 
         // Validate input fields
         validate_new_insight(&insight)?;
@@ -3757,6 +3941,187 @@ mod open_with_embedder {
         assert_eq!(db.embedding_dimension(), EmbeddingDimension::D384.size());
         db.close().unwrap();
     }
+
+    // ---- VS-4.3.3 work 1.03: forbid `embedding: Some(vec)` under
+    //      `open_with_embedder` (pulsedb-internal #8). The injected embedder's
+    //      contract is "I embed everything"; a caller-supplied vector bypasses
+    //      it. The `open` + `Some(vec)` legacy API stays legal. ----
+
+    /// Opens a store via `open_with_embedder` with a 384-d `RecordingEmbedder`
+    /// and `Config::with_builtin_embeddings()` (the config that admits
+    /// `embedding: None` on record), then creates a single collective. Shared
+    /// setup for the 1.03 refusal/regression tests.
+    fn injected_store_with_collective(
+        dir: &tempfile::TempDir,
+        db_name: &str,
+    ) -> (PulseDB, Arc<RecordingEmbedding>, CollectiveId) {
+        let path = dir.path().join(db_name);
+        let embedder = Arc::new(RecordingEmbedding::new(384));
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::with_builtin_embeddings(),
+            embedder.clone() as Arc<dyn EmbeddingService>,
+        )
+        .expect("open_with_embedder succeeds");
+        let collective_id = db
+            .create_collective("injected-1.03")
+            .expect("create collective");
+        (db, embedder, collective_id)
+    }
+
+    /// AC-1 (a): `record_experience { embedding: Some(vec) }` under
+    /// `open_with_embedder` is refused with `InjectedEmbedderPresent {
+    /// record_kind: "experience" }`.
+    #[test]
+    fn record_experience_with_some_vec_under_injected_is_refused() {
+        let dir = tempdir().unwrap();
+        let (db, _embedder, collective_id) = injected_store_with_collective(&dir, "refused-exp.db");
+
+        let exp = NewExperience {
+            collective_id,
+            content: "caller-supplied vector under injected embedder".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            ..Default::default()
+        };
+        match db.record_experience(exp) {
+            Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "experience",
+            }) => {}
+            other => panic!(
+                "expected InjectedEmbedderPresent{{record_kind: \"experience\"}}, got {other:?}"
+            ),
+        }
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (b): `store_insight { embedding: Some(vec) }` under
+    /// `open_with_embedder` is refused with `InjectedEmbedderPresent {
+    /// record_kind: "insight" }`. The source experience is created first via
+    /// `record_experience { embedding: None }` (which succeeds — the injected
+    /// embedder embeds it).
+    #[test]
+    fn store_insight_with_some_vec_under_injected_is_refused() {
+        let dir = tempdir().unwrap();
+        let (db, _embedder, collective_id) =
+            injected_store_with_collective(&dir, "refused-insight.db");
+
+        // Source experience via the injected embedder (embedding: None) — the
+        // path this gate must NOT over-fire on.
+        let exp = NewExperience {
+            collective_id,
+            content: "source experience for the refused insight".to_string(),
+            embedding: None,
+            ..Default::default()
+        };
+        let exp_id = db
+            .record_experience(exp)
+            .expect("record_experience with None routes through the injected embedder");
+
+        let insight = NewDerivedInsight {
+            collective_id,
+            content: "caller-supplied insight vector under injected embedder".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            source_experience_ids: vec![exp_id],
+            insight_type: InsightType::Pattern,
+            confidence: 0.8,
+            domain: Vec::new(),
+        };
+        match db.store_insight(insight) {
+            Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "insight",
+            }) => {}
+            other => panic!(
+                "expected InjectedEmbedderPresent{{record_kind: \"insight\"}}, got {other:?}"
+            ),
+        }
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (c): regression guard — `record_experience { embedding: None }`
+    /// under `open_with_embedder` still routes through the injected embedder
+    /// (the gate must not over-fire on `None`). Preserves the VS-4.3.1/1.04
+    /// behavior.
+    #[test]
+    fn record_experience_with_none_under_injected_routes_through_embedder() {
+        let dir = tempdir().unwrap();
+        let (db, embedder, collective_id) = injected_store_with_collective(&dir, "none-routes.db");
+
+        let content = "embedding None must route through the injected embedder";
+        let exp = NewExperience {
+            collective_id,
+            content: content.to_string(),
+            embedding: None,
+            ..Default::default()
+        };
+        db.record_experience(exp)
+            .expect("record_experience with None succeeds under open_with_embedder");
+
+        let embedded = embedder.embedded_texts();
+        assert!(
+            embedded.iter().any(|c| c == content),
+            "embedding: None must route content through the injected embedder; saw: {embedded:?}"
+        );
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (d): regression guard — `record_experience { embedding: Some(vec) }`
+    /// under the LEGACY `PulseDB::open` (NOT `open_with_embedder`) still
+    /// succeeds. Proves the gate fires only under the injected-embedder
+    /// constructor; the `open` + `Some(vec)` API (since v0.1.0) is unchanged.
+    /// Uses `Config::default()` (`EmbeddingProvider::External`) — the
+    /// caller-controlled path this slice intentionally keeps legal.
+    #[test]
+    fn record_experience_with_some_vec_under_open_legacy_succeeds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-open.db");
+
+        // Config::default() -> External; under `open` (has_injected_embedder =
+        // false) this is the caller-controlled per-record-vector path.
+        let db = PulseDB::open(&path, Config::default()).expect("open succeeds");
+        let collective_id = db
+            .create_collective("legacy-open")
+            .expect("create collective");
+
+        let exp = NewExperience {
+            collective_id,
+            content: "caller-supplied vector under the legacy open path".to_string(),
+            embedding: Some(vec![0.5f32; 384]),
+            ..Default::default()
+        };
+        db.record_experience(exp)
+            .expect("record_experience with Some(vec) succeeds under the legacy open path");
+
+        db.close().unwrap();
+    }
+
+    /// AC-1 (e): empty-vec ordering pin — `record_experience { embedding:
+    /// Some(vec![]) }` under `open_with_embedder` is refused by the gate as
+    /// misuse, NOT by `validate_new_experience`'s dim check (dim 0 != 384).
+    /// Proves the gate fires BEFORE dim validation, so an empty vector reads as
+    /// misuse rather than a dimension-mismatch error.
+    #[test]
+    fn record_experience_with_empty_vec_under_injected_refused_by_gate_not_dim() {
+        let dir = tempdir().unwrap();
+        let (db, _embedder, collective_id) = injected_store_with_collective(&dir, "empty-vec.db");
+
+        let exp = NewExperience {
+            collective_id,
+            content: "empty caller-supplied vector under injected embedder".to_string(),
+            embedding: Some(vec![]),
+            ..Default::default()
+        };
+        match db.record_experience(exp) {
+            Err(PulseDBError::InjectedEmbedderPresent {
+                record_kind: "experience",
+            }) => {}
+            other => panic!("expected InjectedEmbedderPresent (gate-before-dim), got {other:?}"),
+        }
+
+        db.close().unwrap();
+    }
 }
 
 /// AC-1 for work 1.03: persisted provider identity stamp, mismatch refusal,
@@ -3767,7 +4132,7 @@ mod open_with_embedder {
 mod provider_identity_persistence {
     use super::*;
     use crate::embedding::{EmbeddingService, ProviderIdentity};
-    use crate::error::PulseDBError;
+    use crate::error::{PulseDBError, ValidationError};
     use crate::Embedding;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -3816,6 +4181,22 @@ mod provider_identity_persistence {
             provider: provider.to_string(),
             model_id: model_id.to_string(),
         }
+    }
+
+    /// Creates an UNSTAMPED store on disk — no `PROVIDER_IDENTITY_KEY`, no era
+    /// marker (`PROVIDER_IDENTITY_STAMPED_AT_KEY`) — by calling `open_parts`
+    /// directly. `open_parts` is the shared open prefix that performs NO
+    /// stamping; the stamping tail lives in the public `open` /
+    /// `open_with_embedder` constructors. After VS-4.3.3/1.01 the public `open`
+    /// stamps, so the unstamped (genuine pre-0.7.0, BOTH keys absent) state can
+    /// no longer be produced through `open` — this helper is the lower-level
+    /// synthesis the lenient-path tests now need.
+    fn unstamped_store(path: &Path) {
+        let (storage, _vectors, _insight_vectors, _watch) =
+            PulseDB::open_parts(path, &Config::default()).expect("open_parts creates the store");
+        // redb flushes on drop; the store persists with NEITHER metadata key
+        // written (open_parts performs no provider-identity stamp).
+        storage.close().expect("close flushes the unstamped store");
     }
 
     /// (a) Stamp round-trips across a reopen with the same provider. The
@@ -3893,9 +4274,10 @@ mod provider_identity_persistence {
         let dir = tempdir().unwrap();
         let path = dir.path().join("lenient.db");
 
-        // Create via `open` — no PROVIDER_IDENTITY_KEY is written.
-        let db = PulseDB::open(&path, Config::default()).expect("open creates the store");
-        db.close().unwrap();
+        // Create a genuine pre-0.7.0 store — BOTH keys absent. After
+        // VS-4.3.3/1.01 the public `open` stamps, so synthesize the unstamped
+        // state via `open_parts` (which performs no stamping).
+        unstamped_store(&path);
 
         // Reopen via `open_with_embedder` with an arbitrary identity. The
         // absent key triggers the lenient adoption path — the open succeeds and
@@ -3921,9 +4303,10 @@ mod provider_identity_persistence {
         let dir = tempdir().unwrap();
         let path = dir.path().join("readonly-unstamped.db");
 
-        // Create via `open` — no PROVIDER_IDENTITY_KEY is written.
-        let db = PulseDB::open(&path, Config::default()).expect("open creates the store");
-        db.close().unwrap();
+        // Create a genuine pre-0.7.0 store — BOTH keys absent. After
+        // VS-4.3.3/1.01 the public `open` stamps, so synthesize the unstamped
+        // state via `open_parts` (which performs no stamping).
+        unstamped_store(&path);
 
         // Reopen via `open_with_embedder` in READ-ONLY mode. The lenient
         // adoption path would stamp, but read-only must refuse the write.
@@ -4103,7 +4486,276 @@ mod provider_identity_persistence {
         unstamped.close().unwrap();
     }
 
-    /// (g) Audit challenge 3 (gap — redundant I/O on reopen). A successful
+    // ========================================================================
+    // VS-4.3.3 work 1.01 — `open` path stamps + mismatch check + era marker
+    // ========================================================================
+
+    /// AC-4 (VS-4.3.3/1.01): opening via `open` with a `Builtin` config stamps
+    /// the config-derived identity — `OnnxEmbedding`'s construction-time
+    /// fingerprint (`{builtin-onnx, onnx-<hash>}` post-1.04). The stamp is
+    /// readable back via `provider_identity()`, proving the `open` path now
+    /// stamps instead of leaving the store identity-less (the #7 closure).
+    #[test]
+    #[cfg(feature = "builtin-embeddings")]
+    fn open_path_stamps_config_derived_identity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("open-builtin-stamp.db");
+
+        let db = PulseDB::open(&path, Config::with_builtin_embeddings())
+            .expect("open with Builtin config stamps the onnx identity");
+        let stamped = db.provider_identity().expect("stamp is readable");
+        assert_eq!(stamped.provider, "builtin-onnx");
+        assert!(
+            stamped.model_id.starts_with("onnx-"),
+            "expected the onnx fingerprint model_id, got: {}",
+            stamped.model_id
+        );
+        db.close().unwrap();
+    }
+
+    /// Opening via `open` with the default `External` config stamps the
+    /// config-derived identity `{external, external-384}`. Runs without the
+    /// `builtin-embeddings` feature.
+    #[test]
+    fn open_path_external_stamps_external_identity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("open-external-stamp.db");
+
+        let db = PulseDB::open(&path, Config::default())
+            .expect("open with External config stamps the external identity");
+        assert_eq!(
+            db.provider_identity().expect("stamp is readable"),
+            id("external", "external-384"),
+            "open stamped the config-derived External identity"
+        );
+        db.close().unwrap();
+    }
+
+    /// Reopening a Builtin-stamped store via `open` with an `External` config
+    /// is refused with `EmbeddingProviderMismatch` — the `open`-path mismatch
+    /// guard (the headline #7 closure: the `open` path can no longer be used
+    /// to silently mix providers in one HNSW index).
+    #[test]
+    #[cfg(feature = "builtin-embeddings")]
+    fn open_path_mismatched_builtin_reopen_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("open-mismatch.db");
+
+        // Stamp via `open` with Builtin → {builtin-onnx, onnx-<hash>}.
+        let db = PulseDB::open(&path, Config::with_builtin_embeddings())
+            .expect("first open stamps the builtin identity");
+        db.close().unwrap();
+
+        // Reopen via `open` with External → requested {external, external-384}.
+        let err = PulseDB::open(&path, Config::default())
+            .expect_err("cross-provider reopen via open must be refused");
+        match err {
+            PulseDBError::EmbeddingProviderMismatch {
+                persisted,
+                requested,
+            } => {
+                assert_eq!(persisted.provider, "builtin-onnx");
+                assert_eq!(requested.provider, "external");
+            }
+            other => panic!("expected EmbeddingProviderMismatch, got {other:?}"),
+        }
+    }
+
+    /// Reopening a store via `open` with the SAME config succeeds and leaves
+    /// the stamp unchanged — the Match arm skips the redundant re-stamp
+    /// (mirrors the open_with_embedder audit-challenge-3 optimization).
+    #[test]
+    fn open_path_same_config_reopen_skips_restamp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("open-same-config.db");
+
+        let db = PulseDB::open(&path, Config::default()).expect("first open stamps");
+        let first = db.provider_identity().expect("stamp readable");
+        db.close().unwrap();
+
+        let db2 = PulseDB::open(&path, Config::default())
+            .expect("reopen with same config succeeds (Match arm)");
+        assert_eq!(
+            db2.provider_identity().expect("stamp readable"),
+            first,
+            "stamp unchanged across a matching reopen"
+        );
+        db2.close().unwrap();
+    }
+
+    /// The lenient-adoption path fires ONLY for a genuine pre-0.7.0 store
+    /// (BOTH keys absent). Synthesized via `open_parts` (no stamping); reopened
+    /// via `open`, it leniently adopts + stamps the config-derived identity.
+    #[test]
+    fn lenient_path_fires_only_when_both_keys_absent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("open-lenient-both-absent.db");
+
+        // Genuine pre-0.7.0 store: BOTH keys absent.
+        unstamped_store(&path);
+
+        // Reopen via `open` → (None, false) → lenient adoption.
+        let db = PulseDB::open(&path, Config::default())
+            .expect("lenient adoption stamps the config-derived identity");
+        assert_eq!(
+            db.provider_identity().expect("stamp readable"),
+            id("external", "external-384"),
+            "lenient path stamped the config-derived identity"
+        );
+        db.close().unwrap();
+    }
+
+    /// Codex #17 closure: a post-0.7.0 store whose identity stamp was LOST or
+    /// CORRUPTED (era marker present, identity absent) is refused with a typed
+    /// corruption error — NOT silently re-adopted. The corruption shape is
+    /// synthesized by removing ONLY `PROVIDER_IDENTITY_KEY` directly through
+    /// redb, leaving `PROVIDER_IDENTITY_STAMPED_AT_KEY` behind.
+    #[test]
+    fn era_marker_present_identity_absent_is_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("open-era-without-identity.db");
+
+        // Stamp both keys via a real `open`.
+        let db = PulseDB::open(&path, Config::default()).expect("open stamps both keys");
+        db.close().unwrap();
+
+        // Remove ONLY the identity key, leaving the era marker behind.
+        let redb_db = redb::Database::open(&path).expect("open redb directly to corrupt");
+        {
+            let wtxn = redb_db.begin_write().unwrap();
+            {
+                let mut meta = wtxn
+                    .open_table(crate::storage::schema::METADATA_TABLE)
+                    .unwrap();
+                meta.remove(crate::storage::schema::PROVIDER_IDENTITY_KEY)
+                    .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        drop(redb_db);
+
+        // Reopen via `open` → (None, true) → corruption error (not adoption).
+        let err = PulseDB::open(&path, Config::default())
+            .expect_err("era-present + identity-absent must be refused as corruption");
+        match err {
+            PulseDBError::Storage(storage_err) => {
+                let msg = storage_err.to_string();
+                assert!(
+                    msg.to_lowercase().contains("corrupt"),
+                    "expected a Corrupted-class error, got: {msg}"
+                );
+                assert!(
+                    msg.contains("era marker present"),
+                    "expected the message to name the era-marker-present state, got: {msg}"
+                );
+            }
+            other => panic!("expected PulseDBError::Storage(Corrupted(..)), got {other:?}"),
+        }
+    }
+
+    /// VS-4.3.3/1.06 fix-up (close-depth challenge 1): `open_with_embedder`
+    /// must ALSO refuse an era-present/identity-absent store — not silently
+    /// adopt the injected identity. Mirrors the `open` path test above.
+    #[test]
+    fn open_with_embedder_era_marker_present_identity_absent_is_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("injected-era-without-identity.db");
+
+        // Stamp both keys via `open_with_embedder`.
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "ada-002")),
+        )
+        .expect("open_with_embedder stamps both keys");
+        db.close().unwrap();
+
+        // Remove ONLY the identity key, leaving the era marker behind.
+        let redb_db = redb::Database::open(&path).expect("open redb directly to corrupt");
+        {
+            let wtxn = redb_db.begin_write().unwrap();
+            {
+                let mut meta = wtxn
+                    .open_table(crate::storage::schema::METADATA_TABLE)
+                    .unwrap();
+                meta.remove(crate::storage::schema::PROVIDER_IDENTITY_KEY)
+                    .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        drop(redb_db);
+
+        // Reopen via `open_with_embedder` with a DIFFERENT identity → (None,
+        // true) → corruption error (not silent adoption of the new identity).
+        let err = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "different-model")),
+        )
+        .expect_err("open_with_embedder must refuse era-present + identity-absent as corruption");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("corrupt"),
+            "expected a Corrupted-class error, got: {msg}"
+        );
+        assert!(
+            msg.contains("era marker present"),
+            "expected the message to name the era-marker-present state, got: {msg}"
+        );
+    }
+
+    /// VS-4.3.3/1.06 fix-up (close-depth challenge 2): the `main_graph`
+    /// migration must fire ONLY for the bundled MiniLM, not for an arbitrary
+    /// builtin model. A non-MiniLM `main_graph` reopen must be refused (the
+    /// user must re-embed), not silently re-stamped.
+    #[test]
+    fn main_graph_migration_refuses_non_bundled_minilm() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("main-graph-non-minilm.db");
+
+        // Create a store through open_with_embedder (sets up all tables +
+        // stamps both keys), then overwrite the identity key with
+        // {builtin-onnx, main_graph} to simulate a VS-4.3.1-era stamp.
+        let db = PulseDB::open_with_embedder(
+            &path,
+            Config::default(),
+            injected(id("external", "ada-002")),
+        )
+        .expect("create store");
+        db.close().unwrap();
+
+        let redb_db = redb::Database::open(&path).expect("open redb to overwrite identity");
+        {
+            let wtxn = redb_db.begin_write().unwrap();
+            {
+                let mut meta = wtxn
+                    .open_table(crate::storage::schema::METADATA_TABLE)
+                    .unwrap();
+                let legacy = crate::embedding::ProviderIdentity {
+                    provider: "builtin-onnx".to_string(),
+                    model_id: "main_graph".to_string(),
+                };
+                let bytes = postcard::to_allocvec(&legacy).unwrap();
+                meta.insert(
+                    crate::storage::schema::PROVIDER_IDENTITY_KEY,
+                    bytes.as_slice(),
+                )
+                .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        drop(redb_db);
+
+        // Reopen via `open` with External config → config-derived identity is
+        // {external, external-384}, NOT {builtin-onnx, onnx-<minilm>}. The
+        // migration must NOT fire; the mismatch guard must refuse.
+        let err = PulseDB::open(&path, Config::default())
+            .expect_err("non-MiniLM main_graph reopen must be refused");
+        assert!(
+            matches!(err, PulseDBError::EmbeddingProviderMismatch { .. }),
+            "expected EmbeddingProviderMismatch (migration should NOT fire for non-MiniLM), got: {err:?}"
+        );
+    }
     /// reopen whose injected identity MATCHES the persisted stamp should NOT
     /// re-stamp — the bytes are identical and the write txn + fsync is pure
     /// overhead on the hot open path. The structural guard (`should_stamp`)
@@ -4150,5 +4802,68 @@ mod provider_identity_persistence {
     fn matching_reopen_skips_redundant_stamp() {
         // Skipped body kept as living documentation of the intended assertion.
         // When the spy infra lands, restore the mtime-independent witness here.
+    }
+
+    /// (h) VS-4.3.3/1.05 (#10): a dimension mismatch between the injected
+    /// embedder and the configured dimension is refused BEFORE the stamp
+    /// fires. Catches the 384-config + 768-embedder case that would stamp
+    /// successfully then corrupt the HNSW on the first record. The "no stamp
+    /// written" half is proved by reopening with a CORRECT-dim embedder
+    /// carrying a DIFFERENT identity: if the failed open had left a stamp, the
+    /// different identity would trip the mismatch guard; instead the lenient
+    /// adoption path fires (persisted identity is None), proving nothing was
+    /// stamped.
+    #[test]
+    fn open_with_embedder_dim_mismatch_refused_before_stamp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dim-mismatch.db");
+
+        // D384 config (Config::default()) but inject a 768-dim embedder.
+        let too_big = Arc::new(StubEmbedder::new(768, id("external", "ada-002")));
+        let err = PulseDB::open_with_embedder(&path, Config::default(), too_big)
+            .expect_err("768-dim embedder under D384 config must be refused");
+
+        match err {
+            PulseDBError::Validation(ValidationError::DimensionMismatch { expected, got }) => {
+                assert_eq!(expected, 384, "expected the configured D384");
+                assert_eq!(got, 768, "got the injected 768");
+            }
+            other => panic!("expected DimensionMismatch, got {other:?}"),
+        }
+
+        // No stamp was written: reopen with a CORRECT-dim (384) embedder
+        // carrying a DIFFERENT identity. If the failed open had left a stamp,
+        // this reopen would hit the EmbeddingProviderMismatch guard; instead
+        // the lenient adoption path fires (persisted is None), proving the
+        // dim-mismatch wrote nothing.
+        let correct = Arc::new(StubEmbedder::new(384, id("external", "cohere-embed-v3")));
+        let db = PulseDB::open_with_embedder(&path, Config::default(), correct)
+            .expect("no stamp left → lenient adoption of the new identity");
+        assert_eq!(
+            db.provider_identity().unwrap(),
+            id("external", "cohere-embed-v3"),
+            "lenient path stamped the correct-dim identity"
+        );
+        db.close().unwrap();
+    }
+
+    /// (i) VS-4.3.3/1.05 (#10) regression guard: when the injected embedder's
+    /// dimension MATCHES the configured dimension, the dim check does not
+    /// over-fire — the open succeeds and the stamp is written normally.
+    #[test]
+    fn open_with_embedder_matching_dim_stamps_normally() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dim-match.db");
+
+        let original = id("external", "ada-002");
+        // `injected()` builds a 384-dim StubEmbedder; Config::default() is D384.
+        let db = PulseDB::open_with_embedder(&path, Config::default(), injected(original.clone()))
+            .expect("matching dimension stamps normally");
+        assert_eq!(
+            db.provider_identity().expect("stamp written"),
+            original,
+            "stamp carries the injected identity"
+        );
+        db.close().unwrap();
     }
 }

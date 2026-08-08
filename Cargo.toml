@@ -103,6 +103,12 @@ dirs = { version = "6.0", optional = true }
 # Optional: HTTP client for model downloads from HuggingFace
 ureq = { version = "3.0", optional = true }
 
+# VS-4.3.3 (1.04): full SHA-256 construction-time fingerprint of length-framed
+# model+tokenizer bytes for OnnxEmbedding::identity(). Promoted from
+# [dev-dependencies] (was dev-only for the VS-4.0.4 golden-fixture hash check);
+# now a runtime dep used by the embedding identity path.
+sha2 = "0.10"
+
 # Optional: HTTP transport for sync protocol
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "gzip"] }
 
@@ -128,9 +134,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # Property-based testing (E5-S03: verify invariants with random inputs)
 proptest = "1.4"
 
-# VS-4.0.4 (4.02) golden-fixture upgrade test only. Runtime deps are unchanged.
-# sha2: the C1 provenance hash-check (fixture SHA-256 vs manifest) before opening.
-sha2 = "0.10"
+# VS-4.0.4 (4.02) golden-fixture upgrade test re-declares runtime deps so the
+# integration target can name them (sha2 was promoted to [dependencies] in
+# VS-4.3.3/1.04 for OnnxEmbedding's construction-time fingerprint).
 # serde_json: parse the frozen manifest oracle (already a runtime dep; re-declared
 # here so the integration target can name it).
 serde_json = "1.0"
