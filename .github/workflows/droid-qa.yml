@@ -41,6 +41,7 @@ jobs:
         uses: Factory-AI/droid-action@main
         with:
           factory_api_key: ${{ secrets.FACTORY_API_KEY }}
+          droid_args: "-m glm-5.2 -r high"
           prompt: |
             You are running in a NON-INTERACTIVE CI environment. There is NO human available.
             Do NOT use AskUser, do NOT wait for confirmations, do NOT pause for input.

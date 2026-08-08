@@ -25,9 +25,11 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Run Droid Auto Review
+      - name: Run Droid Auto Review + Security Review
         uses: Factory-AI/droid-action@main
         with:
           factory_api_key: ${{ secrets.FACTORY_API_KEY }}
           automatic_review: true
-          review_depth: deep
+          automatic_security_review: true
+          review_model: glm-5.2
+          reasoning_effort: high
