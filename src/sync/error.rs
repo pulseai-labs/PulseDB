@@ -154,6 +154,42 @@ pub enum SyncError {
         cap: u64,
     },
 
+    /// A request this instance built cannot fit the budget the party that must
+    /// read it will actually accept.
+    ///
+    /// Raised at exactly one boundary — the **outbound** encode, where the
+    /// request's own frame is measured against the send budget its producer
+    /// supplied. It is never a reclassification of an inbound
+    /// [`SyncError::PayloadTooLarge`]: an oversized body arriving from the wire
+    /// keeps that variant, because there the fault is the sender's.
+    ///
+    /// **Deterministic and terminal**, for the same reason
+    /// [`SyncError::ChangeTooLarge`] is: the same request rebuilt next cycle is
+    /// the same size against the same cap, so retrying sends a body already
+    /// known not to fit. The background loop records
+    /// [`SyncStatus::Error`](super::types::SyncStatus::Error) and stops; a
+    /// one-shot call returns it.
+    ///
+    /// Distinct from [`SyncError::ChangeTooLarge`], and not interchangeable
+    /// with it: no WAL sequence is at fault here and no cursor is involved —
+    /// the request's own shape is what does not fit. A single oversized WAL
+    /// change is still `ChangeTooLarge`, caught by the packer before any
+    /// transport is invoked, and still leaves its cursor unadvanced.
+    ///
+    /// Correcting it is an operator action — narrow
+    /// [`SyncConfig::collectives`](super::config::SyncConfig::collectives), or
+    /// raise the peer's `max_request_bytes` — after which
+    /// [`SyncManager::start`](super::manager::SyncManager::start) runs again.
+    #[error("Sync {operation:?} request needs {needed} bytes, over the {cap}-byte send budget")]
+    RequestTooLarge {
+        /// Which request could not fit.
+        operation: super::wire::WireOperation,
+        /// The exact frame size the request requires.
+        needed: u64,
+        /// The effective send budget it was measured against.
+        cap: u64,
+    },
+
     /// The peer refused the request with a compact structured reason.
     ///
     /// The detail is bounded on the wire
@@ -338,6 +374,14 @@ impl SyncError {
     /// deterministic, terminal failure the background loop stops retrying on.
     pub fn is_change_too_large(&self) -> bool {
         matches!(self, Self::ChangeTooLarge { .. })
+    }
+
+    /// Returns true if an outbound request could not fit the budget the reader
+    /// on the other side will accept — the deterministic, terminal failure the
+    /// background loop stops retrying on, alongside
+    /// [`is_change_too_large`](Self::is_change_too_large).
+    pub fn is_request_too_large(&self) -> bool {
+        matches!(self, Self::RequestTooLarge { .. })
     }
 
     /// Returns true if a frame carried the wrong operation discriminator.

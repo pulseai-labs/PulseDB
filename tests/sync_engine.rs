@@ -1150,6 +1150,7 @@ async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
         async fn handshake(
             &self,
             _request: HandshakeRequest,
+            _send_budget_bytes: usize,
         ) -> Result<HandshakeResponse, SyncError> {
             Ok(HandshakeResponse {
                 instance_id: self.peer,
@@ -1163,6 +1164,7 @@ async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
         async fn push_changes(
             &self,
             _request: PushRequest,
+            _send_budget_bytes: usize,
         ) -> Result<WireReply<PushAck>, SyncError> {
             unreachable!("initial_sync never pushes");
         }
@@ -1170,6 +1172,7 @@ async fn initial_sync_terminates_on_an_empty_batch_that_claims_more() {
         async fn pull_changes(
             &self,
             request: PullRequest,
+            _send_budget_bytes: usize,
         ) -> Result<WireReply<PullPage>, SyncError> {
             if self.pulls.fetch_add(1, Ordering::SeqCst) >= SPIN_TRIPWIRE {
                 return Err(SyncError::transport("initial_sync is spinning"));
@@ -1265,6 +1268,7 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPullTransport {
     async fn handshake(
         &self,
         _request: pulsedb::sync::types::HandshakeRequest,
+        _send_budget_bytes: usize,
     ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
         Ok(pulsedb::sync::types::HandshakeResponse {
             instance_id: self.peer,
@@ -1278,6 +1282,7 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPullTransport {
     async fn push_changes(
         &self,
         _request: pulsedb::sync::types::PushRequest,
+        _send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
         pulsedb::sync::SyncError,
@@ -1288,6 +1293,7 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPullTransport {
     async fn pull_changes(
         &self,
         request: pulsedb::sync::types::PullRequest,
+        _send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
         pulsedb::sync::SyncError,
@@ -1493,6 +1499,7 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPagesTransport {
     async fn handshake(
         &self,
         _request: pulsedb::sync::types::HandshakeRequest,
+        _send_budget_bytes: usize,
     ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
         Ok(pulsedb::sync::types::HandshakeResponse {
             instance_id: self.peer,
@@ -1506,6 +1513,7 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPagesTransport {
     async fn push_changes(
         &self,
         _request: pulsedb::sync::types::PushRequest,
+        _send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
         pulsedb::sync::SyncError,
@@ -1516,6 +1524,7 @@ impl pulsedb::sync::transport::SyncTransport for ScriptedPagesTransport {
     async fn pull_changes(
         &self,
         request: pulsedb::sync::types::PullRequest,
+        _send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
         pulsedb::sync::SyncError,
@@ -1920,6 +1929,7 @@ impl pulsedb::sync::transport::SyncTransport for RestorableTransport {
     async fn handshake(
         &self,
         _request: pulsedb::sync::types::HandshakeRequest,
+        _send_budget_bytes: usize,
     ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
         self.0
             .handshakes
@@ -1936,6 +1946,7 @@ impl pulsedb::sync::transport::SyncTransport for RestorableTransport {
     async fn push_changes(
         &self,
         request: pulsedb::sync::types::PushRequest,
+        _send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
         pulsedb::sync::SyncError,
@@ -1980,6 +1991,7 @@ impl pulsedb::sync::transport::SyncTransport for RestorableTransport {
     async fn pull_changes(
         &self,
         request: pulsedb::sync::types::PullRequest,
+        _send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
         pulsedb::sync::SyncError,
@@ -2483,6 +2495,7 @@ async fn recovery_v5_a_second_remint_in_one_cycle_fails_boundedly() {
         async fn handshake(
             &self,
             _request: pulsedb::sync::types::HandshakeRequest,
+            _send_budget_bytes: usize,
         ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
             self.handshakes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2498,6 +2511,7 @@ async fn recovery_v5_a_second_remint_in_one_cycle_fails_boundedly() {
         async fn push_changes(
             &self,
             request: pulsedb::sync::types::PushRequest,
+            _send_budget_bytes: usize,
         ) -> Result<
             pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
             pulsedb::sync::SyncError,
@@ -2511,6 +2525,7 @@ async fn recovery_v5_a_second_remint_in_one_cycle_fails_boundedly() {
         async fn pull_changes(
             &self,
             request: pulsedb::sync::types::PullRequest,
+            _send_budget_bytes: usize,
         ) -> Result<
             pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
             pulsedb::sync::SyncError,
@@ -3035,4 +3050,377 @@ async fn recovery_v5_double_start_is_refused_while_running() {
         .expect_err("a live run must not be started twice");
     assert!(err.to_string().contains("already started"), "got {err}");
     manager.stop().await.unwrap();
+}
+
+// ============================================================================
+// Direction-specific transport budgets (R4, R7-R10)
+//
+// The outbound budget is what the party that must READ the request will
+// accept; the advertised reply budget is what this side can read. They are
+// different numbers computed from different inputs, and neither is the other.
+// ============================================================================
+
+/// The exact `PullRequest` a `SyncManager` builds for `peer`, so a test can
+/// MEASURE the boundary instead of baking in a guessed collective count.
+///
+/// It has to be the real shape — the same identities, cursor, batch size and
+/// advertised reply limit — because every one of those contributes bytes.
+fn manager_pull_request(
+    local: pulsedb::sync::types::InstanceId,
+    peer: pulsedb::sync::types::InstanceId,
+    config: &SyncConfig,
+    reply_limit_bytes: u64,
+    collectives: &[CollectiveId],
+) -> pulsedb::sync::types::PullRequest {
+    pulsedb::sync::types::PullRequest {
+        protocol_version: pulsedb::sync::SYNC_PROTOCOL_VERSION,
+        source_instance: local,
+        target_instance: peer,
+        cursor: pulsedb::sync::types::SyncPosition::new(peer, 0),
+        batch_size: config.batch_size as u64,
+        reply_limit_bytes,
+        collectives: Some(collectives.to_vec()),
+    }
+}
+
+/// Grows a collective filter one id at a time until the real frame crosses
+/// `cap`, and returns `(the first filter that does NOT fit, the largest that
+/// does)`.
+fn measure_filter_boundary(
+    local: pulsedb::sync::types::InstanceId,
+    peer: pulsedb::sync::types::InstanceId,
+    config: &SyncConfig,
+    reply_limit_bytes: u64,
+    cap: usize,
+) -> (Vec<CollectiveId>, Vec<CollectiveId>) {
+    let mut ids: Vec<CollectiveId> = Vec::new();
+    loop {
+        ids.push(CollectiveId::new());
+        let frame = pulsedb::sync::wire::encoded_len(&manager_pull_request(
+            local,
+            peer,
+            config,
+            reply_limit_bytes,
+            &ids,
+        ))
+        .unwrap();
+        if frame > cap {
+            let under = ids[..ids.len() - 1].to_vec();
+            assert!(
+                !under.is_empty(),
+                "the crossover must be above a single id, or the case is degenerate"
+            );
+            return (ids, under);
+        }
+        assert!(
+            ids.len() < 4096,
+            "the filter never crossed the {cap}-byte cap; the measurement is wrong"
+        );
+    }
+}
+
+/// R4 — bounded control traffic under ASYMMETRIC limits at the 1 KiB floor.
+///
+/// The peer accepts only the control minimum while this side's policy is
+/// 64 MiB. The handshake and the empty routed push must both still succeed —
+/// they are certified bounded control frames — and identity detection must stay
+/// active on the two paths that have no changes to send: a cursor already at
+/// the WAL head, and a page filtered away entirely.
+#[tokio::test]
+async fn recovery_v5_bounded_controls_survive_the_minimum_peer_budget() {
+    let (db_a, _dir_a, _cid, ids) = seeded_store();
+    let (db_b, _dir_b) = open_db();
+    // A peer that will read no more than a bounded control frame.
+    let endpoint = common::SyncEndpoint::new(server_for_with(
+        &db_b,
+        SyncConfig {
+            max_request_bytes: pulsedb::sync::MIN_CONTROL_FRAME_BYTES,
+            ..SyncConfig::default()
+        },
+    ));
+    let original = endpoint.instance_id();
+
+    // A filter excluding everything this store holds: every page is filtered,
+    // so only the empty probe ever goes out and it must fit 1 KiB.
+    let unrelated = CollectiveId::new();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            collectives: Some(vec![unrelated]),
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    // The handshake happened (the manager is bound) and the empty probe went
+    // out under the 1 KiB peer cap.
+    manager
+        .sync_once()
+        .await
+        .expect("a bounded control exchange fits the certified minimum");
+    let probes = endpoint.pushes();
+    assert!(probes >= 1, "an entirely filtered page still probes");
+    for id in &ids {
+        assert!(db_b.get_experience(*id).unwrap().is_none());
+    }
+    let head = db_a.get_current_sequence().unwrap();
+    assert_eq!(
+        cursor_row(&db_a, original).unwrap().push_sequence,
+        head,
+        "a validated probe lets the filtered scan position be saved"
+    );
+
+    // Identity detection at the WAL head, still under the minimum budget.
+    let (db_c, _dir_c) = open_db();
+    endpoint.replace(server_for_with(
+        &db_c,
+        SyncConfig {
+            max_request_bytes: pulsedb::sync::MIN_CONTROL_FRAME_BYTES,
+            ..SyncConfig::default()
+        },
+    ));
+    let restored = endpoint.instance_id();
+    assert_ne!(restored, original);
+
+    manager.sync_once().await.unwrap();
+    assert!(
+        endpoint.pushes() > probes,
+        "the cycle must have made a request, or it could not have noticed"
+    );
+    assert!(
+        cursor_row(&db_a, restored).is_some(),
+        "the replacement is detected and bound through a 1 KiB control exchange"
+    );
+}
+
+/// R8 + R9 + R10 — a control request too large for the peer's reader is a
+/// LOCAL, typed, terminal failure, and the boundary is the measured one.
+///
+/// `SyncConfig::collectives` is a documented public field and is unbounded, so
+/// a supported configuration can build a pull request past a conforming peer's
+/// inbound cap. Sending it means the peer refuses it remotely and the loop
+/// retries the identical body forever. Failing locally is strictly better: one
+/// round trip cheaper, typed, and terminal.
+#[tokio::test]
+async fn recovery_v5_oversized_filtered_pull_fails_locally_and_terminally() {
+    let (db_a, _dir_a) = open_db();
+    let (db_b, _dir_b) = open_db();
+    let cap = pulsedb::sync::MIN_CONTROL_FRAME_BYTES;
+    let endpoint = common::SyncEndpoint::new(server_for_with(
+        &db_b,
+        SyncConfig {
+            max_request_bytes: cap,
+            ..SyncConfig::default()
+        },
+    ));
+    let peer = endpoint.instance_id();
+
+    let base = SyncConfig {
+        direction: SyncDirection::PullOnly,
+        push_interval_ms: 10,
+        pull_interval_ms: 10,
+        ..sync_config()
+    };
+    // The transport's receive limit IS the peer server's cap here, so the
+    // advertised reply budget is min(64 MiB, 1 KiB).
+    let reply_limit = cap as u64;
+    let (over, under) = measure_filter_boundary(db_a.instance_id(), peer, &base, reply_limit, cap);
+    let over_frame = pulsedb::sync::wire::encoded_len(&manager_pull_request(
+        db_a.instance_id(),
+        peer,
+        &base,
+        reply_limit,
+        &over,
+    ))
+    .unwrap();
+
+    // ── R9: the adjacent FITTING filter still works. The boundary is real,
+    // not a blanket refusal of filtered pulls.
+    let mut fits = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            collectives: Some(under.clone()),
+            ..base.clone()
+        },
+    )
+    .unwrap();
+    fits.sync_once()
+        .await
+        .expect("a measured under-cap filter is an ordinary pull");
+    assert!(
+        endpoint.pulls() >= 1,
+        "the fitting filter reached the peer, so the boundary is where measured"
+    );
+
+    // ── R8: one more id, and the request cannot be read by the peer.
+    let pulls_before = endpoint.pulls();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            collectives: Some(over.clone()),
+            ..base.clone()
+        },
+    )
+    .unwrap();
+
+    let err = manager
+        .sync_once()
+        .await
+        .expect_err("a request the peer cannot read must not be sent");
+    match err {
+        pulsedb::sync::SyncError::RequestTooLarge {
+            operation,
+            needed,
+            cap: c,
+        } => {
+            assert_eq!(operation, pulsedb::sync::WireOperation::Pull);
+            assert_eq!(needed, over_frame as u64, "the measured frame is reported");
+            assert_eq!(c, cap as u64, "against the peer's actual inbound budget");
+        }
+        other => panic!("expected the typed RequestTooLarge, got {other}"),
+    }
+    // R10 (classification): it is NOT the WAL-change variant, and not the
+    // inbound one either. No sequence is at fault and no cursor is involved.
+    let err = manager.sync_once().await.unwrap_err();
+    assert!(err.is_request_too_large());
+    assert!(
+        !err.is_change_too_large(),
+        "no WAL sequence is at fault, so ChangeTooLarge would be a lie in the type"
+    );
+    assert!(
+        !err.is_payload_too_large(),
+        "and it is an outbound failure, not an oversized inbound body"
+    );
+    assert_eq!(
+        endpoint.pulls(),
+        pulls_before,
+        "no pull crossed to the peer — the failure is local, before the round trip"
+    );
+    assert!(
+        matches!(manager.status(), SyncStatus::Error(ref m) if m.contains("send budget")),
+        "a one-shot terminal failure records the actionable reason, got {:?}",
+        manager.status()
+    );
+
+    // ── The background loop stops rather than retrying a body already known
+    // not to fit.
+    manager.start().await.unwrap();
+    await_until(
+        || matches!(manager.status(), SyncStatus::Error(ref m) if m.contains("send budget")),
+        "the background loop records the terminal request-size error",
+    )
+    .await;
+    let attempts = endpoint.pulls();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        endpoint.pulls(),
+        attempts,
+        "and makes no further automatic attempt across ~30 poll intervals"
+    );
+    // Deterministic proof the task EXITED rather than merely being quiet: a
+    // `start()` on a live run is refused, so one that succeeds reaped it.
+    manager
+        .start()
+        .await
+        .expect("the terminal task exited, so a restart reaps it");
+    await_until(
+        || matches!(manager.status(), SyncStatus::Error(ref m) if m.contains("send budget")),
+        "the restarted run hits the same dead end and records it again",
+    )
+    .await;
+    // Stopping a task that already exited reaps it without erasing the reason.
+    manager.stop().await.unwrap();
+    assert!(
+        matches!(manager.status(), SyncStatus::Error(ref m) if m.contains("send budget")),
+        "the reason survives on the exited task"
+    );
+
+    // ── R10 (restart): the operator corrects the cause — here by raising the
+    // peer's inbound limit — and an explicit restart re-handshakes, picks the
+    // new budget up, and resumes.
+    endpoint.replace(server_for_with(
+        &db_b,
+        SyncConfig {
+            max_request_bytes: 64 * 1024 * 1024,
+            ..SyncConfig::default()
+        },
+    ));
+    let mut corrected = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            collectives: Some(over),
+            ..base
+        },
+    )
+    .unwrap();
+    corrected
+        .sync_once()
+        .await
+        .expect("the same filter fits the corrected peer, and the pull runs");
+    assert!(
+        endpoint.pulls() > attempts,
+        "the corrected configuration actually reaches the peer"
+    );
+}
+
+/// R7 — the WAL-change terminal path is NOT replaced by the request-size one.
+///
+/// A single change that cannot fit its push budget is caught by the packer,
+/// before any transport is invoked, so it keeps naming its sequence and keeps
+/// leaving its cursor unadvanced. Reclassifying it would lose both.
+#[tokio::test]
+async fn recovery_v5_oversized_change_is_not_reclassified_as_request_too_large() {
+    let (db_a, _dir_a) = open_db();
+    let (db_b, _dir_b) = open_db();
+    let endpoint = common::SyncEndpoint::new(server_for(&db_b));
+
+    let cid = db_a.create_collective("oversized").unwrap(); // seq 1
+    db_a.record_experience(NewExperience {
+        collective_id: cid,
+        content: "x".repeat(8 * 1024),
+        embedding: Some(vec![0.1f32; 384]),
+        ..Default::default()
+    })
+    .unwrap(); // seq 2
+
+    let tight = 4 * 1024;
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_a),
+        Box::new(ServerBackedTransport::over(Arc::clone(&endpoint))),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            max_request_bytes: tight,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    manager.sync_once().await.unwrap(); // the collective fits
+    let pushes = endpoint.pushes();
+    let err = manager.sync_once().await.unwrap_err();
+    assert!(
+        err.is_change_too_large(),
+        "the packer catches it first and names the sequence, got {err}"
+    );
+    assert!(
+        !err.is_request_too_large(),
+        "the two terminal paths stay distinct, got {err}"
+    );
+    assert_eq!(
+        endpoint.pushes(),
+        pushes,
+        "and it never reached the transport, so no request was ever built"
+    );
+    assert_eq!(
+        cursor_row(&db_a, endpoint.instance_id())
+            .unwrap()
+            .push_sequence,
+        1,
+        "the oversized change keeps its cursor unadvanced"
+    );
 }

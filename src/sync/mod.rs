@@ -91,6 +91,28 @@
 //! [`SyncError::ChangeTooLarge`] with its cursor unadvanced, and the background
 //! loop stops retrying it instead of rebuilding the same refused body forever.
 //!
+//! **Send and receive budgets are different numbers.**
+//! [`SyncTransport::receive_limit_bytes`](crate::sync::SyncTransport::receive_limit_bytes) is inbound only — the body this
+//! transport will read — and nothing about it bounds what a peer will accept.
+//! The outbound direction arrives per call as `send_budget_bytes` on
+//! `handshake`, `push_changes` and `pull_changes`: the cap the request's own
+//! frame is encoded against, supplied by whoever packed it, so the encode cap
+//! and the packing cap are the same value by construction. It is a local
+//! parameter and is never serialized; a budget field inside a request would
+//! change that request's own encoded length. Each producer supplies what the
+//! reader on the other side will actually take — `min(local policy, peer
+//! inbound limit)` for a push, `min(local policy, the bound peer's inbound
+//! limit)` for a pull, and local policy alone for a handshake, which has no
+//! binding yet and therefore rests on peer conformance: a bounded control frame
+//! fits [`wire::MIN_CONTROL_FRAME_BYTES`](crate::sync::wire::MIN_CONTROL_FRAME_BYTES), which every conforming v5 server
+//! enforces as its own floor at construction. A request that exceeds its send
+//! budget is refused locally as the typed [`SyncError::RequestTooLarge`](crate::sync::SyncError::RequestTooLarge),
+//! before transmission — deterministic and terminal like
+//! [`SyncError::ChangeTooLarge`](crate::sync::SyncError::ChangeTooLarge), and distinct from it, because no WAL sequence
+//! is at fault and no cursor is involved. An oversized body arriving from the
+//! wire keeps [`SyncError::PayloadTooLarge`](crate::sync::SyncError::PayloadTooLarge); the outbound mapping never
+//! reclassifies it.
+//!
 //! **What the byte cap does and does not bound.** It bounds encoded request and
 //! reply bodies, and the accumulation of a bounded response. It does **not**
 //! bound every decoded object, nor WAL and payload allocations behind the

@@ -14,6 +14,11 @@
 //! and refused the moment it crosses the cap — either way as the typed
 //! [`SyncError::PayloadTooLarge`], before any postcard decode.
 //!
+//! That cap is **inbound only**. What this client will read says nothing about
+//! what a peer will accept, so an outbound request is encoded against the
+//! `send_budget_bytes` its caller supplies — the cap its packer sized against —
+//! and never against the response reader. The two are legitimately unequal.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -88,7 +93,12 @@ impl HttpSyncTransport {
         }
     }
 
-    /// Sets the response-body byte cap (default [`DEFAULT_MAX_REQUEST_BYTES`]).
+    /// Sets the **response**-body byte cap (default
+    /// [`DEFAULT_MAX_REQUEST_BYTES`]).
+    ///
+    /// Inbound only: it bounds what this client reads, never what it sends. A
+    /// client that reads 4 MiB may still send a 64 MiB request to a peer that
+    /// accepts one — the outbound budget arrives per call.
     ///
     /// Mirrors the server's `SyncConfig::max_request_bytes` on the client
     /// side: a response whose `Content-Length` exceeds the cap is refused
@@ -197,43 +207,99 @@ impl HttpSyncTransport {
 
     /// Sends a POST with a framed body and decodes the framed response.
     ///
-    /// Both legs go through [`wire`](super::wire): the request is refused
-    /// before allocation if it would exceed this client's cap, and the response
-    /// is checked for cap, magic, wire version and operation before any decode.
+    /// Both legs go through [`wire`](super::wire), against **different** caps,
+    /// because they are different directions. The request is refused before
+    /// allocation if it exceeds `send_budget` — the caller's outbound budget,
+    /// the same number its packer sized against. The response is checked
+    /// against [`Self::max_response_bytes`], this client's actual reader, for
+    /// cap, magic, wire version and operation before any decode.
+    ///
+    /// Encoding over budget is [`SyncError::RequestTooLarge`], not
+    /// `PayloadTooLarge`: this side built a request too big for the budget it
+    /// was given, which is deterministic and terminal, whereas an oversized
+    /// body arriving from the wire is the sender's fault and stays
+    /// `PayloadTooLarge`.
     async fn post_framed<Req, Resp>(
         &self,
         operation: WireOperation,
         path: &str,
         request: &Req,
+        send_budget: usize,
     ) -> Result<Resp, SyncError>
     where
         Req: serde::Serialize,
         Resp: serde::de::DeserializeOwned,
     {
-        let body = wire::encode_bounded(operation, request, self.max_response_bytes)?;
+        let body = wire::encode_bounded(operation, request, send_budget)
+            .map_err(|e| request_too_large(operation, e))?;
         let response_bytes = self.post_raw(path, body).await?;
         wire::decode_bounded(operation, &response_bytes, self.max_response_bytes)
     }
 }
 
+/// Reclassifies an **encode**-time over-budget refusal as
+/// [`SyncError::RequestTooLarge`].
+///
+/// Only [`wire::encode_bounded`] feeds this, and only on the outbound leg, so
+/// the size it reports is unambiguously "the request we built against the
+/// budget we were given". Every other error passes through untouched — an
+/// inbound `PayloadTooLarge` in particular, which is never reclassified.
+fn request_too_large(operation: WireOperation, err: SyncError) -> SyncError {
+    match err {
+        SyncError::PayloadTooLarge { size, max } => SyncError::RequestTooLarge {
+            operation,
+            needed: size as u64,
+            cap: max as u64,
+        },
+        other => other,
+    }
+}
+
 #[async_trait]
 impl SyncTransport for HttpSyncTransport {
-    async fn handshake(&self, request: HandshakeRequest) -> Result<HandshakeResponse, SyncError> {
+    async fn handshake(
+        &self,
+        request: HandshakeRequest,
+        send_budget_bytes: usize,
+    ) -> Result<HandshakeResponse, SyncError> {
         debug!(url = %self.base_url, "HTTP sync handshake");
-        self.post_framed(WireOperation::Handshake, "/sync/handshake", &request)
-            .await
+        self.post_framed(
+            WireOperation::Handshake,
+            "/sync/handshake",
+            &request,
+            send_budget_bytes,
+        )
+        .await
     }
 
-    async fn push_changes(&self, request: PushRequest) -> Result<WireReply<PushAck>, SyncError> {
+    async fn push_changes(
+        &self,
+        request: PushRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PushAck>, SyncError> {
         debug!(count = request.changes.len(), "HTTP sync push");
-        self.post_framed(WireOperation::Push, "/sync/push", &request)
-            .await
+        self.post_framed(
+            WireOperation::Push,
+            "/sync/push",
+            &request,
+            send_budget_bytes,
+        )
+        .await
     }
 
-    async fn pull_changes(&self, request: PullRequest) -> Result<WireReply<PullPage>, SyncError> {
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
         debug!("HTTP sync pull");
-        self.post_framed(WireOperation::Pull, "/sync/pull", &request)
-            .await
+        self.post_framed(
+            WireOperation::Pull,
+            "/sync/pull",
+            &request,
+            send_budget_bytes,
+        )
+        .await
     }
 
     async fn health_check(&self) -> Result<(), SyncError> {

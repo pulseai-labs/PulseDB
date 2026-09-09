@@ -232,7 +232,12 @@ impl SyncManager {
         // is the explicit restart an operator reaches for after correcting a
         // terminal condition, and the peer's advertised inbound budget is part
         // of what has to be picked up again.
-        let binding = Self::handshake_with(&self.transport, self.local_instance_id).await?;
+        let binding = Self::handshake_with(
+            &self.transport,
+            self.local_instance_id,
+            self.config.max_request_bytes,
+        )
+        .await?;
         self.peer = Some(binding);
 
         self.set_status(SyncStatus::Syncing);
@@ -319,9 +324,12 @@ impl SyncManager {
         if let Err(e) = result {
             // A deterministic dead end is recorded, not just returned: a caller
             // that polls `status()` must see the same terminal condition the
-            // background loop would record. Anything else is transient and the
+            // background loop would record. Both size failures qualify — one
+            // change that can never be sent, or a request this side built that
+            // the peer will never read — because retrying either rebuilds a
+            // body already known not to fit. Anything else is transient and the
             // manager is simply idle again.
-            self.set_status(if e.is_change_too_large() {
+            self.set_status(if e.is_change_too_large() || e.is_request_too_large() {
                 SyncStatus::Error(e.to_string())
             } else {
                 SyncStatus::Idle
@@ -429,6 +437,7 @@ impl SyncManager {
                         self.local_instance_id,
                         binding.identity,
                         responder,
+                        self.config.max_request_bytes,
                     )
                     .await?;
                     self.peer = Some(binding);
@@ -582,7 +591,12 @@ impl SyncManager {
         match self.peer {
             Some(binding) => Ok(binding),
             None => {
-                let binding = Self::handshake_with(&self.transport, self.local_instance_id).await?;
+                let binding = Self::handshake_with(
+                    &self.transport,
+                    self.local_instance_id,
+                    self.config.max_request_bytes,
+                )
+                .await?;
                 self.peer = Some(binding);
                 Ok(binding)
             }
@@ -608,6 +622,7 @@ impl SyncManager {
         local_instance_id: InstanceId,
         previous: InstanceId,
         observed: InstanceId,
+        send_budget_bytes: usize,
     ) -> Result<PeerBinding, SyncError> {
         warn!(
             previous = %previous,
@@ -616,7 +631,7 @@ impl SyncManager {
              the same endpoint); re-handshaking and switching to the new peer's own cursor"
         );
 
-        let binding = Self::handshake_with(transport, local_instance_id).await?;
+        let binding = Self::handshake_with(transport, local_instance_id, send_budget_bytes).await?;
         if binding.identity != observed {
             debug!(
                 observed = %observed,
@@ -632,9 +647,24 @@ impl SyncManager {
     /// The background task holds no `&self`, and an identity re-established
     /// there must go through exactly the same negotiation — protocol-version
     /// check included — as the one `start()` performed.
+    ///
+    /// # The one budget that cannot be peer-derived
+    ///
+    /// Every other request is encoded against a budget the peer told this
+    /// instance about. The handshake precedes the binding, so no such number
+    /// exists yet and `send_budget_bytes` is local policy alone. That it will
+    /// be accepted rests on **peer conformance**, not on anything this side can
+    /// check: a `HandshakeRequest` is a bounded control frame certified to fit
+    /// [`MIN_CONTROL_FRAME_BYTES`], and every conforming v5 server refuses a
+    /// `max_request_bytes` below that minimum at construction, so a conforming
+    /// peer always accepts it. A NON-conforming peer refuses remotely, exactly
+    /// as it does today; local detection before the first exchange is not
+    /// possible, and this is an assumption about the peer rather than a
+    /// property this instance enforces.
     async fn handshake_with(
         transport: &Arc<dyn SyncTransport>,
         local_instance_id: InstanceId,
+        send_budget_bytes: usize,
     ) -> Result<PeerBinding, SyncError> {
         let request = HandshakeRequest {
             instance_id: local_instance_id,
@@ -646,7 +676,7 @@ impl SyncManager {
             ],
         };
 
-        let response = transport.handshake(request).await?;
+        let response = transport.handshake(request, send_budget_bytes).await?;
 
         // Protocol-version check FIRST. A server that speaks a different
         // version answers with the soft `accepted: false` path carrying its
@@ -766,8 +796,14 @@ impl SyncManager {
             collectives: config.collectives.clone(),
         };
 
+        // The OUTBOUND budget: what the bound peer will actually read, floored
+        // by this instance's own policy. It is a different quantity from
+        // `reply_limit_bytes` inside the request, which is the INBOUND budget
+        // for the answer. Sending against local policy alone would relocate the
+        // very defect this repairs to any deployment whose peer reads less.
+        let send_budget = config.max_request_bytes.min(binding.receive_budget);
         let page = transport
-            .pull_changes(request)
+            .pull_changes(request, send_budget)
             .await?
             .into_result(binding.identity)?;
 
@@ -907,13 +943,14 @@ impl SyncManager {
                                 *s = SyncStatus::Syncing;
                             }
                         }
-                        Err(e) if e.is_change_too_large() => {
-                            // Deterministic and terminal: the same change
-                            // rebuilt next cycle is the same size against the
-                            // same cap. Retrying would send a body already known
-                            // not to fit, forever. Record it and stop; an
-                            // explicit `start()` after the operator raises the
-                            // cap runs again.
+                        Err(e) if e.is_change_too_large() || e.is_request_too_large() => {
+                            // Deterministic and terminal: the same change, or
+                            // the same request, rebuilt next cycle is the same
+                            // size against the same cap. Retrying would send a
+                            // body already known not to fit, forever. Record it
+                            // and stop; an explicit `start()` after the operator
+                            // raises the cap — or narrows the filter — runs
+                            // again.
                             error!("Sync stopped: {}", e);
                             if let Ok(mut s) = status.write() {
                                 *s = SyncStatus::Error(e.to_string());
@@ -988,6 +1025,7 @@ impl SyncManager {
                             local_id,
                             binding.identity,
                             responder,
+                            config.max_request_bytes,
                         )
                         .await?;
                         continue;
@@ -1026,6 +1064,7 @@ impl SyncManager {
                             local_id,
                             binding.identity,
                             responder,
+                            config.max_request_bytes,
                         )
                         .await?;
                         continue;

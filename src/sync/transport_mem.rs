@@ -124,9 +124,45 @@ impl InMemorySyncTransport {
         lanes.lanes.get(&owner).cloned().unwrap_or_default()
     }
 
-    /// Round-trips `value` through the real frame codec under this transport's
-    /// cap, so an in-process test still pays for serialization.
-    fn round_trip<T>(&self, operation: WireOperation, value: &T) -> Result<T, SyncError>
+    /// Round-trips a REQUEST through the real frame codec, honestly split by
+    /// direction.
+    ///
+    /// The caller encodes against the budget it was given, exactly as an HTTP
+    /// client does; this endpoint then reads under its own inbound limit. The
+    /// two are different numbers and the loopback must not blur them — an
+    /// over-budget encode here is the sender's
+    /// [`SyncError::RequestTooLarge`], while a body that fits the sender's
+    /// budget yet exceeds this endpoint's reader is the ordinary inbound
+    /// [`SyncError::PayloadTooLarge`], as it would be over the wire.
+    fn round_trip_request<T>(
+        &self,
+        operation: WireOperation,
+        value: &T,
+        send_budget_bytes: usize,
+    ) -> Result<T, SyncError>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let framed =
+            wire::encode_bounded(operation, value, send_budget_bytes).map_err(|e| match e {
+                SyncError::PayloadTooLarge { size, max } => SyncError::RequestTooLarge {
+                    operation,
+                    needed: size as u64,
+                    cap: max as u64,
+                },
+                other => other,
+            })?;
+        wire::decode_bounded(operation, &framed, self.receive_limit_bytes)
+    }
+
+    /// Round-trips a REPLY through the real frame codec under this endpoint's
+    /// own limit, so an in-process test still pays for serialization.
+    ///
+    /// The reply leg keeps `receive_limit_bytes` on both halves: this endpoint
+    /// builds the answer under its own policy, and an oversized one is an
+    /// inbound failure for the reader — never a `RequestTooLarge`, which names
+    /// a request this side built.
+    fn round_trip_reply<T>(&self, operation: WireOperation, value: &T) -> Result<T, SyncError>
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
@@ -137,8 +173,13 @@ impl InMemorySyncTransport {
 
 #[async_trait]
 impl SyncTransport for InMemorySyncTransport {
-    async fn handshake(&self, request: HandshakeRequest) -> Result<HandshakeResponse, SyncError> {
-        let request: HandshakeRequest = self.round_trip(WireOperation::Handshake, &request)?;
+    async fn handshake(
+        &self,
+        request: HandshakeRequest,
+        send_budget_bytes: usize,
+    ) -> Result<HandshakeResponse, SyncError> {
+        let request: HandshakeRequest =
+            self.round_trip_request(WireOperation::Handshake, &request, send_budget_bytes)?;
         request.check_bounds()?;
         let response = HandshakeResponse {
             instance_id: self.peer_instance_id,
@@ -147,17 +188,22 @@ impl SyncTransport for InMemorySyncTransport {
             reason: None,
             receive_limit_bytes: self.receive_limit_bytes as u64,
         };
-        self.round_trip(WireOperation::Handshake, &response)
+        self.round_trip_reply(WireOperation::Handshake, &response)
     }
 
-    async fn push_changes(&self, request: PushRequest) -> Result<WireReply<PushAck>, SyncError> {
-        let request: PushRequest = self.round_trip(WireOperation::Push, &request)?;
+    async fn push_changes(
+        &self,
+        request: PushRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PushAck>, SyncError> {
+        let request: PushRequest =
+            self.round_trip_request(WireOperation::Push, &request, send_budget_bytes)?;
 
         // Route FIRST: a batch addressed to somebody else is not this peer's to
         // record, so nothing is written.
         if request.target_instance != self.peer_instance_id {
             let reply = WireReply::peer_changed(self.peer_instance_id, request.target_instance);
-            return self.round_trip(WireOperation::Push, &reply);
+            return self.round_trip_reply(WireOperation::Push, &reply);
         }
         if let Some(foreign) = request
             .changes
@@ -172,7 +218,7 @@ impl SyncTransport for InMemorySyncTransport {
                     foreign.sequence, foreign.source_instance, request.source_instance
                 ),
             );
-            return self.round_trip(WireOperation::Push, &reply);
+            return self.round_trip_reply(WireOperation::Push, &reply);
         }
 
         let total = request.changes.len() as u64;
@@ -197,15 +243,20 @@ impl SyncTransport for InMemorySyncTransport {
                 safe_through,
             },
         );
-        self.round_trip(WireOperation::Push, &reply)
+        self.round_trip_reply(WireOperation::Push, &reply)
     }
 
-    async fn pull_changes(&self, request: PullRequest) -> Result<WireReply<PullPage>, SyncError> {
-        let request: PullRequest = self.round_trip(WireOperation::Pull, &request)?;
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        let request: PullRequest =
+            self.round_trip_request(WireOperation::Pull, &request, send_budget_bytes)?;
 
         if request.target_instance != self.peer_instance_id {
             let reply = WireReply::peer_changed(self.peer_instance_id, request.target_instance);
-            return self.round_trip(WireOperation::Pull, &reply);
+            return self.round_trip_reply(WireOperation::Pull, &reply);
         }
         if request.batch_size == 0 {
             let reply = WireReply::rejected(
@@ -213,7 +264,7 @@ impl SyncTransport for InMemorySyncTransport {
                 WireErrorCode::InvalidRequest,
                 "pull requested zero changes",
             );
-            return self.round_trip(WireOperation::Pull, &reply);
+            return self.round_trip_reply(WireOperation::Pull, &reply);
         }
 
         let after_seq = request.cursor.sequence;
@@ -255,7 +306,7 @@ impl SyncTransport for InMemorySyncTransport {
                 scan_position: SyncPosition::new(self.peer_instance_id, scanned),
             },
         );
-        self.round_trip(WireOperation::Pull, &reply)
+        self.round_trip_reply(WireOperation::Pull, &reply)
     }
 
     async fn health_check(&self) -> Result<(), SyncError> {
@@ -333,7 +384,10 @@ mod tests {
             protocol_version: SYNC_PROTOCOL_VERSION,
             capabilities: vec![],
         };
-        let resp = transport.handshake(req).await.unwrap();
+        let resp = transport
+            .handshake(req, DEFAULT_MAX_REQUEST_BYTES)
+            .await
+            .unwrap();
         assert!(resp.accepted);
         assert_eq!(resp.protocol_version, SYNC_PROTOCOL_VERSION);
         assert_eq!(
@@ -360,7 +414,10 @@ mod tests {
             .map(|seq| make_test_change(seq, cid, source))
             .collect();
         let ack = local
-            .push_changes(push_request(source, local.instance_id(), changes))
+            .push_changes(
+                push_request(source, local.instance_id(), changes),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap()
             .into_result(local.instance_id())
@@ -377,7 +434,10 @@ mod tests {
 
         // The peer's OWN lane is untouched by what was pushed into the sender's.
         let page = local
-            .pull_changes(pull_request(local.instance_id(), 0, 100))
+            .pull_changes(
+                pull_request(local.instance_id(), 0, 100),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap()
             .into_result(local.instance_id())
@@ -398,11 +458,10 @@ mod tests {
         let cid = CollectiveId::new();
 
         let reply = local
-            .push_changes(push_request(
-                source,
-                stranger,
-                vec![make_test_change(1, cid, source)],
-            ))
+            .push_changes(
+                push_request(source, stranger, vec![make_test_change(1, cid, source)]),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap();
         let err = reply.into_result(stranger).unwrap_err();
@@ -413,7 +472,7 @@ mod tests {
         );
 
         let reply = local
-            .pull_changes(pull_request(stranger, 0, 10))
+            .pull_changes(pull_request(stranger, 0, 10), DEFAULT_MAX_REQUEST_BYTES)
             .await
             .unwrap();
         assert!(reply.into_result(stranger).unwrap_err().is_peer_changed());
@@ -429,11 +488,14 @@ mod tests {
         let cid = CollectiveId::new();
 
         let reply = local
-            .push_changes(push_request(
-                source,
-                local.instance_id(),
-                vec![make_test_change(1, cid, foreign)],
-            ))
+            .push_changes(
+                push_request(
+                    source,
+                    local.instance_id(),
+                    vec![make_test_change(1, cid, foreign)],
+                ),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap();
         let err = reply.into_result(local.instance_id()).unwrap_err();
@@ -453,7 +515,10 @@ mod tests {
         );
 
         let page = local
-            .pull_changes(pull_request(local.instance_id(), 3, 100))
+            .pull_changes(
+                pull_request(local.instance_id(), 3, 100),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap()
             .into_result(local.instance_id())
@@ -465,7 +530,10 @@ mod tests {
         assert!(!page.has_more);
 
         let page = local
-            .pull_changes(pull_request(local.instance_id(), 0, 3))
+            .pull_changes(
+                pull_request(local.instance_id(), 0, 3),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap()
             .into_result(local.instance_id())
@@ -489,7 +557,7 @@ mod tests {
         let mut request = pull_request(local.instance_id(), 0, 100);
         request.collectives = Some(vec![cid_a]);
         let page = local
-            .pull_changes(request)
+            .pull_changes(request, DEFAULT_MAX_REQUEST_BYTES)
             .await
             .unwrap()
             .into_result(local.instance_id())
@@ -502,7 +570,10 @@ mod tests {
     async fn test_pull_empty_lane() {
         let (_, remote) = InMemorySyncTransport::new_pair();
         let page = remote
-            .pull_changes(pull_request(remote.instance_id(), 0, 100))
+            .pull_changes(
+                pull_request(remote.instance_id(), 0, 100),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap()
             .into_result(remote.instance_id())
@@ -517,7 +588,10 @@ mod tests {
     async fn recovery_v5_zero_count_pull_is_refused() {
         let (local, _remote) = InMemorySyncTransport::new_pair();
         let err = local
-            .pull_changes(pull_request(local.instance_id(), 0, 0))
+            .pull_changes(
+                pull_request(local.instance_id(), 0, 0),
+                DEFAULT_MAX_REQUEST_BYTES,
+            )
             .await
             .unwrap()
             .into_result(local.instance_id())

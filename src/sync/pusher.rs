@@ -90,6 +90,26 @@ impl LocalChangePusher {
             .min(self.peer_receive_limit_bytes)
     }
 
+    /// The reply budget this pusher can actually receive: the smaller of this
+    /// instance's own policy and what its transport will really read.
+    ///
+    /// The push side advertises the same quantity the pull side does
+    /// (`SyncManager::reply_limit_bytes`); advertising `max_request_bytes`
+    /// alone promises a peer a reply size the local reader would refuse. It is
+    /// the exact opposite direction from [`push_cap_bytes`](Self::push_cap_bytes),
+    /// and the two are computed from different inputs on purpose.
+    ///
+    /// Every `PushRequest` this pusher builds — the sized envelope, the real
+    /// request and the empty probe — must use THIS expression, not merely the
+    /// same value: `reply_limit_bytes` is a postcard varint, so a sizing
+    /// envelope built from a different number can be a byte narrower than the
+    /// frame actually sent.
+    fn reply_limit_bytes(&self) -> u64 {
+        self.config
+            .max_request_bytes
+            .min(self.transport.receive_limit_bytes()) as u64
+    }
+
     /// Pushes all pending local changes to the remote peer.
     ///
     /// Returns the number of changes successfully pushed.
@@ -116,7 +136,7 @@ impl LocalChangePusher {
             protocol_version: SYNC_PROTOCOL_VERSION,
             source_instance: self.local_instance_id,
             target_instance: self.peer_instance_id,
-            reply_limit_bytes: self.config.max_request_bytes as u64,
+            reply_limit_bytes: self.reply_limit_bytes(),
             changes: Vec::new(),
         })?;
         let mut sizer = wire::FrameSizer::new(envelope);
@@ -180,13 +200,18 @@ impl LocalChangePusher {
         let sent: Vec<u64> = changes.iter().map(|c| c.sequence).collect();
         let reply = self
             .transport
-            .push_changes(PushRequest {
-                protocol_version: SYNC_PROTOCOL_VERSION,
-                source_instance: self.local_instance_id,
-                target_instance: self.peer_instance_id,
-                reply_limit_bytes: self.config.max_request_bytes as u64,
-                changes,
-            })
+            .push_changes(
+                PushRequest {
+                    protocol_version: SYNC_PROTOCOL_VERSION,
+                    source_instance: self.local_instance_id,
+                    target_instance: self.peer_instance_id,
+                    reply_limit_bytes: self.reply_limit_bytes(),
+                    changes,
+                },
+                // The very cap this batch was packed against, so a body the
+                // packer built is never refused by the encoder.
+                cap,
+            )
             .await
             .inspect_err(|_| {
                 // A transport failure leaves the fate of the batch unknown, so
@@ -240,13 +265,17 @@ impl LocalChangePusher {
     async fn probe_and_save(&mut self, prior: u64, scanned: u64) -> Result<PushOutcome, SyncError> {
         let reply = self
             .transport
-            .push_changes(PushRequest {
-                protocol_version: SYNC_PROTOCOL_VERSION,
-                source_instance: self.local_instance_id,
-                target_instance: self.peer_instance_id,
-                reply_limit_bytes: self.config.max_request_bytes as u64,
-                changes: Vec::new(),
-            })
+            .push_changes(
+                PushRequest {
+                    protocol_version: SYNC_PROTOCOL_VERSION,
+                    source_instance: self.local_instance_id,
+                    target_instance: self.peer_instance_id,
+                    reply_limit_bytes: self.reply_limit_bytes(),
+                    changes: Vec::new(),
+                },
+                // Same path, same budget as a real push.
+                self.push_cap_bytes(),
+            )
             .await
             .inspect_err(|_| self.reset_to(prior))?;
 
@@ -535,6 +564,7 @@ mod tests {
         async fn handshake(
             &self,
             _request: HandshakeRequest,
+            _send_budget_bytes: usize,
         ) -> Result<HandshakeResponse, SyncError> {
             Ok(HandshakeResponse {
                 instance_id: self.identity,
@@ -548,6 +578,7 @@ mod tests {
         async fn push_changes(
             &self,
             request: PushRequest,
+            _send_budget_bytes: usize,
         ) -> Result<WireReply<super::super::types::PushAck>, SyncError> {
             let sent: Vec<u64> = request.changes.iter().map(|c| c.sequence).collect();
             self.batches.lock().unwrap().push(sent.clone());
@@ -573,6 +604,7 @@ mod tests {
         async fn pull_changes(
             &self,
             _request: PullRequest,
+            _send_budget_bytes: usize,
         ) -> Result<WireReply<PullPage>, SyncError> {
             unreachable!("this double is push-only");
         }

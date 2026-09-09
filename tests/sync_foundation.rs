@@ -18,6 +18,14 @@ use pulsedb::sync::SYNC_PROTOCOL_VERSION;
 use pulsedb::{Collective, CollectiveId, Config, Timestamp};
 use tempfile::tempdir;
 
+/// The outbound budget a DIRECT transport call supplies.
+///
+/// A direct caller is not the pusher, so nothing computed a packing cap for it;
+/// it states its own budget explicitly. The encoder still enforces it — see the
+/// direct-caller regression, which passes a budget smaller than the request and
+/// gets `RequestTooLarge` back before anything is transmitted.
+const DIRECT_SEND_BUDGET: usize = 64 * 1024 * 1024;
+
 // ============================================================================
 // InstanceId persistence
 // ============================================================================
@@ -300,6 +308,23 @@ fn test_zero_update_still_registers_an_unknown_peer() {
 /// and the intervals default to one second — so a no-op update must not pay a
 /// durable write. An update that changes nothing about an existing record
 /// leaves the store file untouched.
+///
+/// # Why the witness is `(len, mtime)` and not the bytes
+///
+/// redb takes an exclusive **whole-file** lock while the store is open, so
+/// reading the file's bytes fails on Windows. `fs::metadata` does not touch the
+/// locked byte range and is legal on every platform this ships to.
+///
+/// Both components are needed and neither alone would do: a commit need not
+/// resize the file, so length alone can miss a real write, and a coarse
+/// filesystem clock can miss an mtime change inside one tick. Dropping and
+/// reopening the store to take a byte snapshot is not an alternative — that
+/// operation itself makes redb flush and rewrite allocator state, so the
+/// snapshot would witness the drop rather than the guard.
+///
+/// The positive control below is what keeps the no-op assertion from passing
+/// vacuously: if this filesystem cannot show a real commit through either
+/// component, the test FAILS rather than silently asserting nothing.
 #[test]
 fn test_no_op_cursor_update_does_not_touch_the_store() {
     let dir = tempdir().unwrap();
@@ -310,10 +335,11 @@ fn test_no_op_cursor_update_does_not_touch_the_store() {
     let peer_id = InstanceId::new();
     storage.update_pull_cursor(&peer_id, 7).unwrap();
 
-    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-    // mtime alone is a coarse witness — a filesystem with second granularity
-    // records no change for ten writes inside one tick — so compare the bytes.
-    let before_bytes = std::fs::read(&path).unwrap();
+    let witness = || {
+        let m = std::fs::metadata(&path).expect("the store file is always stat-able");
+        (m.len(), m.modified().expect("mtime is available"))
+    };
+    let before = witness();
 
     // Ten idle cycles' worth of "persist the position we already have".
     for _ in 0..10 {
@@ -321,31 +347,25 @@ fn test_no_op_cursor_update_does_not_touch_the_store() {
         storage.update_push_cursor(&peer_id, 0).unwrap();
     }
 
-    let after = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let after_bytes = std::fs::read(&path).unwrap();
     assert_eq!(
-        before, after,
+        before,
+        witness(),
         "a cursor update that changes nothing must not commit a write transaction"
     );
-    assert_eq!(
-        before_bytes.len(),
-        after_bytes.len(),
-        "the store file changed size across ten no-op cursor updates"
-    );
-    // Compared by hand rather than `assert_eq!` on the vectors: a mismatch must
-    // report the offset, not dump the whole store.
-    let first_difference = before_bytes
-        .iter()
-        .zip(after_bytes.iter())
-        .position(|(before, after)| before != after);
-    assert_eq!(
-        first_difference, None,
-        "a cursor update that changes nothing must leave the store byte-identical; \
-         first differing offset shown"
+
+    // Positive control: a REAL advance must move the witness in this
+    // environment, or the assertion above proves nothing. This is the
+    // non-vacuity guard, not a claim about clock resolution in general.
+    storage.update_pull_cursor(&peer_id, 8).unwrap();
+    assert_ne!(
+        before,
+        witness(),
+        "the witness did not move for a real cursor commit, so the no-op \
+         assertion above is vacuous on this filesystem"
     );
 
     let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
-    assert_eq!(loaded.pull_sequence, 7);
+    assert_eq!(loaded.pull_sequence, 8);
     assert_eq!(loaded.push_sequence, 0);
 }
 
@@ -441,7 +461,7 @@ async fn test_memory_transport_full_roundtrip() {
         protocol_version: SYNC_PROTOCOL_VERSION,
         capabilities: vec!["push".into(), "pull".into()],
     };
-    let hs_resp = local.handshake(hs_req).await.unwrap();
+    let hs_resp = local.handshake(hs_req, DIRECT_SEND_BUDGET).await.unwrap();
     assert!(hs_resp.accepted);
     assert_eq!(hs_resp.protocol_version, SYNC_PROTOCOL_VERSION);
     assert_eq!(
@@ -461,7 +481,10 @@ async fn test_memory_transport_full_roundtrip() {
         make_change_from(3, cid, sender),
     ];
     let ack = local
-        .push_changes(push_request(sender, local.instance_id(), changes))
+        .push_changes(
+            push_request(sender, local.instance_id(), changes),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(local.instance_id())
@@ -476,7 +499,10 @@ async fn test_memory_transport_full_roundtrip() {
 
     // A pull reads the addressed peer's OWN lane, which the push did not touch.
     let page = remote
-        .pull_changes(pull_request(remote.instance_id(), 0, 500))
+        .pull_changes(
+            pull_request(remote.instance_id(), 0, 500),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(remote.instance_id())
@@ -493,7 +519,10 @@ async fn test_memory_transport_full_roundtrip() {
         make_change_from(3, cid, remote.instance_id()),
     ]);
     let page = remote
-        .pull_changes(pull_request(remote.instance_id(), 0, 500))
+        .pull_changes(
+            pull_request(remote.instance_id(), 0, 500),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(remote.instance_id())
@@ -516,7 +545,7 @@ async fn test_memory_transport_incremental_pull() {
     remote.seed((1..=5).map(|s| make_change_from(s, cid, peer)).collect());
 
     let page1 = remote
-        .pull_changes(pull_request(peer, 0, 2))
+        .pull_changes(pull_request(peer, 0, 2), DIRECT_SEND_BUDGET)
         .await
         .unwrap()
         .into_result(peer)
@@ -526,7 +555,10 @@ async fn test_memory_transport_incremental_pull() {
     assert_eq!(page1.scan_position.sequence, 2);
 
     let page2 = remote
-        .pull_changes(pull_request(peer, page1.scan_position.sequence, 2))
+        .pull_changes(
+            pull_request(peer, page1.scan_position.sequence, 2),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(peer)
@@ -536,7 +568,10 @@ async fn test_memory_transport_incremental_pull() {
     assert_eq!(page2.scan_position.sequence, 4);
 
     let page3 = remote
-        .pull_changes(pull_request(peer, page2.scan_position.sequence, 100))
+        .pull_changes(
+            pull_request(peer, page2.scan_position.sequence, 100),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(peer)

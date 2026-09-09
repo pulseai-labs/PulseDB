@@ -33,6 +33,14 @@ use pulsedb::sync::{
 use pulsedb::{CollectiveId, Config, NewExperience, PulseDB};
 use tempfile::tempdir;
 
+/// The outbound budget a DIRECT transport call supplies.
+///
+/// A direct caller is not the pusher, so nothing computed a packing cap for it;
+/// it states its own budget explicitly. The encoder still enforces it — see the
+/// direct-caller regression, which passes a budget smaller than the request and
+/// gets `RequestTooLarge` back before anything is transmitted.
+const DIRECT_SEND_BUDGET: usize = 64 * 1024 * 1024;
+
 // ============================================================================
 // Axum handlers (test server)
 // ============================================================================
@@ -227,7 +235,10 @@ async fn test_http_handshake() {
         capabilities: vec!["push".into(), "pull".into()],
     };
 
-    let response = transport.handshake(request).await.unwrap();
+    let response = transport
+        .handshake(request, DIRECT_SEND_BUDGET)
+        .await
+        .unwrap();
     assert!(response.accepted);
     assert_eq!(response.protocol_version, SYNC_PROTOCOL_VERSION);
     assert_ne!(response.instance_id, InstanceId::nil());
@@ -245,7 +256,7 @@ async fn test_http_push_and_pull_roundtrip() {
     // Pull changes via HTTP
     let peer = server.db.instance_id();
     let page = transport
-        .pull_changes(pull_request(peer, 0, 100))
+        .pull_changes(pull_request(peer, 0, 100), DIRECT_SEND_BUDGET)
         .await
         .unwrap()
         .into_result(peer)
@@ -459,7 +470,10 @@ async fn recovery_v5_malformed_vector_create_is_refused_and_saves_nothing() {
     };
 
     let ack = transport
-        .push_changes(push_request(peer, server.db.instance_id(), vec![change]))
+        .push_changes(
+            push_request(peer, server.db.instance_id(), vec![change]),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(server.db.instance_id())
@@ -569,7 +583,10 @@ async fn recovery_v5_wrong_target_has_no_side_effects() {
         timestamp: pulsedb::Timestamp::now(),
     };
     let reply = transport
-        .push_changes(push_request(sender, stranger, vec![change]))
+        .push_changes(
+            push_request(sender, stranger, vec![change]),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap();
 
@@ -598,7 +615,7 @@ async fn recovery_v5_wrong_target_has_no_side_effects() {
 
     // A pull addressed elsewhere is refused the same way, and serves nothing.
     let reply = transport
-        .pull_changes(pull_request(stranger, 0, 100))
+        .pull_changes(pull_request(stranger, 0, 100), DIRECT_SEND_BUDGET)
         .await
         .unwrap();
     let err = reply.into_result(stranger).unwrap_err();
@@ -631,7 +648,10 @@ async fn recovery_v5_inconsistent_source_ownership_is_refused() {
         timestamp: pulsedb::Timestamp::now(),
     };
     let err = transport
-        .push_changes(push_request(sender, server.db.instance_id(), vec![change]))
+        .push_changes(
+            push_request(sender, server.db.instance_id(), vec![change]),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(server.db.instance_id())
@@ -672,11 +692,10 @@ async fn recovery_v5_duplicate_sequences_are_refused() {
 
     let before = snapshot(&server.db);
     let err = transport
-        .push_changes(push_request(
-            sender,
-            server.db.instance_id(),
-            vec![make(4), make(4)],
-        ))
+        .push_changes(
+            push_request(sender, server.db.instance_id(), vec![make(4), make(4)]),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(server.db.instance_id())
@@ -995,7 +1014,7 @@ async fn test_http_handshake_happy_path_carries_preamble() {
     // The transport frames the request preamble and validates the response
     // preamble end-to-end over real HTTP; a clean round-trip proves both legs.
     let response = transport
-        .handshake(request)
+        .handshake(request, DIRECT_SEND_BUDGET)
         .await
         .expect("framed handshake round-trips over HTTP");
     assert!(response.accepted);
@@ -1233,7 +1252,7 @@ async fn client_refuses_oversized_response_body() {
 
     let target = InstanceId::new();
     let err = transport
-        .pull_changes(pull_request(target, 0, 10))
+        .pull_changes(pull_request(target, 0, 10), DIRECT_SEND_BUDGET)
         .await
         .expect_err("an oversized Content-Length response must be refused");
     assert!(
@@ -1242,7 +1261,10 @@ async fn client_refuses_oversized_response_body() {
     );
 
     let err = transport
-        .push_changes(push_request(InstanceId::new(), target, Vec::new()))
+        .push_changes(
+            push_request(InstanceId::new(), target, Vec::new()),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .expect_err("an oversized chunked response must be refused");
     assert!(
@@ -1371,7 +1393,10 @@ async fn server_stats_count_skewed_last_reinforced() {
     };
 
     let ack = transport
-        .push_changes(push_request(peer, server.db.instance_id(), vec![change]))
+        .push_changes(
+            push_request(peer, server.db.instance_id(), vec![change]),
+            DIRECT_SEND_BUDGET,
+        )
         .await
         .unwrap()
         .into_result(server.db.instance_id())
@@ -2170,13 +2195,15 @@ impl pulsedb::sync::transport::SyncTransport for FailOnceTransport {
     async fn handshake(
         &self,
         request: HandshakeRequest,
+        send_budget_bytes: usize,
     ) -> Result<pulsedb::sync::types::HandshakeResponse, SyncError> {
-        self.inner.handshake(request).await
+        self.inner.handshake(request, send_budget_bytes).await
     }
 
     async fn push_changes(
         &self,
         request: PushRequest,
+        send_budget_bytes: usize,
     ) -> Result<WireReply<pulsedb::sync::types::PushAck>, SyncError> {
         use std::sync::atomic::Ordering;
 
@@ -2184,14 +2211,17 @@ impl pulsedb::sync::transport::SyncTransport for FailOnceTransport {
         let hit =
             submitted.contains(&self.fail_sequence) && self.armed.swap(false, Ordering::SeqCst);
         if !hit {
-            return self.inner.push_changes(request).await;
+            return self.inner.push_changes(request, send_budget_bytes).await;
         }
 
         let mut forwarded = request;
         forwarded
             .changes
             .retain(|c| c.sequence != self.fail_sequence);
-        let reply = self.inner.push_changes(forwarded).await?;
+        let reply = self
+            .inner
+            .push_changes(forwarded, send_budget_bytes)
+            .await?;
         let responder = reply.responder;
         let ack = reply.into_result(responder)?;
         Ok(WireReply::ok(
@@ -2213,8 +2243,12 @@ impl pulsedb::sync::transport::SyncTransport for FailOnceTransport {
         ))
     }
 
-    async fn pull_changes(&self, request: PullRequest) -> Result<WireReply<PullPage>, SyncError> {
-        self.inner.pull_changes(request).await
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        self.inner.pull_changes(request, send_budget_bytes).await
     }
 
     async fn health_check(&self) -> Result<(), SyncError> {
@@ -2915,5 +2949,861 @@ async fn recovery_v5_scan_advance_delta_matches_the_real_frame_at_every_width() 
         reply_frame_len(responder, &[], u64::MAX) <= pulsedb::sync::MIN_CONTROL_FRAME_BYTES,
         "an empty reply at the widest scan position must fit the control minimum, \
          or a metadata-only stop could fire on an empty prefix and stall"
+    );
+}
+
+// ============================================================================
+// Transport send budget — the outbound cap is the packer's, never the
+// inbound reader's (R1-R6, R9-R10).
+//
+// A client may legitimately read less than it sends: `max_response_bytes` is
+// the body this client will READ, and nothing about it bounds what a peer will
+// accept. Substituting it for the outbound encode cap refuses a body the peer
+// would have taken, on every cycle, from the same cursor.
+// ============================================================================
+
+/// 4 MiB — the tight inbound reader the crate's own example documents.
+const TIGHT_READER_BYTES: usize = 4 * 1024 * 1024;
+
+/// One push as it actually went out: the values a test needs to check are
+/// recorded from the request itself, not inferred from the change count.
+#[derive(Clone, Debug)]
+struct PushObservation {
+    /// What the request advertised as this side's inbound reply budget.
+    reply_limit_bytes: u64,
+    /// The outbound budget its caller supplied.
+    send_budget_bytes: usize,
+    /// The exact encoded frame length of the whole request.
+    frame_len: usize,
+    /// The frame length of the same request with an EMPTY change vector — the
+    /// envelope the packer sizes against.
+    envelope_len: usize,
+    /// The summed encoded length of the changes it carried.
+    item_bytes: usize,
+    changes: usize,
+}
+
+/// A transport wrapper that records every push it forwards, so a test can prove
+/// what crossed the wire rather than assert it from the change count.
+struct PushSizeWitness {
+    inner: HttpSyncTransport,
+    observations: Arc<std::sync::Mutex<Vec<PushObservation>>>,
+}
+
+/// What a [`PushSizeWitness`] recorded, handed back to the test separately from
+/// the transport the manager takes ownership of.
+struct PushObservations {
+    observations: Arc<std::sync::Mutex<Vec<PushObservation>>>,
+}
+
+impl PushObservations {
+    fn all(&self) -> Vec<PushObservation> {
+        self.observations.lock().unwrap().clone()
+    }
+
+    fn largest_frame(&self) -> usize {
+        self.all().iter().map(|o| o.frame_len).max().unwrap_or(0)
+    }
+
+    fn pushes(&self) -> usize {
+        self.all().len()
+    }
+
+    fn send_budgets(&self) -> Vec<usize> {
+        self.all().iter().map(|o| o.send_budget_bytes).collect()
+    }
+
+    fn reply_limits(&self) -> Vec<u64> {
+        self.all().iter().map(|o| o.reply_limit_bytes).collect()
+    }
+
+    /// The reply budget advertised by the EMPTY probe, if one was sent.
+    fn empty_probe_reply_limit(&self) -> Option<u64> {
+        self.all()
+            .iter()
+            .find(|o| o.changes == 0)
+            .map(|o| o.reply_limit_bytes)
+    }
+
+    /// `(envelope, frame, item bytes, change count)` of the largest push
+    /// observed.
+    fn envelope_frame_and_items(&self) -> (usize, usize, usize, usize) {
+        let o = self
+            .all()
+            .into_iter()
+            .max_by_key(|o| o.frame_len)
+            .expect("at least one push");
+        (o.envelope_len, o.frame_len, o.item_bytes, o.changes)
+    }
+}
+
+impl PushSizeWitness {
+    fn new(inner: HttpSyncTransport) -> (Self, PushObservations) {
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                inner,
+                observations: Arc::clone(&observations),
+            },
+            PushObservations { observations },
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl pulsedb::sync::transport::SyncTransport for PushSizeWitness {
+    async fn handshake(
+        &self,
+        request: HandshakeRequest,
+        send_budget_bytes: usize,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, SyncError> {
+        self.inner.handshake(request, send_budget_bytes).await
+    }
+
+    async fn push_changes(
+        &self,
+        request: PushRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<pulsedb::sync::types::PushAck>, SyncError> {
+        let envelope_len = wire::encoded_len(&PushRequest {
+            changes: Vec::new(),
+            ..request.clone()
+        })?;
+        let mut item_bytes = 0usize;
+        for change in &request.changes {
+            item_bytes += wire::item_len(change)?;
+        }
+        self.observations.lock().unwrap().push(PushObservation {
+            reply_limit_bytes: request.reply_limit_bytes,
+            send_budget_bytes,
+            frame_len: wire::encoded_len(&request)?,
+            envelope_len,
+            item_bytes,
+            changes: request.changes.len(),
+        });
+        self.inner.push_changes(request, send_budget_bytes).await
+    }
+
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        self.inner.pull_changes(request, send_budget_bytes).await
+    }
+
+    async fn health_check(&self) -> Result<(), SyncError> {
+        self.inner.health_check().await
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        self.inner.receive_limit_bytes()
+    }
+}
+
+/// The pull-side counterpart: records what each request advertised as its
+/// inbound budget, and how big the reply that came back actually was.
+struct PullLimitWitness {
+    inner: HttpSyncTransport,
+    reply_limits: Arc<std::sync::Mutex<Vec<u64>>>,
+    largest_reply_frame: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct PullObservations {
+    reply_limits: Arc<std::sync::Mutex<Vec<u64>>>,
+    largest_reply_frame: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PullObservations {
+    fn reply_limits(&self) -> Vec<u64> {
+        self.reply_limits.lock().unwrap().clone()
+    }
+
+    fn largest_reply_frame(&self) -> usize {
+        self.largest_reply_frame
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl PullLimitWitness {
+    fn new(inner: HttpSyncTransport) -> (Self, PullObservations) {
+        let reply_limits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let largest_reply_frame = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Self {
+                inner,
+                reply_limits: Arc::clone(&reply_limits),
+                largest_reply_frame: Arc::clone(&largest_reply_frame),
+            },
+            PullObservations {
+                reply_limits,
+                largest_reply_frame,
+            },
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl pulsedb::sync::transport::SyncTransport for PullLimitWitness {
+    async fn handshake(
+        &self,
+        request: HandshakeRequest,
+        send_budget_bytes: usize,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, SyncError> {
+        self.inner.handshake(request, send_budget_bytes).await
+    }
+
+    async fn push_changes(
+        &self,
+        request: PushRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<pulsedb::sync::types::PushAck>, SyncError> {
+        self.inner.push_changes(request, send_budget_bytes).await
+    }
+
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        self.reply_limits
+            .lock()
+            .unwrap()
+            .push(request.reply_limit_bytes);
+        let reply = self.inner.pull_changes(request, send_budget_bytes).await?;
+        self.largest_reply_frame.fetch_max(
+            wire::encoded_len(&reply)?,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        Ok(reply)
+    }
+
+    async fn health_check(&self) -> Result<(), SyncError> {
+        self.inner.health_check().await
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        self.inner.receive_limit_bytes()
+    }
+}
+
+/// Seeds `count` experiences of ~100 KiB each, enough to push the encoded push
+/// frame past `TIGHT_READER_BYTES`.
+fn seed_bulk_experiences(db: &Arc<PulseDB>, cid: CollectiveId, count: usize) {
+    for i in 0..count {
+        db.record_experience(NewExperience {
+            collective_id: cid,
+            content: format!("{i:06}").repeat(102_400 / 6),
+            embedding: Some(vec![0.1f32; 384]),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+}
+
+/// R1 — the original T3 defect, over real HTTP.
+///
+/// The client reads 4 MiB, but its own policy and the peer's advertised inbound
+/// limit are both 64 MiB, so the packer builds a valid >4 MiB body. Encoding
+/// that body against the client's INBOUND reader refuses it locally: the
+/// request never leaves, the push cursor never advances, and the next cycle
+/// rebuilds the identical body from the identical cursor. The outbound budget
+/// must be the packer's cap.
+#[tokio::test]
+async fn recovery_v5_push_encodes_against_the_send_budget_not_the_response_reader() {
+    let server = start_test_server().await; // 64 MiB policy, advertises 64 MiB
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let cid = db_client.create_collective("bulk-push").unwrap();
+    seed_bulk_experiences(&db_client, cid, 45);
+
+    let (witness, observed) = PushSizeWitness::new(
+        HttpSyncTransport::new(&server.base_url).with_max_response_bytes(TIGHT_READER_BYTES),
+    );
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(witness),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..SyncConfig::default()
+        },
+    )
+    .unwrap();
+
+    manager
+        .sync_once()
+        .await
+        .expect("a body the peer accepts must not be refused by the sender's own reader limit");
+
+    let frame = observed.largest_frame();
+    assert!(
+        frame > TIGHT_READER_BYTES,
+        "the regression needs a frame that actually crosses the 4 MiB reader; got {frame} bytes"
+    );
+    assert_eq!(observed.pushes(), 1);
+    assert_eq!(
+        observed.send_budgets(),
+        vec![64 * 1024 * 1024],
+        "the outbound budget is min(local policy, peer inbound) — the packer's own cap, \
+         never the 4 MiB response reader"
+    );
+
+    // The peer received it.
+    assert_eq!(
+        server.db.list_experiences(cid, 100, 0).unwrap().len(),
+        45,
+        "every seeded experience must reach the peer"
+    );
+    // And the push cursor advanced, so the next cycle does not rebuild the
+    // same body from the same position.
+    let cursor = db_client
+        .storage_for_test()
+        .load_sync_cursor(&server.db.instance_id())
+        .unwrap()
+        .expect("a push cursor row for the peer");
+    assert!(
+        cursor.push_sequence >= db_client.get_current_sequence().unwrap(),
+        "the push position must advance past everything sent, got {}",
+        cursor.push_sequence
+    );
+}
+
+/// R2 — the inbound advertisement, the other half of the same defect.
+///
+/// A `PushRequest` tells the peer how big a reply this side can read. Answering
+/// that with `max_request_bytes` promises 64 MiB while the reader accepts 4 MiB
+/// — a promise the reader cannot keep. Both the real push and the empty probe
+/// must advertise the same min'd value, and the envelope the packer sized
+/// against must be the frame that was actually sent.
+#[tokio::test]
+async fn recovery_v5_push_advertises_the_reply_budget_its_reader_can_keep() {
+    let server = start_test_server().await; // 64 MiB policy
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let (witness, observed) = PushSizeWitness::new(
+        HttpSyncTransport::new(&server.base_url).with_max_response_bytes(TIGHT_READER_BYTES),
+    );
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(witness),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            ..SyncConfig::default()
+        },
+    )
+    .unwrap();
+
+    // A real push: one collective, one experience.
+    let cid = db_client.create_collective("advertised").unwrap();
+    db_client.record_experience(minimal_exp(cid)).unwrap();
+    manager.sync_once().await.unwrap();
+    // And an empty probe: the cursor is now at the WAL head, so the next cycle
+    // sends the bounded empty push.
+    manager.sync_once().await.unwrap();
+
+    let advertised = observed.reply_limits();
+    assert_eq!(
+        advertised.len(),
+        2,
+        "one real push and one empty probe, got {advertised:?}"
+    );
+    assert!(
+        advertised
+            .iter()
+            .all(|limit| *limit == TIGHT_READER_BYTES as u64),
+        "every push must advertise min(policy, actual reader) = 4 MiB, got {advertised:?}"
+    );
+    assert_eq!(
+        observed.empty_probe_reply_limit(),
+        Some(TIGHT_READER_BYTES as u64),
+        "the empty probe must not differ from the real request"
+    );
+
+    // The sized envelope and the real frame agree: an envelope built from a
+    // different `reply_limit_bytes` could be a varint byte narrower than what
+    // is sent, and the exact-size oracle would be wrong. This is
+    // `FrameSizer`'s own identity — the empty-collection envelope spends
+    // `varint_len(0) == 1` byte on the count, which the real count replaces —
+    // so it holds at any batch size, not only under 128 changes.
+    let (envelope, frame, item_bytes, changes) = observed.envelope_frame_and_items();
+    assert_eq!(
+        envelope - 1 + wire::varint_len(changes as u64) + item_bytes,
+        frame,
+        "the envelope sized with the advertised limit must equal the frame sent"
+    );
+}
+
+/// R3 — the asymmetric direction that already worked, pinned so the fix cannot
+/// break it.
+///
+/// Reader 4 MiB, policy 64 MiB, a WAL well past 4 MiB: the pull advertises the
+/// reader's bound, the server truncates to it, every reply decodes under the
+/// reader, and successive prefixes deliver everything.
+#[tokio::test]
+async fn recovery_v5_pull_advertises_the_reader_bound_and_still_delivers() {
+    let server = start_test_server().await; // 64 MiB policy
+    let cid = server.db.create_collective("bulk-pull").unwrap();
+    seed_bulk_experiences(&server.db, cid, 45);
+
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let (witness, observed) = PullLimitWitness::new(
+        HttpSyncTransport::new(&server.base_url).with_max_response_bytes(TIGHT_READER_BYTES),
+    );
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(witness),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..SyncConfig::default()
+        },
+    )
+    .unwrap();
+
+    manager.initial_sync(None).await.unwrap();
+
+    let advertised = observed.reply_limits();
+    assert!(!advertised.is_empty());
+    assert!(
+        advertised
+            .iter()
+            .all(|limit| *limit == TIGHT_READER_BYTES as u64),
+        "the pull advertises min(policy, actual reader), got {advertised:?}"
+    );
+    assert!(
+        advertised.len() > 1,
+        "the 4 MiB bound must have truncated the page, so catch-up took several \
+         prefixes; got {} request(s)",
+        advertised.len()
+    );
+    assert!(
+        observed.largest_reply_frame() <= TIGHT_READER_BYTES,
+        "every reply must fit the reader that has to read it, largest was {}",
+        observed.largest_reply_frame()
+    );
+    assert_eq!(
+        db_client.list_experiences(cid, 100, 0).unwrap().len(),
+        45,
+        "the prefixes continue to eventual delivery"
+    );
+}
+
+/// R6 — the real varint width boundary.
+///
+/// 4 MiB and 64 MiB encode in the same four varint bytes, so that pair proves
+/// nothing about width. 16 383 → 16 384 is the 2 → 3-byte step, and both are
+/// legal budgets above the control minimum: the sizing envelope and the frame
+/// actually built must move together across it.
+#[test]
+fn recovery_v5_reply_limit_varint_width_boundary_is_measured_not_assumed() {
+    let target = InstanceId::new();
+    let frame_at = |limit: u64| {
+        let mut request = pull_request(target, 0, 100);
+        request.reply_limit_bytes = limit;
+        wire::encoded_len(&request).unwrap()
+    };
+
+    // The boundary the recovery's own sizing relationship rests on.
+    assert_eq!(
+        frame_at(16_384) - frame_at(16_383),
+        wire::varint_len(16_384) - wire::varint_len(16_383),
+        "the frame must widen by exactly the varint step at 16 383 → 16 384"
+    );
+    assert_eq!(
+        frame_at(16_384) - frame_at(16_383),
+        1,
+        "and that step is one byte, which is what makes it a boundary"
+    );
+
+    // The pair the earlier analysis reached for proves nothing: same width.
+    assert_eq!(
+        frame_at(4 * 1024 * 1024),
+        frame_at(64 * 1024 * 1024),
+        "4 MiB and 64 MiB are the SAME postcard width — this pair cannot \
+         demonstrate the invariant"
+    );
+}
+
+/// R5 (outbound half) — a direct caller's budget is genuinely enforced, before
+/// anything is transmitted.
+#[tokio::test]
+async fn recovery_v5_direct_call_over_budget_is_request_too_large_before_transmission() {
+    let server = start_test_server().await;
+    let transport = HttpSyncTransport::new(&server.base_url);
+    let target = server.db.instance_id();
+
+    let before = snapshot(&server.db);
+    let request = pull_request(target, 0, 100);
+    let needed = wire::encoded_len(&request).unwrap();
+    let cap = needed - 1; // one byte under, so nothing about the shape changes
+
+    let err = transport
+        .pull_changes(request, cap)
+        .await
+        .expect_err("a request over its own send budget must not be sent");
+    match err {
+        SyncError::RequestTooLarge {
+            operation,
+            needed: n,
+            cap: c,
+        } => {
+            assert_eq!(operation, WireOperation::Pull);
+            assert_eq!(n, needed as u64);
+            assert_eq!(c, cap as u64);
+        }
+        other => panic!("expected the typed RequestTooLarge, got {other}"),
+    }
+    assert!(
+        !SyncError::RequestTooLarge {
+            operation: WireOperation::Pull,
+            needed: needed as u64,
+            cap: cap as u64,
+        }
+        .is_payload_too_large(),
+        "an outbound budget failure is not the inbound variant"
+    );
+    assert_eq!(
+        snapshot(&server.db),
+        before,
+        "nothing reached the peer, so nothing moved there"
+    );
+
+    // The same request WITH an adequate budget still goes through: the budget
+    // is a bound, not a blanket refusal.
+    transport
+        .pull_changes(pull_request(target, 0, 100), needed)
+        .await
+        .expect("exactly-fitting is fitting")
+        .into_result(target)
+        .unwrap();
+}
+
+/// R5 (inbound half) — an oversized incoming REPLY keeps the inbound error.
+///
+/// The outbound mapping must not reclassify a body that arrived from the wire:
+/// there the fault is the sender's, and `PayloadTooLarge` is what a consumer
+/// maps to 413.
+#[tokio::test]
+async fn recovery_v5_oversized_reply_stays_payload_too_large() {
+    let server = start_test_server().await;
+    let cid = server.db.create_collective("oversized-reply").unwrap();
+    for _ in 0..40 {
+        server.db.record_experience(minimal_exp(cid)).unwrap();
+    }
+
+    // A reader far too small for the page the server will build, but large
+    // enough that the REQUEST itself encodes comfortably.
+    let transport = HttpSyncTransport::new(&server.base_url)
+        .with_max_response_bytes(pulsedb::sync::MIN_CONTROL_FRAME_BYTES);
+    let target = server.db.instance_id();
+    let mut request = pull_request(target, 0, 500);
+    request.reply_limit_bytes = 64 * 1024 * 1024; // ask for more than we can read
+
+    let err = transport
+        .pull_changes(request, DIRECT_SEND_BUDGET)
+        .await
+        .expect_err("a reply past the reader must be refused");
+    assert!(
+        err.is_payload_too_large(),
+        "an inbound over-limit body keeps its own variant, got {err}"
+    );
+    assert!(
+        !err.is_request_too_large(),
+        "and it is NOT reclassified as an outbound failure, got {err}"
+    );
+}
+
+// ============================================================================
+// F1 / R8 — the pull's outbound budget is the BOUND PEER's advertised inbound
+// limit, never this client's own response reader.
+//
+// `min(policy, peer inbound)` and `min(policy, transport.receive_limit_bytes())`
+// are the same number whenever the transport reads exactly what the peer
+// accepts — which is true of every in-process server-backed transport in this
+// suite, so no test there can tell the two apart. Over real HTTP they are
+// independent: `max_response_bytes` is what this client will READ, and the
+// peer's cap arrives in the handshake. Separating them is what makes the pull
+// budget's SOURCE observable.
+// ============================================================================
+
+/// The peer's inbound cap: the certified control minimum, the smallest budget a
+/// conforming v5 server may advertise.
+const PEER_INBOUND_LIMIT: usize = pulsedb::sync::MIN_CONTROL_FRAME_BYTES;
+
+/// This client's response reader — eight times the peer's cap, so a real frame
+/// can sit strictly between the two.
+const CLIENT_READER_BYTES: usize = 8 * 1024;
+
+/// A `SyncServer` behind real HTTP that counts what actually arrived on each
+/// route, so "nothing was transmitted" is read off the peer rather than
+/// inferred from the sender.
+#[derive(Clone)]
+struct CountingState {
+    server: Arc<SyncServer>,
+    handshakes: Arc<std::sync::atomic::AtomicUsize>,
+    pulls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn counting_health(State(st): State<CountingState>) -> StatusCode {
+    match st.server.handle_health() {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+async fn counting_handshake(
+    State(st): State<CountingState>,
+    body: Bytes,
+) -> Result<Vec<u8>, StatusCode> {
+    st.handshakes
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    st.server.handle_handshake_bytes(&body).map_err(status_for)
+}
+
+async fn counting_push(
+    State(st): State<CountingState>,
+    body: Bytes,
+) -> Result<Vec<u8>, StatusCode> {
+    st.server.handle_push_bytes(&body).map_err(status_for)
+}
+
+async fn counting_pull(
+    State(st): State<CountingState>,
+    body: Bytes,
+) -> Result<Vec<u8>, StatusCode> {
+    st.pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    st.server.handle_pull_bytes(&body).map_err(status_for)
+}
+
+struct CountingServer {
+    base_url: String,
+    db: Arc<PulseDB>,
+    state: CountingState,
+    _dir: tempfile::TempDir,
+}
+
+impl CountingServer {
+    fn handshakes(&self) -> usize {
+        self.state
+            .handshakes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn pulls(&self) -> usize {
+        self.state.pulls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Starts a counting server whose own policy — and therefore the inbound limit
+/// it advertises at handshake — is `max_request_bytes`.
+async fn start_counting_server(max_request_bytes: usize) -> CountingServer {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(PulseDB::open(dir.path().join("server.db"), Config::default()).unwrap());
+    let server = Arc::new(
+        SyncServer::new(
+            Arc::clone(&db),
+            SyncConfig {
+                max_request_bytes,
+                ..SyncConfig::default()
+            },
+        )
+        .unwrap(),
+    );
+    let state = CountingState {
+        server,
+        handshakes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        pulls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route("/sync/health", get(counting_health))
+        .route("/sync/handshake", post(counting_handshake))
+        .route("/sync/push", post(counting_push))
+        .route("/sync/pull", post(counting_pull))
+        .layer(axum::extract::DefaultBodyLimit::max(ADAPTER_BODY_LIMIT))
+        .with_state(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    CountingServer {
+        base_url,
+        db,
+        state,
+        _dir: dir,
+    }
+}
+
+/// The exact `PullRequest` a `SyncManager` builds for `peer` from a cold
+/// cursor. Every field contributes bytes, so the boundary can only be measured
+/// on the real shape.
+fn manager_pull_request(
+    local: InstanceId,
+    peer: InstanceId,
+    config: &SyncConfig,
+    reply_limit_bytes: u64,
+    collectives: &[CollectiveId],
+) -> PullRequest {
+    PullRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        source_instance: local,
+        target_instance: peer,
+        cursor: SyncPosition::new(peer, 0),
+        batch_size: config.batch_size as u64,
+        reply_limit_bytes,
+        collectives: Some(collectives.to_vec()),
+    }
+}
+
+/// Grows a collective filter one id at a time until the real frame crosses
+/// `cap`, and returns the first filter that does NOT fit. Nothing about the id
+/// count is assumed — it is whatever the encoder actually produces.
+fn filter_that_crosses(
+    local: InstanceId,
+    peer: InstanceId,
+    config: &SyncConfig,
+    reply_limit_bytes: u64,
+    cap: usize,
+) -> Vec<CollectiveId> {
+    let mut ids: Vec<CollectiveId> = Vec::new();
+    loop {
+        ids.push(CollectiveId::new());
+        let frame = wire::encoded_len(&manager_pull_request(
+            local,
+            peer,
+            config,
+            reply_limit_bytes,
+            &ids,
+        ))
+        .unwrap();
+        if frame > cap {
+            return ids;
+        }
+        assert!(
+            ids.len() < 4096,
+            "the filter never crossed the {cap}-byte cap; the measurement is wrong"
+        );
+    }
+}
+
+/// F1 / R8 over real HTTP — the pull send budget's SOURCE, pinned.
+///
+/// Three budgets, all different: the peer reads 1 KiB, this client reads 8 KiB,
+/// this client's policy is 64 MiB. A supported `collectives` filter builds a
+/// pull frame strictly between the peer's cap and this client's reader — a body
+/// the reader would take and the peer would refuse.
+///
+/// The outbound budget must therefore be `min(policy, the bound peer's inbound
+/// limit)`. Sourcing it from `transport.receive_limit_bytes()` instead would
+/// encode the frame against 8 KiB, let it through, and ship a body the peer
+/// cannot read — which the in-process suites cannot see, because there the
+/// transport's reader IS the peer's cap.
+#[tokio::test]
+async fn recovery_v5_pull_encodes_against_the_peer_budget_not_the_response_reader() {
+    let server = start_counting_server(PEER_INBOUND_LIMIT).await;
+    let peer = server.db.instance_id();
+
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let config = SyncConfig {
+        direction: SyncDirection::PullOnly,
+        ..SyncConfig::default()
+    };
+    assert!(
+        config.max_request_bytes > CLIENT_READER_BYTES,
+        "local policy must be the LOOSEST of the three, or it is the binding constraint"
+    );
+
+    // What the manager will advertise as its inbound reply budget:
+    // min(local policy, the reader that has to read the answer).
+    let reply_limit = config.max_request_bytes.min(CLIENT_READER_BYTES) as u64;
+
+    let filter = filter_that_crosses(
+        db_client.instance_id(),
+        peer,
+        &config,
+        reply_limit,
+        PEER_INBOUND_LIMIT,
+    );
+    let frame = wire::encoded_len(&manager_pull_request(
+        db_client.instance_id(),
+        peer,
+        &config,
+        reply_limit,
+        &filter,
+    ))
+    .unwrap();
+    assert!(
+        frame > PEER_INBOUND_LIMIT,
+        "the frame must actually cross the peer's cap; got {frame} bytes"
+    );
+    assert!(
+        frame < CLIENT_READER_BYTES,
+        "and must fit THIS client's reader, or the two budgets are not separated \
+         and the test cannot tell which one was used; got {frame} bytes"
+    );
+
+    let transport =
+        HttpSyncTransport::new(&server.base_url).with_max_response_bytes(CLIENT_READER_BYTES);
+    assert_eq!(
+        transport.receive_limit_bytes(),
+        CLIENT_READER_BYTES,
+        "the reader is set independently of the peer's cap — that is the whole separation"
+    );
+
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(transport),
+        SyncConfig {
+            collectives: Some(filter),
+            ..config.clone()
+        },
+    )
+    .unwrap();
+
+    let err = manager
+        .sync_once()
+        .await
+        .expect_err("a pull the BOUND PEER cannot read must not be sent");
+    match err {
+        SyncError::RequestTooLarge {
+            operation,
+            needed,
+            cap,
+        } => {
+            assert_eq!(operation, WireOperation::Pull);
+            assert_eq!(
+                needed, frame as u64,
+                "the measured frame is what was refused"
+            );
+            assert_eq!(
+                cap, PEER_INBOUND_LIMIT as u64,
+                "the pull encodes against the peer's advertised inbound limit; this \
+                 client's {CLIENT_READER_BYTES}-byte response reader would have let \
+                 the frame through"
+            );
+        }
+        other => panic!("expected the typed RequestTooLarge, got {other}"),
+    }
+
+    assert!(
+        server.handshakes() >= 1,
+        "the binding was established, so the peer's advertised budget was known"
+    );
+    assert_eq!(
+        server.pulls(),
+        0,
+        "no pull crossed to the peer — the refusal is local, before transmission"
     );
 }

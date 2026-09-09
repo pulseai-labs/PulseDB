@@ -100,10 +100,34 @@ impl SyncEndpoint {
 /// frames the request exactly as HTTP would, hands the bytes to the server's own
 /// byte handler, and decodes the framed reply — so a test that passes on this
 /// adapter is a test the same exchange passes over HTTP.
+///
+/// Directions are kept apart the way the HTTP transport keeps them: the request
+/// is encoded against the caller's `send_budget_bytes` (an over-budget one is
+/// `RequestTooLarge`, raised before the server is handed anything), and the
+/// reply is read under this client's own receive limit.
 #[cfg(feature = "sync")]
 pub struct ServerBackedTransport {
     endpoint: std::sync::Arc<SyncEndpoint>,
     receive_limit_bytes: usize,
+}
+
+/// Reclassifies an outbound over-budget encode, exactly as the HTTP transport
+/// does, so a test on this adapter sees the same typed failure.
+#[cfg(feature = "sync")]
+fn encode_request<T: serde::Serialize>(
+    operation: pulsedb::sync::wire::WireOperation,
+    value: &T,
+    send_budget_bytes: usize,
+) -> Result<Vec<u8>, pulsedb::sync::SyncError> {
+    use pulsedb::sync::SyncError;
+    pulsedb::sync::wire::encode_bounded(operation, value, send_budget_bytes).map_err(|e| match e {
+        SyncError::PayloadTooLarge { size, max } => SyncError::RequestTooLarge {
+            operation,
+            needed: size as u64,
+            cap: max as u64,
+        },
+        other => other,
+    })
 }
 
 #[cfg(feature = "sync")]
@@ -134,13 +158,16 @@ impl pulsedb::sync::transport::SyncTransport for ServerBackedTransport {
     async fn handshake(
         &self,
         request: pulsedb::sync::types::HandshakeRequest,
+        send_budget_bytes: usize,
     ) -> Result<pulsedb::sync::types::HandshakeResponse, pulsedb::sync::SyncError> {
         use pulsedb::sync::wire::{self, WireOperation};
+        // Counted only once the request actually leaves: an over-budget encode
+        // is refused locally, and a test asserting "no round trip happened"
+        // must be able to see that.
+        let body = encode_request(WireOperation::Handshake, &request, send_budget_bytes)?;
         self.endpoint
             .handshakes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let body =
-            wire::encode_bounded(WireOperation::Handshake, &request, self.receive_limit_bytes)?;
         let reply = self.endpoint.server().handle_handshake_bytes(&body)?;
         wire::decode_bounded(WireOperation::Handshake, &reply, self.receive_limit_bytes)
     }
@@ -148,15 +175,19 @@ impl pulsedb::sync::transport::SyncTransport for ServerBackedTransport {
     async fn push_changes(
         &self,
         request: pulsedb::sync::types::PushRequest,
+        send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PushAck>,
         pulsedb::sync::SyncError,
     > {
         use pulsedb::sync::wire::{self, WireOperation};
+        // Counted only once the request actually leaves: an over-budget encode
+        // is refused locally, and a test asserting "no round trip happened"
+        // must be able to see that.
+        let body = encode_request(WireOperation::Push, &request, send_budget_bytes)?;
         self.endpoint
             .pushes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let body = wire::encode_bounded(WireOperation::Push, &request, self.receive_limit_bytes)?;
         let reply = self.endpoint.server().handle_push_bytes(&body)?;
         wire::decode_bounded(WireOperation::Push, &reply, self.receive_limit_bytes)
     }
@@ -164,15 +195,19 @@ impl pulsedb::sync::transport::SyncTransport for ServerBackedTransport {
     async fn pull_changes(
         &self,
         request: pulsedb::sync::types::PullRequest,
+        send_budget_bytes: usize,
     ) -> Result<
         pulsedb::sync::types::WireReply<pulsedb::sync::types::PullPage>,
         pulsedb::sync::SyncError,
     > {
         use pulsedb::sync::wire::{self, WireOperation};
+        // Counted only once the request actually leaves: an over-budget encode
+        // is refused locally, and a test asserting "no round trip happened"
+        // must be able to see that.
+        let body = encode_request(WireOperation::Pull, &request, send_budget_bytes)?;
         self.endpoint
             .pulls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let body = wire::encode_bounded(WireOperation::Pull, &request, self.receive_limit_bytes)?;
         let reply = self.endpoint.server().handle_pull_bytes(&body)?;
         let decoded = wire::decode_bounded(WireOperation::Pull, &reply, self.receive_limit_bytes);
         // The replacement lands AFTER the pull is answered: the cycle has now
