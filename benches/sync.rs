@@ -59,7 +59,7 @@ fn bench_sync_change_serialization(c: &mut Criterion) {
         source_instance: InstanceId::new(),
         collective_id: cid,
         entity_type: SyncEntityType::Experience,
-        payload: SyncPayload::ExperienceCreated(exp),
+        payload: SyncPayload::ExperienceCreated(exp.into()),
         timestamp: Timestamp::now(),
     };
 
@@ -79,7 +79,7 @@ fn bench_sync_change_deserialization(c: &mut Criterion) {
         source_instance: InstanceId::new(),
         collective_id: cid,
         entity_type: SyncEntityType::Experience,
-        payload: SyncPayload::ExperienceCreated(exp),
+        payload: SyncPayload::ExperienceCreated(exp.into()),
         timestamp: Timestamp::now(),
     };
     let bytes = postcard::to_stdvec(&change).unwrap();
@@ -160,7 +160,8 @@ fn bench_wal_compaction(c: &mut Criterion) {
                 // Save a cursor so compaction has a target
                 let cursor = SyncCursor {
                     instance_id: InstanceId::new(),
-                    last_sequence: 50, // compact up to seq 50
+                    push_sequence: 50, // compact up to seq 50 (push side bounds compaction)
+                    pull_sequence: 0,
                 };
                 db.storage_for_test().save_sync_cursor(&cursor).unwrap();
 

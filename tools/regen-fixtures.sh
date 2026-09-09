@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Regenerate BOTH real prior-release golden fixtures + their provenance manifests.
+# Regenerate ALL real prior-release golden fixtures + their provenance manifests.
 #
-# Builds the two workspace-OUTSIDE generator crates against the PUBLISHED
-# pulsehive-db =0.5.1 / =0.4.0 (resolved from crates.io), runs them to write the
+# Builds the three workspace-OUTSIDE generator crates against the PUBLISHED
+# pulsehive-db =0.7.0 / =0.5.1 / =0.4.0 (resolved from crates.io), runs them to write the
 # frozen `.redb` blobs into tests/fixtures/, strips the derived HNSW sidecar dir,
 # and layers mechanical provenance onto each manifest via finalize_manifest.py.
 #
@@ -49,9 +49,10 @@ gen_one() {
     "$git_commit" "$rustc_version" "$cargo_version"
 }
 
+gen_one "fixture-gen-v0_7_0" "0.7.0"
 gen_one "fixture-gen-v0_5_1" "0.5.1"
 gen_one "fixture-gen-v0_4_0" "0.4.0"
 
 echo ">> done. Frozen fixtures + manifests:"
-ls -l "$fixtures_dir"/real-v0.5.1.redb "$fixtures_dir"/real-v0.4.0.redb \
-      "$fixtures_dir"/real-v0.5.1.manifest.json "$fixtures_dir"/real-v0.4.0.manifest.json
+ls -l "$fixtures_dir"/real-v0.7.0.redb "$fixtures_dir"/real-v0.5.1.redb "$fixtures_dir"/real-v0.4.0.redb \
+      "$fixtures_dir"/real-v0.7.0.manifest.json "$fixtures_dir"/real-v0.5.1.manifest.json "$fixtures_dir"/real-v0.4.0.manifest.json

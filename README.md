@@ -113,6 +113,22 @@ Desktop (Tauri)                    Server (Axum)
 - Initial sync catchup with progress callback
 - Pluggable transport trait (HTTP, in-memory for testing, custom)
 
+**Backups, restores and sync identity.** Every store carries a persistent
+`InstanceId` (read it with `db.instance_id()`) that keys its bucket of the
+per-instance reinforcement counter. A file-level copy of a store — a backup
+restore, a snapshot, a plain `cp` — carries the *same* id, so if the original
+and the copy both keep syncing, their reinforcements collide and are silently
+lost. Give a restored copy its own identity **before its first reinforce and
+before constructing a `SyncManager`** over it:
+
+```rust,ignore
+let restored = PulseDB::open("restored-copy.db", Config::default())?;
+let new_id = restored.remint_instance_id()?; // one write; no WAL/sync event
+```
+
+Existing counts are preserved (the old buckets simply read as another peer's),
+and the remint is logged at `info` with the old and new ids.
+
 ## Performance
 
 Measured on Apple Silicon (M-series), single-threaded:

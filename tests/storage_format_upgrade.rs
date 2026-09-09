@@ -56,6 +56,9 @@
 //! `redb = "4.1"` dev-dependency — the same technique 4.01's generator used. The
 //! guarantee is identical; the inspector is named `raw_table_bytes` per the AC.
 
+mod common;
+
+use common::{copy_fixture, fixtures_dir};
 use pulsedb::{CollectiveId, Config, ExperienceId, InsightId, PulseDB, RelationId};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde_json::Value;
@@ -76,10 +79,6 @@ const SUBSTRATE_MARKER: [u8; 3] = [b'P', b'S', 2];
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -111,15 +110,6 @@ fn load_manifest(name: &str) -> Value {
     let s = std::fs::read_to_string(fixtures_dir().join(name))
         .unwrap_or_else(|e| panic!("read manifest {name}: {e}"));
     serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse manifest {name}: {e}"))
-}
-
-/// Copy the committed fixture to a fresh temp path (redb's v2→v3 `upgrade()` is
-/// destructive/in-place — the checked-in blob must never be mutated by a run).
-fn copy_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let dst = dir.path().join(name);
-    std::fs::copy(fixtures_dir().join(name), &dst).unwrap_or_else(|e| panic!("copy {name}: {e}"));
-    (dir, dst)
 }
 
 fn to_uuid(s: &str) -> uuid::Uuid {
@@ -221,7 +211,9 @@ const INS_STABLE: &[&str] = &[
     "updated_at",
 ];
 
-fn verify_fixture(fx: &Fixture) {
+/// Returns the migrated temp store (and its guard) so fixture-specific checks can
+/// run raw reads against it after the shared verification.
+fn verify_fixture(fx: &Fixture) -> (tempfile::TempDir, PathBuf) {
     let manifest = load_manifest(fx.manifest);
 
     // ---- C1 provenance guard: committed blob SHA-256 == manifest, BEFORE opening.
@@ -234,13 +226,13 @@ fn verify_fixture(fx: &Fixture) {
     );
 
     // ---- migrate via the public open path (fires all three axes).
-    let (_tmp, store) = copy_fixture(fx.redb);
+    let (tmp, store) = copy_fixture(fx.redb);
     let db = PulseDB::open(&store, Config::default())
         .unwrap_or_else(|e| panic!("{}: migrate+open failed: {e:?}", fx.redb));
     assert_eq!(
         db.metadata().schema_version,
-        4,
-        "{}: expected schema v4 post-migration",
+        5,
+        "{}: expected schema v5 post-migration",
         fx.redb
     );
 
@@ -481,6 +473,8 @@ fn verify_fixture(fx: &Fixture) {
             );
         }
     }
+
+    (tmp, store)
 }
 
 // ---------------------------------------------------------------------------
@@ -553,4 +547,158 @@ fn truncated_fixture_fails_explicitly() {
         !opened_silently,
         "a truncated fixture must fail explicitly (Err/panic), not open silently"
     );
+}
+
+// ---------------------------------------------------------------------------
+// r1.s1.w1 (#9) — real v0.7.0 (schema-v4, sync cursor present) → schema v5
+// ---------------------------------------------------------------------------
+
+/// Copy-through mirror of the `sync_cursors` table (`src/storage/schema.rs`),
+/// declared locally so the raw-bytes check is feature-independent.
+const SYNC_CURSORS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("sync_cursors");
+
+/// The postcard encoding of a schema-v5 `SyncCursor { instance_id, push_sequence: 0,
+/// pull_sequence: 0 }`: `varint(16) ‖ uuid bytes ‖ varint(0) ‖ varint(0)`.
+fn v5_reset_cursor_bytes(peer: &uuid::Uuid) -> Vec<u8> {
+    let mut v = vec![0x10];
+    v.extend_from_slice(peer.as_bytes());
+    v.extend_from_slice(&[0x00, 0x00]);
+    v
+}
+
+/// RAW on-disk `sync_cursors` rows (peer-id → value bytes) of the MIGRATED store.
+fn raw_sync_cursors(store: &Path) -> BTreeMap<String, Vec<u8>> {
+    let db = redb::Database::open(store).expect("reopen migrated store (redb 4.x)");
+    let rtx = db.begin_read().unwrap();
+    let t = rtx.open_table(SYNC_CURSORS).unwrap();
+    let mut out = BTreeMap::new();
+    for row in t.iter().unwrap() {
+        let (k, v) = row.unwrap();
+        out.insert(uuid_str(k.value()), v.value().to_vec());
+    }
+    out
+}
+
+/// Shared v5 assertions for the real v0.7.0 fixture, feature-independent:
+/// `.pre-v5.bak` byte-identical to the committed fixture, `schema_version == 5`,
+/// and the legacy `{instance_id, last_sequence}` cursor row rewritten to
+/// `{instance_id, 0, 0}` (grill Q1: both positions reset, never seeded).
+fn assert_v0_7_0_migrated_to_v5(store: &Path, manifest: &Value) {
+    // ---- backup-before-migrate (ADR-011): the pristine pre-v5 sidecar is the fixture, byte for byte.
+    let sidecar = store.with_file_name("real-v0.7.0.redb.pre-v5.bak");
+    let sidecar_bytes = std::fs::read(&sidecar)
+        .unwrap_or_else(|e| panic!("`.pre-v5.bak` sidecar missing after migration: {e}"));
+    let committed = std::fs::read(fixtures_dir().join("real-v0.7.0.redb")).unwrap();
+    if sidecar_bytes != committed {
+        let first_diff = sidecar_bytes
+            .iter()
+            .zip(committed.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(sidecar_bytes.len().min(committed.len()));
+        let diff_count = sidecar_bytes
+            .iter()
+            .zip(committed.iter())
+            .filter(|(a, b)| a != b)
+            .count()
+            + sidecar_bytes.len().abs_diff(committed.len());
+        let lo = first_diff.saturating_sub(8);
+        let hi = (first_diff + 24).min(sidecar_bytes.len().min(committed.len()));
+        panic!(
+            ".pre-v5.bak is not byte-identical to the committed v0.7.0 fixture: \
+             sidecar {} bytes, fixture {} bytes, {} differing bytes, first at offset {first_diff}; \
+             sidecar[{lo}..{hi}]={} fixture[{lo}..{hi}]={}",
+            sidecar_bytes.len(),
+            committed.len(),
+            diff_count,
+            hex(&sidecar_bytes[lo..hi]),
+            hex(&committed[lo..hi]),
+        );
+    }
+
+    // ---- logical schema: v5, and idempotent on reopen.
+    let db = PulseDB::open(store, Config::default()).expect("reopen migrated store");
+    assert_eq!(
+        db.metadata().schema_version,
+        5,
+        "expected schema v5 post-migration"
+    );
+    drop(db);
+
+    // ---- the legacy cursor row is reset, not seeded (raw bytes, no `sync` feature needed).
+    let legacy = &manifest["sync_cursor"];
+    let peer = legacy["peer_instance_id"].as_str().unwrap();
+    assert!(
+        legacy["last_sequence"].as_u64().unwrap() > 0,
+        "fixture precondition: the v0.7.0 store must carry a NON-ZERO legacy cursor"
+    );
+    let raw = raw_sync_cursors(store);
+    let got = raw
+        .get(peer)
+        .unwrap_or_else(|| panic!("sync cursor for peer {peer} lost across the v5 migration"));
+    assert_eq!(
+        hex(got),
+        hex(&v5_reset_cursor_bytes(&to_uuid(peer))),
+        "migrated sync cursor must be `{{instance_id, push_sequence: 0, pull_sequence: 0}}`"
+    );
+    assert_ne!(
+        hex(got),
+        legacy["raw_value_bytes_hex"].as_str().unwrap(),
+        "migrated cursor bytes still equal the legacy v4 encoding"
+    );
+}
+
+#[test]
+fn real_v0_7_0_sync_cursor_store_upgrades_to_v5() {
+    let manifest = load_manifest("real-v0.7.0.manifest.json");
+    let (_tmp, store) = verify_fixture(&Fixture {
+        redb: "real-v0.7.0.redb",
+        manifest: "real-v0.7.0.manifest.json",
+        instance_id: InstanceIdMode::Preserve,
+    });
+    assert_v0_7_0_migrated_to_v5(&store, &manifest);
+
+    // Under `sync`, the typed port sees the same reset record.
+    #[cfg(feature = "sync")]
+    {
+        let db = PulseDB::open(&store, Config::default()).unwrap();
+        let cursors = db.storage_for_test().list_sync_cursors().unwrap();
+        assert_eq!(cursors.len(), 1, "exactly one migrated peer cursor");
+        let peer = to_uuid(
+            manifest["sync_cursor"]["peer_instance_id"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_eq!(cursors[0].instance_id.0, peer);
+        assert_eq!(
+            cursors[0].push_sequence, 0,
+            "push position reset to 0 (grill Q1)"
+        );
+        assert_eq!(
+            cursors[0].pull_sequence, 0,
+            "pull position reset to 0 (grill Q1)"
+        );
+        // A reset push position keeps compaction blocked until a real push.
+        assert_eq!(db.compact_wal().unwrap(), 0);
+    }
+}
+
+/// The v4→v5 cursor reset runs through a feature-independent raw helper: a build
+/// WITHOUT `sync` (where the cursor table type is cfg'd out) must still migrate
+/// the store to v5 and reset the row (AC-3 runs this under default features).
+///
+/// Gated to a non-`sync` build so it covers what its name promises. Under
+/// `--features sync` it would silently re-run
+/// `real_v0_7_0_sync_cursor_store_upgrades_to_v5`, and a regression in the
+/// non-sync leg would still show green.
+#[test]
+#[cfg(not(feature = "sync"))]
+fn real_v0_7_0_opens_without_sync_feature() {
+    let manifest = load_manifest("real-v0.7.0.manifest.json");
+    let (_tmp, store) = copy_fixture("real-v0.7.0.redb");
+    {
+        let db = PulseDB::open(&store, Config::default())
+            .unwrap_or_else(|e| panic!("real-v0.7.0.redb: migrate+open failed: {e:?}"));
+        assert_eq!(db.metadata().schema_version, 5);
+    }
+    assert_v0_7_0_migrated_to_v5(&store, &manifest);
 }
