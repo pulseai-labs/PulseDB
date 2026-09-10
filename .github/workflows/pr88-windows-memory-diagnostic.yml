@@ -1,0 +1,176 @@
+name: PR88 Windows memory diagnostic
+
+# TEMPORARY, DIAGNOSTIC-ONLY. Delete this workflow and its script when the
+# question below is answered.
+#
+# The Windows / sync-http CI job refused a 3,105,296-byte allocation inside the
+# sync_http test binary after 16 of its 52 tests had completed (public run
+# 34389089262, job 102593327289). The last COMPLETED test is not evidence of the
+# culprit, and the Rust fast-fail message does not say which resource ran out.
+# There is no process or system commit telemetry from that run, so nothing there
+# distinguishes "one test allocates too much" from "the default-concurrency suite
+# exhausts system commit".
+#
+# This job answers only the first, narrower question: what do the two heaviest
+# sync-http tests cost ON THEIR OWN, on Windows? It runs them UNMODIFIED, one per
+# process, serially, and samples memory while they run. No test, fixture, cap or
+# production source is touched by this workflow; it adds files and reads the tree.
+#
+# Scope guards, all deliberate:
+#   * push-triggered on the diagnostic branch ONLY, with a second `if` guard so the
+#     file cannot start running if it is ever merged elsewhere. It is not added to
+#     main, to the PR branch, or to any existing workflow.
+#   * `permissions: contents: read` and `persist-credentials: false` — this job has
+#     no write token and uses no secrets.
+#   * no default-concurrency run of the whole suite. That is the NEXT experiment and
+#     needs its own decision; running it here would confound the isolated numbers.
+
+on:
+  push:
+    branches:
+      - diagnostic/pr88-windows-memory
+
+# Least-privilege, matching the repository's existing default. This job reads the
+# tree and uploads an artifact; it never writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: pr88-windows-memory-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Mirrors CI, so the binary under measurement is built the way the failing job
+  # built it.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  windows-memory-probe:
+    name: Isolated sync-http memory telemetry
+    # Belt-and-braces: the trigger already restricts the branch, and this repeats it
+    # so a copy of this file on any other ref is inert rather than merely untriggered.
+    if: github.ref == 'refs/heads/diagnostic/pr88-windows-memory'
+    runs-on: windows-latest
+    # Hard ceiling for the whole job, compile included.
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # This job must never be able to write to the repository.
+          persist-credentials: false
+
+      # The repository's CI resolves `stable`; the failing run resolved it to
+      # 1.98.1. Pinning that exact version keeps the measured binary comparable to
+      # the failing one instead of drifting with the channel. `@master` + an explicit
+      # toolchain is the same pattern the MSRV job already uses.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+
+      # `windows-latest` is what the failing job requested, so it is what this
+      # reproduces. The concrete image it resolves to is recorded below rather than
+      # assumed, because "latest" moves.
+      - name: Record runner image and toolchain
+        run: |
+          New-Item -ItemType Directory -Force -Path diagnostic-out | Out-Null
+          $os  = Get-CimInstance -ClassName Win32_OperatingSystem
+          $cs  = Get-CimInstance -ClassName Win32_ComputerSystem
+          $mem = Get-CimInstance -ClassName Win32_PerfRawData_PerfOS_Memory
+          # Only the image, toolchain and memory shape. No environment dump.
+          $info = [pscustomobject]@{
+            recorded_utc             = (Get-Date).ToUniversalTime().ToString('o')
+            runner_label             = 'windows-latest'
+            image_os                 = $env:ImageOS
+            image_version            = $env:ImageVersion
+            os_caption               = $os.Caption
+            os_version               = $os.Version
+            os_build                 = $os.BuildNumber
+            logical_processors       = $cs.NumberOfLogicalProcessors
+            total_physical_bytes     = [uint64]$cs.TotalPhysicalMemory
+            commit_limit_bytes       = [uint64]$mem.CommitLimit
+            committed_bytes_at_start = [uint64]$mem.CommittedBytes
+            available_bytes_at_start = [uint64]$mem.AvailableBytes
+            rustc                    = (rustc -vV | Out-String)
+            cargo                    = (cargo -vV | Out-String)
+          }
+          $info | ConvertTo-Json -Depth 4 | Tee-Object -FilePath diagnostic-out/environment.json
+
+      # A syntax error in the probe would otherwise be discovered only after the
+      # compile has spent most of the job budget.
+      - name: Parse-check the probe script
+        run: |
+          $script = (Resolve-Path .github/diagnostics/pr88-windows-memory-probe.ps1).ProviderPath
+          $errors = $null
+          $tokens = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+          if ($errors -and @($errors).Count -gt 0) {
+            foreach ($e in $errors) {
+              Write-Host "::error file=$script,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+            }
+            exit 1
+          }
+          Write-Host "probe script parses clean"
+
+      # Compiled ONCE. Both measured runs execute this same binary, so the two
+      # numbers are comparable to each other and neither pays a compile cost.
+      - name: Compile the sync_http test binary (no run)
+        timeout-minutes: 13
+        run: |
+          cargo test --features sync-http --test sync_http --no-run --message-format=json `
+            1> diagnostic-out/cargo-messages.jsonl
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo test --no-run failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Run the bounded memory probe
+        run: |
+          # Resolve the executable cargo actually produced. Guessing the filename
+          # hash would be the one place this harness could silently measure the
+          # wrong binary.
+          $artifacts = Get-Content -LiteralPath diagnostic-out/cargo-messages.jsonl |
+            Where-Object { $_.StartsWith('{') } |
+            ForEach-Object { try { $_ | ConvertFrom-Json } catch { $null } } |
+            Where-Object {
+              $_ -and $_.reason -eq 'compiler-artifact' -and $_.executable -and
+              $_.target.name -eq 'sync_http' -and ($_.target.kind -contains 'test')
+            }
+          $exe = @($artifacts) | Select-Object -Last 1 -ExpandProperty executable
+          if (-not $exe) {
+            throw "no sync_http test executable in the cargo messages"
+          }
+          Write-Host "test binary: $exe"
+
+          # Both names are the tests as they stand on this branch, unmodified.
+          #   1. the full poll page that seeds 1005 collectives and then replicates
+          #      every one of them over real HTTP into a second store;
+          #   2. the >4 MiB outbound push regression.
+          $probe = './.github/diagnostics/pr88-windows-memory-probe.ps1'
+          & $probe `
+            -Executable $exe `
+            -OutputDirectory diagnostic-out `
+            -Tests @(
+              'a_full_poll_page_reports_more_even_when_every_event_yielded_a_change',
+              'recovery_v5_push_encodes_against_the_send_budget_not_the_response_reader'
+            ) `
+            -SampleIntervalMs 500 `
+            -PerTestTimeoutSeconds 180 `
+            -PrivateBytesLimitGiB 8 `
+            -AvailableFloorGiB 2 `
+            -CommitCeilingPercent 90
+          exit $LASTEXITCODE
+
+      # always(): a run stopped by a watchdog, a timeout or a crash is exactly the
+      # run whose telemetry is worth keeping.
+      - name: Upload diagnostic telemetry
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr88-windows-memory-diagnostic
+          path: diagnostic-out/
+          # Short: this is throwaway diagnostic data, not a build output.
+          retention-days: 7
+          if-no-files-found: warn
