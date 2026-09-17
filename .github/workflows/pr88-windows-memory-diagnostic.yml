@@ -11,9 +11,15 @@ name: PR88 Windows memory diagnostic
 # distinguishes "one test allocates too much" from "the default-concurrency suite
 # exhausts system commit".
 #
-# This job answers only the first, narrower question: what do the two heaviest
-# sync-http tests cost ON THEIR OWN, on Windows? It runs them UNMODIFIED, one per
-# process, serially, and samples memory while they run. No test, fixture, cap or
+# Run 34505038713 answered the first question and raised a sharper one. Alone in its
+# own process, the full-page test commits ~5.15 GiB/s and crossed 10.17 GiB private
+# bytes in 2.1 s while its working set stayed at 38.7 MiB -- commit without touch.
+# The >4 MiB push test peaked at 143.5 MiB and passed, so it is excluded as the
+# source. What is still unknown is WHERE: that run took no stack or region evidence.
+#
+# This job runs ONLY the full-page test, UNMODIFIED, and captures thread stacks plus
+# a virtual-memory region summary at a 4 GiB trigger -- after suspending the target,
+# so the capture cannot be outrun -- then terminates it. No test, fixture, cap or
 # production source is touched by this workflow; it adds files and reads the tree.
 #
 # Scope guards, all deliberate:
@@ -99,21 +105,27 @@ jobs:
           }
           $info | ConvertTo-Json -Depth 4 | Tee-Object -FilePath diagnostic-out/environment.json
 
-      # A syntax error in the probe would otherwise be discovered only after the
+      # A syntax error in either script would otherwise be discovered only after the
       # compile has spent most of the job budget.
-      - name: Parse-check the probe script
+      - name: Parse-check the diagnostic scripts
         run: |
-          $script = (Resolve-Path .github/diagnostics/pr88-windows-memory-probe.ps1).ProviderPath
-          $errors = $null
-          $tokens = $null
-          $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
-          if ($errors -and @($errors).Count -gt 0) {
-            foreach ($e in $errors) {
-              Write-Host "::error file=$script,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+          $failed = $false
+          foreach ($rel in @('.github/diagnostics/pr88-windows-memory-probe.ps1',
+                             '.github/diagnostics/pr88-windows-capture.ps1')) {
+            $script = (Resolve-Path $rel).ProviderPath
+            $errors = $null
+            $tokens = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errors)
+            if ($errors -and @($errors).Count -gt 0) {
+              $failed = $true
+              foreach ($e in $errors) {
+                Write-Host "::error file=$script,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+            } else {
+              Write-Host "$rel parses clean"
             }
-            exit 1
           }
-          Write-Host "probe script parses clean"
+          if ($failed) { exit 1 }
 
       # Compiled ONCE. Both measured runs execute this same binary, so the two
       # numbers are comparable to each other and neither pays a compile cost.
@@ -144,23 +156,30 @@ jobs:
           }
           Write-Host "test binary: $exe"
 
-          # Both names are the tests as they stand on this branch, unmodified.
-          #   1. the full poll page that seeds 1005 collectives and then replicates
-          #      every one of them over real HTTP into a second store;
-          #   2. the >4 MiB outbound push regression.
+          # ONE test, unmodified: the full poll page that seeds 1005 collectives and
+          # then replicates every one of them over real HTTP into a second store.
+          #
+          # The >4 MiB push regression that ran alongside it in 34505038713 is
+          # deliberately NOT here. It peaked at 143.5 MiB and passed, so it is already
+          # excluded as the allocation source; re-running it would only add a second
+          # process to a run whose whole purpose is localizing the first one.
           $probe = './.github/diagnostics/pr88-windows-memory-probe.ps1'
           & $probe `
             -Executable $exe `
             -OutputDirectory diagnostic-out `
             -Tests @(
-              'a_full_poll_page_reports_more_even_when_every_event_yielded_a_change',
-              'recovery_v5_push_encodes_against_the_send_budget_not_the_response_reader'
+              'a_full_poll_page_reports_more_even_when_every_event_yielded_a_change'
             ) `
             -SampleIntervalMs 500 `
             -PerTestTimeoutSeconds 180 `
             -PrivateBytesLimitGiB 8 `
             -AvailableFloorGiB 2 `
-            -CommitCeilingPercent 90
+            -CommitCeilingPercent 90 `
+            -CaptureHelperPath './.github/diagnostics/pr88-windows-capture.ps1' `
+            -CaptureTriggerGiB 4 `
+            -CaptureTimeoutSeconds 60 `
+            -CaptureMaxFileMiB 256 `
+            -CaptureMaxTotalMiB 512
           exit $LASTEXITCODE
 
       # always(): a run stopped by a watchdog, a timeout or a crash is exactly the

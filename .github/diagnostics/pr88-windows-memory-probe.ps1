@@ -120,7 +120,30 @@ param(
     [double] $AvailableFloorGiB = 2,
 
     [ValidateRange(50, 90)]
-    [double] $CommitCeilingPercent = 90
+    [double] $CommitCeilingPercent = 90,
+
+    # ---- capture ------------------------------------------------------------
+    # Every capture bound is closed on the loosening side, like the memory bounds.
+    # Mandatory: this follow-up exists to capture, so a run without a helper is a
+    # misconfiguration, not a quiet degrade to the previous behaviour.
+    [Parameter(Mandatory = $true)]
+    [string] $CaptureHelperPath,
+
+    # Strictly below the private-bytes kill so capture happens with headroom. At the
+    # observed ~5.15 GiB/s this is reached ~0.8 s in, with ~14 GiB of commit still
+    # free -- and the target is suspended before anything is written, so growth stops
+    # rather than racing the capture.
+    [ValidateRange(0.5, 7.5)]
+    [double] $CaptureTriggerGiB = 4,
+
+    [ValidateRange(5, 60)]
+    [int] $CaptureTimeoutSeconds = 60,
+
+    [ValidateRange(1, 256)]
+    [int] $CaptureMaxFileMiB = 256,
+
+    [ValidateRange(1, 512)]
+    [int] $CaptureMaxTotalMiB = 512
 )
 
 Set-StrictMode -Version 1.0
@@ -144,6 +167,15 @@ $CimTimeoutSec = 5
 
 # How long to wait for a terminated tree before declaring termination unconfirmed.
 $TerminationWaitMs = 15000
+
+$captureTriggerBytes = [uint64]($CaptureTriggerGiB * $GiB)
+$captureMaxFileBytes = [int64]$CaptureMaxFileMiB * 1MB
+$captureMaxTotalBytes = [int64]$CaptureMaxTotalMiB * 1MB
+# Filled in by the pre-launch readiness check and reported in every result record.
+$captureTools = $null
+$captureSymbol = $null
+$captureHelperFull = $null
+$pwshPath = $null
 
 function Write-Note {
     param([string] $Message)
@@ -260,14 +292,91 @@ function Stop-TestTree {
     return $confirmed
 }
 
-function Complete-Probe {
+function New-RunRecord {
     <#
-        Writes summary.json and the job summary, then exits with the code the run
-        earned. EVERY terminating path after the output directory exists goes through
-        here, so an abort can never leave the artifact without a summary: losing the
-        JSON is losing the evidence the whole run exists to produce.
+        The ONE place a per-run result object is constructed. The real loop and the
+        self-check both call this, so the self-check exercises the actual conversion
+        rather than an imitation of it. `[ordered]` in, so field order survives the
+        call the way a literal `[pscustomobject]@{}` would.
     #>
-    $summary = [pscustomobject]@{
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.Specialized.OrderedDictionary] $Fields
+    )
+
+    return [pscustomobject]$Fields
+}
+
+function Get-JsonEscaped {
+    <#
+        Minimal JSON string escaping for the fixed-shape fallback below. Deliberately
+        uses only the -replace operator: ConvertTo-Json is one of the suspects the
+        fallback exists to route around, so the fallback cannot depend on it.
+    #>
+    param([string] $Value)
+
+    if ($null -eq $Value) { return '' }
+    # Backslash first, then quote: reversing them would double-escape the backslash
+    # this step just inserted. In a -replace replacement backslash is literal, so
+    # each replacement below is written as the exact characters JSON should receive.
+    $out = $Value -replace '\\', '\\'
+    $out = $out -replace '"', '\"'
+    $out = $out -replace "`r", '\r'
+    $out = $out -replace "`n", '\n'
+    $out = $out -replace "`t", '\t'
+    # Anything else in the C0 range would make the file invalid JSON.
+    $out = $out -replace '[\x00-\x1F]', ' '
+    return $out
+}
+
+function Write-FallbackSummary {
+    <#
+        Writes a summary.json of fixed shape from string and integer literals only.
+
+        This exists for exactly one situation: the self-check has just proved that the
+        normal summary path throws. Routing the failure report back through
+        Build-ProbeSummary / Write-ProbeSummary / ConvertTo-Json would then produce
+        nothing at all, which is the failure mode that cost run 34505038713 its
+        evidence. So this touches none of them.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [string] $Reason,
+        [Parameter(Mandatory = $true)] [string] $Detail
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('{')
+    $lines.Add('  "schema": "pr88-windows-memory-probe/fallback-1",')
+    $lines.Add('  "generated_utc": "' + (Get-JsonEscaped ((Get-Date).ToUniversalTime().ToString('o'))) + '",')
+    $lines.Add('  "fixed_shape_fallback": true,')
+    $lines.Add('  "note": "the normal summary path failed its own pre-launch self-check; this file is built from literals only and uses neither Build-ProbeSummary nor ConvertTo-Json",')
+    $lines.Add('  "sequence_aborted": true,')
+    $lines.Add('  "tests_launched": 0,')
+    $lines.Add('  "runs": [],')
+    $lines.Add('  "failure_reason": "' + (Get-JsonEscaped $Reason) + '",')
+    $lines.Add('  "failure_detail": "' + (Get-JsonEscaped $Detail) + '"')
+    $lines.Add('}')
+    ($lines -join "`n") | Set-Content -LiteralPath $Path -Encoding utf8
+}
+
+function Build-ProbeSummary {
+    <#
+        Builds the summary object from the SAME concrete collection types the real run
+        uses. The parameters are typed to those exact generic types on purpose: run
+        34505038713 died with `Argument types do not match` -- a reflection-level
+        argument-binding failure -- somewhere in this construction, and a self-check
+        that passed plain arrays through here would not exercise the binder that
+        failed. See Invoke-ProbeSelfCheck.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.Generic.List[object]] $Results,
+        [Parameter(Mandatory = $true)] [System.Collections.Generic.List[string]] $HarnessFailures,
+        [Parameter(Mandatory = $true)] [System.Collections.Generic.List[string]] $Skipped,
+        [Parameter(Mandatory = $true)] [bool] $SequenceAborted
+    )
+
+    return [pscustomobject]@{
         schema             = 'pr88-windows-memory-probe/3'
         generated_utc      = (Get-Date).ToUniversalTime().ToString('o')
         executable         = $exePath
@@ -286,30 +395,41 @@ function Complete-Probe {
             'The per-test timeout can overshoot by up to about one bounded iteration (the CIM timeout plus one process read).',
             'Peaks are the maxima OBSERVED at the sample interval, so they are lower bounds; a shorter spike can be missed.'
         )
-        sequence_aborted   = $script:sequenceAborted
-        tests_launched     = @($script:results | Where-Object { $_.launched }).Count
+        sequence_aborted   = $SequenceAborted
+        tests_launched     = @($Results | Where-Object { $_.launched }).Count
         # Two different things share `launched = $false` and must never be summed
         # together: the harness correctly DECLINING to start a child on an unsafe
         # runner, and the harness FAILING before it could start one. The first is a
         # fact about the runner; the second is a defect in the run.
-        tests_refused_pre_launch = @($script:results | Where-Object { -not $_.launched -and $_.unlaunched_class -eq 'pre-launch-refusal' }).Count
-        tests_unlaunched_harness_failure = @($script:results | Where-Object { -not $_.launched -and $_.unlaunched_class -eq 'harness-failure' }).Count
-        tests_not_run      = @($script:skipped)
-        harness_failures   = @($script:harnessFailures)
-        runs               = @($script:results)
+        tests_refused_pre_launch = @($Results | Where-Object { -not $_.launched -and $_.unlaunched_class -eq 'pre-launch-refusal' }).Count
+        tests_unlaunched_harness_failure = @($Results | Where-Object { -not $_.launched -and $_.unlaunched_class -eq 'harness-failure' }).Count
+        tests_not_run      = @($Skipped)
+        harness_failures   = @($HarnessFailures)
+        runs               = @($Results)
     }
 
-    $summaryPath = Join-Path $outDir 'summary.json'
-    $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding utf8
-    Write-Note "summary written to $summaryPath"
+}
 
-    if ($env:GITHUB_STEP_SUMMARY) {
-        $md = New-Object System.Collections.Generic.List[string]
+function Build-StepSummaryLines {
+    <#
+        Renders the job-summary markdown. Split out for the same reason as
+        Build-ProbeSummary: the self-check must cross this boundary too, since it is
+        the other `-f`-heavy, collection-heavy path in the crash window.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Summary,
+        [Parameter(Mandatory = $true)] [System.Collections.Generic.List[object]] $Results,
+        [Parameter(Mandatory = $true)] [System.Collections.Generic.List[string]] $HarnessFailures,
+        [Parameter(Mandatory = $true)] [System.Collections.Generic.List[string]] $Skipped,
+        [Parameter(Mandatory = $true)] [bool] $SequenceAborted
+    )
+
+    $md = New-Object System.Collections.Generic.List[string]
         $md.Add('### Windows sync-http memory probe (PR #88, diagnostic only)')
         $md.Add('')
         $md.Add('| # | test | outcome | exit | elapsed s | peak private | peak working set | peak virtual | peak threads | min available | max commit % |')
         $md.Add('|---|------|---------|------|-----------|--------------|------------------|--------------|--------------|---------------|--------------|')
-        foreach ($run in $script:results) {
+        foreach ($run in $Results) {
             $md.Add(('| {0} | `{1}` | {2} | {3} | {4} | {5:N0} | {6:N0} | {7:N0} | {8} | {9:N0} | {10} |' -f `
                 $run.index, $run.test, $run.outcome, $run.exit_code, $run.elapsed_seconds,
                 $run.peak_process.private_bytes, $run.peak_process.working_set_bytes,
@@ -319,7 +439,7 @@ function Complete-Probe {
         $md.Add('')
         $md.Add('Byte figures are bytes. Private bytes and working set are different quantities and are not interchangeable. Which resource the original CI failure exhausted is not established by this run.')
         $md.Add('Peaks are maxima observed at the sample interval, so they are lower bounds.')
-        foreach ($run in $script:results) {
+        foreach ($run in $Results) {
             # `stop_class` is the authority here, exactly as it is in the JSON and in
             # harness_failures. `stopped_by_watchdog` records the historical fact that
             # a bound fired; it must never decide how the effective result is
@@ -361,10 +481,381 @@ function Complete-Probe {
                 $md.Add(('- `{0}`: termination of PID {1} was REQUESTED but NOT CONFIRMED.' -f $run.test, $run.pid))
             }
         }
-        if ($script:sequenceAborted) {
-            $md.Add(('- SEQUENCE ABORTED. Tests not run: {0}' -f (@($script:skipped) -join ', ')))
+        if ($SequenceAborted) {
+            $md.Add(('- SEQUENCE ABORTED. Tests not run: {0}' -f (@($Skipped) -join ', ')))
         }
-        foreach ($f in $script:harnessFailures) { $md.Add("- HARNESS FAILURE: $f") }
+        foreach ($f in $HarnessFailures) { $md.Add("- HARNESS FAILURE: $f") }
+    return $md
+}
+
+function Write-ProbeSummary {
+    <#
+        The real serialization and write. The self-check calls THIS, against a
+        throwaway path, so a failure in ConvertTo-Json or Set-Content is caught before
+        the expensive test rather than after it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] $Summary,
+        [Parameter(Mandatory = $true)] [string] $Path
+    )
+
+    $Summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding utf8
+}
+
+function Invoke-BoundedCapture {
+    <#
+        Drives the capture helper as a SEPARATE PROCESS and enforces every bound from
+        outside it.
+
+        The helper cannot be trusted to bound itself: a helper that hangs, or that
+        writes without limit, is exactly what the caps exist for. So the parent owns
+        the deadline and both size caps and polls them WHILE the helper writes --
+        checking sizes only after the fact would not be a cap at all.
+
+        Two distinct process trees are in play and they are never confused: this kills
+        the HELPER tree on a breach. The captured TEST tree is terminated by the
+        probe's existing unconditional cleanup path, which this function neither
+        performs nor delays beyond its own hard deadline.
+
+        Returns a reporting object; never throws.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [int] $ProcessId,
+        [Parameter(Mandatory = $true)] [uint64] $PrivateBytes,
+        [Parameter(Mandatory = $true)] [string] $CaptureDirectory
+    )
+
+    $state = [ordered]@{
+        requested             = $true
+        armed                 = $true
+        trigger_reason        = 'process_private_bytes_over_capture_trigger'
+        trigger_private_bytes = $PrivateBytes
+        tool                  = 'dbghelp.dll MiniDumpWriteDump (MiniDumpNormal|MiniDumpWithThreadInfo)'
+        tool_version          = $null
+        target_pid            = $ProcessId
+        scope_note            = 'root test PID only; descendants are neither suspended nor dumped'
+        suspended             = $false
+        suspend_method        = $null
+        suspend_confirmed     = $false
+        counters_stable       = $false
+        completed             = $false
+        elapsed_s             = $null
+        helper_exit_code      = $null
+        files                 = @()
+        total_bytes           = [int64]0
+        symbols               = $script:captureSymbol
+        failure_reason        = $null
+        failure_detail        = $null
+    }
+    if ($null -ne $script:captureTools) {
+        $dbg = @($script:captureTools | Where-Object { $_.name -eq 'dbghelp.dll' })
+        if ($dbg.Count -eq 1) { $state.tool_version = $dbg[0].version }
+    }
+
+    $null = New-Item -ItemType Directory -Force -Path $CaptureDirectory
+    $capDir = (Resolve-Path -LiteralPath $CaptureDirectory).ProviderPath
+    $resultPath = Join-Path $capDir 'capture-result.json'
+    $helperOut = Join-Path $capDir 'capture-helper.stdout.txt'
+    $helperErr = Join-Path $capDir 'capture-helper.stderr.txt'
+
+    $helper = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $helperArgs = @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', $script:captureHelperFull,
+            '-TargetPid', $ProcessId,
+            '-OutputDirectory', $capDir,
+            '-ResultPath', $resultPath,
+            '-MaxFileBytes', $script:captureMaxFileBytes
+        )
+        if ($script:captureSymbol -and $script:captureSymbol.path) {
+            $helperArgs += @('-SymbolPath', $script:captureSymbol.path)
+        }
+        $helper = Start-Process -FilePath $script:pwshPath -ArgumentList $helperArgs `
+                                -NoNewWindow -PassThru `
+                                -RedirectStandardOutput $helperOut -RedirectStandardError $helperErr
+    } catch {
+        $state.failure_reason = 'capture_helper_launch_failed'
+        $state.failure_detail = $_.Exception.Message
+        $state.elapsed_s = [math]::Round($sw.Elapsed.TotalSeconds, 3)
+        return [pscustomobject]$state
+    }
+
+    $helperPid = $helper.Id
+    $breach = $null
+    $breachDetail = $null
+
+    while ($true) {
+        $exited = $true
+        try { $exited = $helper.HasExited } catch { $exited = $true }
+        if ($exited) { break }
+
+        if ($sw.Elapsed.TotalSeconds -gt $script:CaptureTimeoutSeconds) {
+            $breach = 'capture_timeout'
+            $breachDetail = "helper exceeded $($script:CaptureTimeoutSeconds) s"
+        } else {
+            # Live size enforcement, not a post-write audit.
+            $total = [int64]0
+            foreach ($f in @(Get-ChildItem -LiteralPath $capDir -File -ErrorAction SilentlyContinue)) {
+                if ($f.Length -gt $script:captureMaxFileBytes) {
+                    $breach = 'capture_file_cap_exceeded'
+                    $breachDetail = "$($f.Name) reached $($f.Length) B, cap $($script:captureMaxFileBytes) B"
+                    break
+                }
+                $total += $f.Length
+            }
+            if ($null -eq $breach -and $total -gt $script:captureMaxTotalBytes) {
+                $breach = 'capture_total_cap_exceeded'
+                $breachDetail = "$total B across the capture directory, cap $($script:captureMaxTotalBytes) B"
+            }
+        }
+
+        if ($null -ne $breach) {
+            Write-Host "::warning::capture bound breached: $breach ($breachDetail); killing the capture helper"
+            try {
+                $out = & $script:taskkill '/PID' $helperPid '/T' '/F' 2>&1
+                foreach ($line in @($out)) { Write-Note "  capture taskkill: $line" }
+            } catch {
+                Write-Note "  capture taskkill raised: $($_.Exception.Message)"
+            }
+            try { $null = $helper.WaitForExit(10000) } catch { }
+            break
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    try { $null = $helper.WaitForExit(10000) } catch { }
+    $sw.Stop()
+    $state.elapsed_s = [math]::Round($sw.Elapsed.TotalSeconds, 3)
+    try { $state.helper_exit_code = $helper.ExitCode } catch { $state.helper_exit_code = $null }
+
+    # Whatever was written stays: partial evidence is preserved, never cleaned up.
+    $files = New-Object System.Collections.Generic.List[object]
+    $total = [int64]0
+    foreach ($f in @(Get-ChildItem -LiteralPath $capDir -File -ErrorAction SilentlyContinue)) {
+        $sha = $null
+        try { $sha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } catch { }
+        $files.Add([pscustomobject]@{ name = $f.Name; bytes = $f.Length; sha256 = $sha })
+        $total += $f.Length
+    }
+    $state.files = @($files)
+    $state.total_bytes = $total
+
+    if ($null -ne $breach) {
+        $state.failure_reason = $breach
+        $state.failure_detail = $breachDetail
+        return [pscustomobject]$state
+    }
+
+    if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+        $state.failure_reason = 'capture_result_missing'
+        $state.failure_detail = "helper exited $($state.helper_exit_code) without writing $resultPath"
+        return [pscustomobject]$state
+    }
+
+    $helperResult = $null
+    try {
+        $helperResult = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+    } catch {
+        $state.failure_reason = 'capture_result_invalid'
+        $state.failure_detail = $_.Exception.Message
+        return [pscustomobject]$state
+    }
+
+    $state.suspended         = [bool]$helperResult.suspended
+    $state.suspend_method    = $helperResult.suspend_method
+    $state.suspend_confirmed = [bool]$helperResult.suspend_confirmed
+    $state.counters_stable   = [bool]$helperResult.counters_stable
+
+    if ($state.helper_exit_code -ne 0 -or -not $helperResult.completed) {
+        $state.failure_reason = if ($helperResult.failure_reason) { $helperResult.failure_reason } else { 'capture_helper_failed' }
+        $state.failure_detail = $helperResult.failure_detail
+        return [pscustomobject]$state
+    }
+    if (-not $state.suspend_confirmed -or -not $state.counters_stable) {
+        $state.failure_reason = 'suspend_unconfirmed'
+        $state.failure_detail = "$($helperResult.suspend_evidence) | $($helperResult.counters_evidence)"
+        return [pscustomobject]$state
+    }
+
+    $state.completed = $true
+    return [pscustomobject]$state
+}
+
+function Invoke-ProbeSelfCheck {
+    <#
+        Proves the summary path works BEFORE the expensive test runs.
+
+        Run 34505038713 measured both tests correctly and then died with an unhandled
+        `Argument types do not match` -- a reflection-level argument-binding failure --
+        while building or serializing the summary, losing summary.json and the job
+        summary entirely. Static reading of the crash window did not isolate the
+        throwing expression, so this does not guess at it: it runs the real code and
+        reports the line.
+
+        To be able to falsify a collection-binder failure it must use the SAME concrete
+        types the real run uses -- List[object] for results, List[string] for the two
+        string collections -- build records through New-RunRecord, and cross the real
+        Build-ProbeSummary / Build-StepSummaryLines / Write-ProbeSummary boundary
+        against a throwaway path. Synthetic arrays passed only through helpers would
+        prove nothing about the binder that actually failed.
+
+        Covers every record shape the loop can emit, with capture fields both populated
+        and null.
+
+        Returns $null on success, or a detail string naming the exception type, line
+        and stack.
+    #>
+    param([Parameter(Mandatory = $true)] [string] $ScratchPath)
+
+    try {
+        $probeResults = New-Object System.Collections.Generic.List[object]
+        $probeFailures = New-Object System.Collections.Generic.List[string]
+        $probeSkipped = New-Object System.Collections.Generic.List[string]
+
+        $syntheticCapture = [pscustomobject]@{
+            requested = $true; armed = $true; completed = $true
+            trigger_reason = 'process_private_bytes_over_capture_trigger'
+            trigger_private_bytes = [uint64]4294967296
+            tool = 'dbghelp.dll MiniDumpWriteDump'; tool_version = '10.0.26100.1'
+            suspended = $true; suspend_method = 'NtSuspendProcess'; suspend_confirmed = $true
+            elapsed_s = 1.234; total_bytes = [int64]5242880
+            files = @([pscustomobject]@{ name = 'pid-1.stacks.dmp'; bytes = [int64]5242880; sha256 = ('0' * 64) })
+            failure_reason = $null
+        }
+
+        # 1: launched, completed cleanly, no capture.
+        $probeResults.Add((New-RunRecord -Fields ([ordered]@{
+            index = 1; test = 'selfcheck-completed'; command = 'x'; executable = 'x'
+            arguments = @('a', '--exact'); launched = $true; unlaunched_class = $null
+            pid = 1234; started_utc = '2026-01-01T00:00:00.0000000Z'; ended_utc = '2026-01-01T00:00:02.0000000Z'
+            elapsed_seconds = 2.0; exit_code = 0; outcome = 'process-completed'
+            stopped_by_watchdog = $false; stop_reason = $null; stop_reason_secondary = $null
+            stop_threshold_secondary = $null; stop_observed_secondary = $null; stop_class = $null
+            stop_threshold = $null; stop_observed = $null; stop_detail = $null
+            writer_dispose_error = $null; stop_sample = $null
+            termination_requested = $false; termination_confirmed = $true
+            libtest = [pscustomobject]@{ running_count = 1; result_line = 'test result: ok. 1 passed'; passed = 1; failed = 0; ignored = 0; zero_tests_selected = $false }
+            baseline_system = [pscustomobject]@{ available_bytes = [uint64]1; committed_bytes = [uint64]2; commit_limit_bytes = [uint64]3; commit_percent = 66.667 }
+            peak_process = [pscustomobject]@{ private_bytes = [uint64]150433792; working_set_bytes = [uint64]41013248; virtual_bytes = [uint64]4531113984; thread_count = 6; handle_count = 88 }
+            system_extremes = [pscustomobject]@{ min_available_bytes = [uint64]14125879296; max_committed_bytes = [uint64]2930601984; max_commit_percent = 14.464; max_commit_percent_raw = 14.4642871 }
+            sample_count = 4; sample_interval_ms = 500; slowest_sample_s = 0.02
+            capture = $null
+            stdout_file = 'a.stdout.txt'; stderr_file = 'a.stderr.txt'; samples_file = 'a.samples.csv'
+        })))
+
+        # 2: launched, stopped by a diagnostic bound, capture completed.
+        $probeResults.Add((New-RunRecord -Fields ([ordered]@{
+            index = 2; test = 'selfcheck-diagnostic-limit'; command = 'x'; executable = 'x'
+            arguments = @('a', '--exact'); launched = $true; unlaunched_class = $null
+            pid = 5678; started_utc = '2026-01-01T00:00:00.0000000Z'; ended_utc = '2026-01-01T00:00:02.1000000Z'
+            elapsed_seconds = 2.122; exit_code = 1; outcome = 'diagnostic-limit'
+            stopped_by_watchdog = $true; stop_reason = 'process_private_bytes_over_capture_trigger'
+            stop_reason_secondary = $null; stop_threshold_secondary = $null; stop_observed_secondary = $null
+            stop_class = 'diagnostic-limit'; stop_threshold = '4294967296 bytes'; stop_observed = '10925547520 bytes private'
+            stop_detail = 'captured then terminated'; writer_dispose_error = $null; stop_sample = 5
+            termination_requested = $true; termination_confirmed = $true
+            libtest = [pscustomobject]@{ running_count = 1; result_line = $null; passed = $null; failed = $null; ignored = $null; zero_tests_selected = $false }
+            baseline_system = [pscustomobject]@{ available_bytes = [uint64]14166269952; committed_bytes = [uint64]2765869056; commit_limit_bytes = [uint64]20261367808; commit_percent = 13.651 }
+            peak_process = [pscustomobject]@{ private_bytes = [uint64]10925547520; working_set_bytes = [uint64]40591360; virtual_bytes = [uint64]15439839232; thread_count = 5; handle_count = 82 }
+            system_extremes = [pscustomobject]@{ min_available_bytes = [uint64]14112043008; max_committed_bytes = [uint64]13762150400; max_commit_percent = 67.923; max_commit_percent_raw = 67.9231122 }
+            sample_count = 5; sample_interval_ms = 500; slowest_sample_s = 0.022
+            capture = $syntheticCapture
+            stdout_file = 'b.stdout.txt'; stderr_file = 'b.stderr.txt'; samples_file = 'b.samples.csv'
+        })))
+
+        # 3: launched, harness failure with a populated secondary triplet and a
+        #    failed capture -- the densest shape the loop can produce.
+        $probeResults.Add((New-RunRecord -Fields ([ordered]@{
+            index = 3; test = 'selfcheck-harness-failure'; command = 'x'; executable = 'x'
+            arguments = @('a', '--exact'); launched = $true; unlaunched_class = $null
+            pid = 9012; started_utc = '2026-01-01T00:00:00.0000000Z'; ended_utc = '2026-01-01T00:00:03.0000000Z'
+            elapsed_seconds = 3.0; exit_code = 1; outcome = 'harness-failure'
+            stopped_by_watchdog = $false; stop_reason = 'termination_unconfirmed'
+            stop_reason_secondary = 'process_private_bytes_over_limit'
+            stop_threshold_secondary = '8589934592 bytes'; stop_observed_secondary = '10925547520 bytes private'
+            stop_class = 'harness-failure'; stop_threshold = 'tree must be confirmed gone'
+            stop_observed = 'PID 9012 not confirmed within 15000 ms'; stop_detail = 'live child'
+            writer_dispose_error = 'the process cannot access the file'; stop_sample = 5
+            termination_requested = $true; termination_confirmed = $false
+            libtest = [pscustomobject]@{ running_count = 1; result_line = $null; passed = $null; failed = $null; ignored = $null; zero_tests_selected = $false }
+            baseline_system = [pscustomobject]@{ available_bytes = [uint64]1; committed_bytes = [uint64]2; commit_limit_bytes = [uint64]3; commit_percent = 66.667 }
+            peak_process = [pscustomobject]@{ private_bytes = [uint64]10925547520; working_set_bytes = [uint64]40591360; virtual_bytes = [uint64]15439839232; thread_count = 5; handle_count = 82 }
+            system_extremes = [pscustomobject]@{ min_available_bytes = [uint64]1; max_committed_bytes = [uint64]2; max_commit_percent = 3.0; max_commit_percent_raw = 3.00001 }
+            sample_count = 5; sample_interval_ms = 500; slowest_sample_s = 0.9
+            capture = [pscustomobject]@{ requested = $true; armed = $true; completed = $false; trigger_reason = 'process_private_bytes_over_capture_trigger'; trigger_private_bytes = [uint64]4294967296; tool = 'dbghelp.dll MiniDumpWriteDump'; tool_version = '10.0.26100.1'; suspended = $false; suspend_method = 'NtSuspendProcess'; suspend_confirmed = $false; elapsed_s = 0.4; total_bytes = [int64]0; files = @(); failure_reason = 'suspend_unconfirmed' }
+            stdout_file = 'c.stdout.txt'; stderr_file = 'c.stderr.txt'; samples_file = 'c.samples.csv'
+        })))
+
+        # 4 and 5: the two unlaunched shapes, which carry nulls where the launched
+        #    shapes carry objects.
+        foreach ($pair in @(@('selfcheck-pre-launch-refusal', 'pre-launch-refusal', 'diagnostic-limit'),
+                            @('selfcheck-unlaunched-harness', 'harness-failure', 'harness-failure'))) {
+            $probeResults.Add((New-RunRecord -Fields ([ordered]@{
+                index = 0; test = $pair[0]; command = 'x'; executable = 'x'
+                arguments = @('a', '--exact'); launched = $false; unlaunched_class = $pair[1]
+                pid = $null; started_utc = $null; ended_utc = $null; elapsed_seconds = $null
+                exit_code = $null; outcome = $pair[2]; stopped_by_watchdog = $false
+                stop_reason = 'pre_launch_commit_over_ceiling'; stop_reason_secondary = $null
+                stop_threshold_secondary = $null; stop_observed_secondary = $null
+                stop_class = $pair[2]; stop_threshold = '90% of a 20261367808-byte commit limit'
+                stop_observed = '91.5% raw'; stop_detail = 'nothing was started'
+                writer_dispose_error = $null; stop_sample = $null
+                termination_requested = $false; termination_confirmed = $true
+                libtest = $null; baseline_system = $null; peak_process = $null; system_extremes = $null
+                sample_count = 0; sample_interval_ms = 500; slowest_sample_s = $null
+                capture = $null; stdout_file = $null; stderr_file = $null; samples_file = $null
+            })))
+        }
+
+        $probeFailures.Add('selfcheck synthetic harness failure entry')
+        $probeSkipped.Add('selfcheck-skipped-test')
+
+        $summary = Build-ProbeSummary -Results $probeResults -HarnessFailures $probeFailures `
+                                      -Skipped $probeSkipped -SequenceAborted $true
+        Write-ProbeSummary -Summary $summary -Path $ScratchPath
+        $lines = Build-StepSummaryLines -Summary $summary -Results $probeResults `
+                                        -HarnessFailures $probeFailures -Skipped $probeSkipped `
+                                        -SequenceAborted $true
+        $null = ($lines -join "`n")
+
+        if (-not (Test-Path -LiteralPath $ScratchPath -PathType Leaf)) {
+            return 'self-check wrote no file'
+        }
+        if ((Get-Item -LiteralPath $ScratchPath).Length -le 0) {
+            return 'self-check wrote a zero-byte summary'
+        }
+        return $null
+    } catch {
+        return ("{0}: {1} | line {2} | statement: {3} | stack: {4}" -f `
+            $_.Exception.GetType().FullName, $_.Exception.Message,
+            $_.InvocationInfo.ScriptLineNumber, ($_.InvocationInfo.Line).Trim(), $_.ScriptStackTrace)
+    }
+}
+
+function Complete-Probe {
+    <#
+        Writes summary.json and the job summary, then exits with the code the run
+        earned. EVERY terminating path after the output directory exists goes through
+        here, so an abort can never leave the artifact without a summary: losing the
+        JSON is losing the evidence the whole run exists to produce.
+    #>
+    $summaryPath = Join-Path $outDir 'summary.json'
+    $summary = Build-ProbeSummary -Results $script:results `
+                                  -HarnessFailures $script:harnessFailures `
+                                  -Skipped $script:skipped `
+                                  -SequenceAborted $script:sequenceAborted
+    Write-ProbeSummary -Summary $summary -Path $summaryPath
+    Write-Note "summary written to $summaryPath"
+
+    if ($env:GITHUB_STEP_SUMMARY) {
+        $md = Build-StepSummaryLines -Summary $summary `
+                                     -Results $script:results `
+                                     -HarnessFailures $script:harnessFailures `
+                                     -Skipped $script:skipped `
+                                     -SequenceAborted $script:sequenceAborted
         ($md -join "`n") | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
     }
 
@@ -393,6 +884,7 @@ $diagnosticLimitReasons = @(
     'discovery_pre_launch_commit_over_ceiling',
     'pre_launch_available_memory_below_floor',
     'pre_launch_commit_over_ceiling',
+    'process_private_bytes_over_capture_trigger',
     'process_private_bytes_over_limit',
     'system_available_memory_below_floor',
     'system_commit_over_ceiling',
@@ -481,7 +973,7 @@ foreach ($t in $Tests) {
         $msg = "system memory telemetry became unusable before the discovery child for '$t': $discoveryTelemetryError"
         Write-Host "::error::$msg"
         $harnessFailures.Add($msg)
-        $results.Add([pscustomobject]@{
+        $results.Add((New-RunRecord -Fields ([ordered]@{
             index                 = 0
             test                  = "(test discovery: $t)"
             command               = ('"{0}" {1} --exact --list' -f $exePath, $t)
@@ -516,11 +1008,12 @@ foreach ($t in $Tests) {
             sample_count          = 0
             sample_interval_ms    = $SampleIntervalMs
             slowest_sample_s      = $null
+            capture               = $null
             writer_dispose_error  = $null
             stdout_file           = $null
             stderr_file           = $null
             samples_file          = $null
-        })
+        })))
         $sequenceAborted = $true
         foreach ($u in $Tests) { $skipped.Add($u) }
         Complete-Probe
@@ -530,7 +1023,7 @@ foreach ($t in $Tests) {
     if ($null -ne $discoveryRefusal) {
         Write-Host "::warning::diagnostic limit before the discovery child for '$t': $($discoveryRefusal.Reason) (threshold $($discoveryRefusal.Threshold), observed $($discoveryRefusal.Observed))"
         Write-Note "  discovery child for '$t' not launched"
-        $results.Add([pscustomobject]@{
+        $results.Add((New-RunRecord -Fields ([ordered]@{
             index                 = 0
             test                  = "(test discovery: $t)"
             command               = ('"{0}" {1} --exact --list' -f $exePath, $t)
@@ -571,11 +1064,12 @@ foreach ($t in $Tests) {
             sample_count          = 0
             sample_interval_ms    = $SampleIntervalMs
             slowest_sample_s      = $null
+            capture               = $null
             writer_dispose_error  = $null
             stdout_file           = $null
             stderr_file           = $null
             samples_file          = $null
-        })
+        })))
         # This child never ran, so THIS test's selection is unverified. An unverified
         # selection cannot be launched, and a run that measured nothing must not
         # report green: abort and exit 2.
@@ -608,6 +1102,114 @@ if ($selectionErrors.Count -gt 0) {
     Complete-Probe
 }
 
+# ---------------------------------------------------------------------------
+# Pre-launch validation. Everything that can fail cheaply fails HERE, before the
+# expensive test runs. Order: summary self-check, capture tooling, symbols. Any
+# failure is a harness failure and no test is launched.
+# ---------------------------------------------------------------------------
+
+# 1. The summary path -- the failure that cost run 34505038713 its evidence.
+$scratchSummary = Join-Path $outDir 'selfcheck-summary.json'
+$selfCheckError = Invoke-ProbeSelfCheck -ScratchPath $scratchSummary
+if ($null -ne $selfCheckError) {
+    Write-Host '::error::summary self-check FAILED; refusing to launch the test'
+    Write-Host "::error::$selfCheckError"
+    # Deliberately NOT Complete-Probe: it uses the path just proven broken.
+    Write-FallbackSummary -Path (Join-Path $outDir 'summary.json') `
+                          -Reason 'summary_selfcheck_failed' -Detail $selfCheckError
+    Write-FallbackSummary -Path (Join-Path $outDir 'selfcheck-failure.json') `
+                          -Reason 'summary_selfcheck_failed' -Detail $selfCheckError
+    exit 2
+}
+Remove-Item -LiteralPath $scratchSummary -Force -ErrorAction SilentlyContinue
+Write-Note 'summary self-check passed (records, summary, job-summary lines, JSON write)'
+
+# 2. Capture tooling. The helper compiles its P/Invoke surface and reports the three
+#    preinstalled DLLs it binds. Nothing is downloaded and no process is opened.
+$captureFailures = New-Object System.Collections.Generic.List[string]
+
+if (-not (Test-Path -LiteralPath $CaptureHelperPath -PathType Leaf)) {
+    $captureFailures.Add("capture helper not found at '$CaptureHelperPath'")
+} else {
+    $captureHelperFull = (Resolve-Path -LiteralPath $CaptureHelperPath).ProviderPath
+    try { $pwshPath = (Get-Process -Id $PID).Path } catch { $pwshPath = $null }
+    if (-not $pwshPath) { $pwshPath = Join-Path $PSHOME 'pwsh.exe' }
+    if (-not (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
+        $captureFailures.Add("could not resolve the PowerShell host executable for the capture helper (tried '$pwshPath')")
+    } else {
+        $verifyDir = Join-Path $outDir 'capture-verify'
+        $null = New-Item -ItemType Directory -Force -Path $verifyDir
+        $verifyResult = Join-Path $verifyDir 'capture-verify.json'
+        try {
+            $vp = Start-Process -FilePath $pwshPath -NoNewWindow -PassThru -ArgumentList @(
+                    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                    '-File', $captureHelperFull, '-VerifyOnly',
+                    '-OutputDirectory', $verifyDir, '-ResultPath', $verifyResult) `
+                -RedirectStandardOutput (Join-Path $verifyDir 'verify.stdout.txt') `
+                -RedirectStandardError  (Join-Path $verifyDir 'verify.stderr.txt')
+            $null = $vp.WaitForExit(60000)
+            $vpExit = $null
+            try { $vpExit = $vp.ExitCode } catch { $vpExit = $null }
+            if ($vpExit -ne 0) {
+                $captureFailures.Add("capture helper -VerifyOnly exited $vpExit")
+            } elseif (-not (Test-Path -LiteralPath $verifyResult -PathType Leaf)) {
+                $captureFailures.Add('capture helper -VerifyOnly wrote no result file')
+            } else {
+                $verify = Get-Content -LiteralPath $verifyResult -Raw | ConvertFrom-Json
+                if (-not $verify.completed) {
+                    $captureFailures.Add("capture tooling unavailable: $($verify.failure_reason) $($verify.failure_detail)")
+                } else {
+                    $captureTools = @($verify.tools)
+                    foreach ($t in $captureTools) {
+                        Write-Note "capture tool      : $($t.name) $($t.version) at $($t.path)"
+                    }
+                }
+            }
+        } catch {
+            $captureFailures.Add("capture helper verification raised: $($_.Exception.Message)")
+        }
+    }
+}
+
+# 3. Symbols. A stack artifact nobody can symbolize is not worth spending the run on,
+#    so a missing, ambiguous or oversized PDB fails BEFORE the test launches.
+if ($captureFailures.Count -eq 0) {
+    $exeItem = Get-Item -LiteralPath $exePath
+    $pdbName = $exeItem.BaseName + '.pdb'
+    $pdbMatches = @(Get-ChildItem -LiteralPath $exeItem.DirectoryName -Filter $pdbName -File -ErrorAction SilentlyContinue)
+    if ($pdbMatches.Count -eq 0) {
+        $captureFailures.Add("no matching symbols: '$pdbName' is not beside the test binary")
+    } elseif ($pdbMatches.Count -ne 1) {
+        $captureFailures.Add("ambiguous symbols: $($pdbMatches.Count) files match '$pdbName'")
+    } elseif ($pdbMatches[0].Length -gt $captureMaxFileBytes) {
+        $captureFailures.Add("symbols oversized: $($pdbMatches[0].Length) B exceeds the $captureMaxFileBytes B file cap")
+    } else {
+        $pdbSha = $null
+        try { $pdbSha = (Get-FileHash -LiteralPath $pdbMatches[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() } catch { }
+        $captureSymbol = [pscustomobject]@{
+            path                  = $pdbMatches[0].FullName
+            name                  = $pdbMatches[0].Name
+            bytes                 = $pdbMatches[0].Length
+            sha256                = $pdbSha
+            matched_by            = 'exact <executable basename>.pdb adjacency'
+            linkage_authoritative = $false
+            linkage_note          = 'authoritative dump-to-PDB linkage is the CodeView signature/age record inside the minidump module list; verify offline against this PDB'
+        }
+        Write-Note "capture symbols   : $($captureSymbol.name) ($($captureSymbol.bytes) B, sha256 $($captureSymbol.sha256))"
+    }
+}
+
+if ($captureFailures.Count -gt 0) {
+    Write-Host '::error::capture readiness FAILED; refusing to launch the test'
+    foreach ($e in $captureFailures) {
+        Write-Host "::error::$e"
+        $harnessFailures.Add("capture readiness: $e")
+    }
+    $sequenceAborted = $true
+    foreach ($t in $Tests) { $skipped.Add($t) }
+    Complete-Probe
+}
+
 Write-Note "binary            : $exePath"
 Write-Note "output            : $outDir"
 Write-Note "sample interval   : $SampleIntervalMs ms"
@@ -616,6 +1218,8 @@ Write-Note "cim call bound    : $CimTimeoutSec s"
 Write-Note "private bytes cap : $PrivateBytesLimitGiB GiB"
 Write-Note "available floor   : $AvailableFloorGiB GiB"
 Write-Note "commit ceiling    : $CommitCeilingPercent %"
+Write-Note "capture trigger   : $CaptureTriggerGiB GiB private bytes (below the $PrivateBytesLimitGiB GiB kill)"
+Write-Note "capture bounds    : $CaptureTimeoutSeconds s, $CaptureMaxFileMiB MiB/file, $CaptureMaxTotalMiB MiB total"
 
 foreach ($test in $Tests) {
     $index++
@@ -655,7 +1259,7 @@ foreach ($test in $Tests) {
         Write-Note '  not launched'
         $harnessFailures.Add($msg)
         $sequenceAborted = $true
-        $results.Add([pscustomobject]@{
+        $results.Add((New-RunRecord -Fields ([ordered]@{
             index                 = $index
             test                  = $test
             command               = $commandLine
@@ -690,11 +1294,12 @@ foreach ($test in $Tests) {
             sample_count          = 0
             sample_interval_ms    = $SampleIntervalMs
             slowest_sample_s      = $null
+            capture               = $null
             writer_dispose_error  = $null
             stdout_file           = $null
             stderr_file           = $null
             samples_file          = $null
-        })
+        })))
         continue
     }
 
@@ -720,7 +1325,7 @@ foreach ($test in $Tests) {
     if ($null -ne $preLaunchReason) {
         Write-Host "::warning::diagnostic limit for '$test' BEFORE launch: $preLaunchReason (threshold $preLaunchThreshold, observed $preLaunchObserved)"
         Write-Note "  not launched"
-        $results.Add([pscustomobject]@{
+        $results.Add((New-RunRecord -Fields ([ordered]@{
             index                 = $index
             test                  = $test
             command               = $commandLine
@@ -761,11 +1366,12 @@ foreach ($test in $Tests) {
             sample_count          = 0
             sample_interval_ms    = $SampleIntervalMs
             slowest_sample_s      = $null
+            capture               = $null
             writer_dispose_error  = $null
             stdout_file           = $null
             stderr_file           = $null
             samples_file          = $null
-        })
+        })))
         continue
     }
 
@@ -797,6 +1403,7 @@ foreach ($test in $Tests) {
     $terminationConfirmed = $false
     $maxSampleSeconds = 0.0
     $writerDisposeError = $null
+    $captureState = $null
 
     # Everything from here to the finally can throw: the CSV writer can fail on a
     # full or read-only disk, Start-Process can fail, a counter read can surprise
@@ -917,6 +1524,34 @@ foreach ($test in $Tests) {
                 $startedUtc.AddSeconds($rowElapsed).ToString('o'),
                 $rowElapsed, $procId, $priv, $ws, $vm, $threads, $handles,
                 $sys.AvailableBytes, $sys.CommittedBytes, $sys.CommitLimitBytes, $sys.CommitPercent))
+
+            # (5b) Capture trigger, checked BEFORE the kill thresholds because it
+            #      sits strictly below them. The helper suspends the target before
+            #      writing anything, so growth stops here rather than racing the
+            #      capture; the private-bytes kill below stays the fail-safe.
+            if ($null -eq $captureState -and $priv -gt $captureTriggerBytes) {
+                Write-Note ("  capture trigger reached at {0:N0} B private; suspending and capturing PID {1}" -f $priv, $procId)
+                $captureState = Invoke-BoundedCapture -ProcessId $procId -PrivateBytes $priv `
+                                                      -CaptureDirectory (Join-Path $outDir "capture-$index")
+                $stopSample = $sampleCount
+                if ($captureState.completed) {
+                    $stopReason    = 'process_private_bytes_over_capture_trigger'
+                    $stopThreshold = "$captureTriggerBytes bytes ($CaptureTriggerGiB GiB private bytes, capture trigger)"
+                    $stopObserved  = "$priv bytes private"
+                    $stopDetail    = "stacks and region evidence captured in $($captureState.elapsed_s) s across $($captureState.total_bytes) B; the target was suspended and is terminated next"
+                    Write-Note ("  capture completed in {0} s, {1:N0} B across {2} files" -f `
+                        $captureState.elapsed_s, $captureState.total_bytes, @($captureState.files).Count)
+                } else {
+                    # No retry, by design. Partial evidence stays on disk, and the
+                    # existing cleanup path terminates the tree next regardless.
+                    $stopReason    = 'capture_failed'
+                    $stopThreshold = "capture must complete within $CaptureTimeoutSeconds s, $CaptureMaxFileMiB MiB/file and $CaptureMaxTotalMiB MiB total"
+                    $stopObserved  = "$($captureState.failure_reason): $($captureState.failure_detail)"
+                    $stopDetail    = 'capture failed; partial evidence preserved, not retried'
+                    Write-Host "::warning::capture failed for '$test': $($captureState.failure_reason)"
+                }
+                break
+            }
 
             # (6) Memory bounds. Every one of these has a usable reading behind it by the
             #     time control reaches here.
@@ -1170,7 +1805,7 @@ foreach ($test in $Tests) {
     Write-Note ("  peak private {0:N0} B | peak working set {1:N0} B | peak virtual {2:N0} B | peak threads {3}" -f `
         $peakPrivate, $peakWorkingSet, $peakVirtual, $peakThreads)
 
-    $results.Add([pscustomobject]@{
+    $results.Add((New-RunRecord -Fields ([ordered]@{
         index                 = $index
         test                  = $test
         command               = $commandLine
@@ -1234,10 +1869,11 @@ foreach ($test in $Tests) {
         sample_count          = $sampleCount
         sample_interval_ms    = $SampleIntervalMs
         slowest_sample_s      = [math]::Round($maxSampleSeconds, 3)
+        capture               = $captureState
         stdout_file           = Split-Path -Leaf $stdoutPath
         stderr_file           = Split-Path -Leaf $stderrPath
         samples_file          = Split-Path -Leaf $samplesPath
-    })
+    })))
 }
 
 Complete-Probe
