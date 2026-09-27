@@ -190,6 +190,32 @@ pub enum SyncError {
         cap: u64,
     },
 
+    /// The peer — or something in front of it — refused the request body as too
+    /// large (HTTP `413 Payload Too Large`).
+    ///
+    /// `sent` is the framed body length this side actually submitted. A 413
+    /// carries no trustworthy peer cap, so none is reported, and its body is
+    /// never read: the status alone classifies it.
+    ///
+    /// **Deterministic and terminal**, like [`SyncError::ChangeTooLarge`] and
+    /// [`SyncError::RequestTooLarge`]: the same body rebuilt next cycle meets
+    /// the same limit. The background loop records
+    /// [`SyncStatus::Error`](super::types::SyncStatus::Error) and stops; a
+    /// one-shot call returns it. The manager does not re-handshake — a proxy's
+    /// body limit is invisible to the peer's advertised inbound budget, so a
+    /// fresh handshake would return the same number and the loop would resume.
+    ///
+    /// Correcting it is an operator action — raise the limit that refused the
+    /// body, or lower this instance's `max_request_bytes` — after which
+    /// [`SyncManager::start`](super::manager::SyncManager::start) runs again.
+    #[error("Sync {operation:?} request of {sent} bytes was refused by the peer as too large (HTTP 413)")]
+    PeerRejectedSize {
+        /// Which request was refused.
+        operation: super::wire::WireOperation,
+        /// The framed body length that was submitted.
+        sent: u64,
+    },
+
     /// The peer refused the request with a compact structured reason.
     ///
     /// The detail is bounded on the wire
@@ -382,6 +408,14 @@ impl SyncError {
     /// [`is_change_too_large`](Self::is_change_too_large).
     pub fn is_request_too_large(&self) -> bool {
         matches!(self, Self::RequestTooLarge { .. })
+    }
+
+    /// Returns true if the peer refused a submitted body as too large (HTTP
+    /// 413) — terminal alongside
+    /// [`is_change_too_large`](Self::is_change_too_large) and
+    /// [`is_request_too_large`](Self::is_request_too_large).
+    pub fn is_peer_rejected_size(&self) -> bool {
+        matches!(self, Self::PeerRejectedSize { .. })
     }
 
     /// Returns true if a frame carried the wrong operation discriminator.

@@ -20,6 +20,30 @@
 //! about **applying** need a server-backed adapter over
 //! [`SyncServer`](super::server::SyncServer), which is what the engine and HTTP
 //! suites use.
+//!
+//! # Conformance domain
+//!
+//! Within **framing, routing, protocol version and lane paging/byte progress**
+//! the double answers exactly as a `SyncServer` over the same WAL would:
+//!
+//! - both data endpoints refuse a request whose `protocol_version` is not
+//!   [`SYNC_PROTOCOL_VERSION`] with the server's `WireErrorCode::ProtocolVersion`
+//!   reply, before any lane is read or written;
+//! - a push runs the server's own batch-metadata checks (foreign source,
+//!   sequence 0, repeated sequence) and reply-capacity preflight, in the
+//!   server's order, before the lane is written;
+//! - a pull reads at most the server's poll page of lane entries, packs the
+//!   longest ordered prefix whose **complete** reply frame fits
+//!   `min(request.reply_limit_bytes, this endpoint's receive limit)`, advances
+//!   its scan position past filtered entries only while that complete reply
+//!   still fits, and reports `has_more` from actual truncation or a full page —
+//!   never from `matching.len() > batch_size`;
+//! - a single change that cannot fit on its own is the server's typed
+//!   `ChangeTooLarge` reply, with the scan position unadvanced.
+//!
+//! Storage resolution (an entity deleted since its WAL event) and apply
+//! outcomes are outside that domain: the lane holds only what was seeded or
+//! pushed, and nothing is applied.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -28,12 +52,15 @@ use async_trait::async_trait;
 
 use super::config::DEFAULT_MAX_REQUEST_BYTES;
 use super::error::SyncError;
+use super::server::{
+    advance_scan_within_cap, preflight_reply_budget, validate_batch_metadata, PULL_PAGE_EVENT_LIMIT,
+};
 use super::transport::SyncTransport;
 use super::types::{
     HandshakeRequest, HandshakeResponse, InstanceId, PullPage, PullRequest, PushAck, PushRequest,
-    SyncChange, SyncPosition, WireErrorCode, WireReply,
+    SyncChange, SyncPosition, WireErrorCode, WireReply, WireResult,
 };
-use super::wire::{self, WireOperation};
+use super::wire::{self, WireOperation, MIN_CONTROL_FRAME_BYTES};
 use super::SYNC_PROTOCOL_VERSION;
 
 /// Per-owner WAL lanes shared between paired transports.
@@ -124,6 +151,161 @@ impl InMemorySyncTransport {
         lanes.lanes.get(&owner).cloned().unwrap_or_default()
     }
 
+    /// The server's refusal of a request declaring another protocol version,
+    /// or `None` when the version matches.
+    fn protocol_mismatch<T>(&self, declared: u32) -> Option<WireReply<T>> {
+        (declared != SYNC_PROTOCOL_VERSION).then(|| {
+            WireReply::rejected(
+                self.peer_instance_id,
+                WireErrorCode::ProtocolVersion,
+                format!(
+                    "server speaks protocol v{SYNC_PROTOCOL_VERSION}, request declared v{declared}"
+                ),
+            )
+        })
+    }
+
+    /// The server's refusals of a pull, in the server's order, before any lane
+    /// is read: protocol version, target, zero count, reply limit, cursor owner.
+    fn refuse_pull(&self, request: &PullRequest) -> Option<WireReply<PullPage>> {
+        let me = self.peer_instance_id;
+        if let Some(reply) = self.protocol_mismatch(request.protocol_version) {
+            return Some(reply);
+        }
+        if request.target_instance != me {
+            return Some(WireReply::peer_changed(me, request.target_instance));
+        }
+        if request.batch_size == 0 {
+            return Some(WireReply::rejected(
+                me,
+                WireErrorCode::InvalidRequest,
+                "pull requested zero changes",
+            ));
+        }
+        if request.reply_limit_bytes < MIN_CONTROL_FRAME_BYTES as u64 {
+            return Some(WireReply::rejected(
+                me,
+                WireErrorCode::InvalidRequest,
+                format!(
+                    "pull declared a {}-byte reply limit, below the \
+                     {MIN_CONTROL_FRAME_BYTES}-byte control minimum",
+                    request.reply_limit_bytes
+                ),
+            ));
+        }
+        if request.cursor.instance_id != me {
+            return Some(WireReply::rejected(
+                me,
+                WireErrorCode::InvalidRequest,
+                format!(
+                    "pull cursor names WAL owner {} but this instance is {me}",
+                    request.cursor.instance_id
+                ),
+            ));
+        }
+        None
+    }
+
+    /// The lane standing in for the WAL: the next poll page of entries after
+    /// `after`, in sequence order, whatever a filter will make of them.
+    fn poll_page(&self, after: u64) -> Vec<SyncChange> {
+        let lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut page: Vec<SyncChange> = lanes
+            .lanes
+            .get(&self.peer_instance_id)
+            .map(|lane| {
+                lane.iter()
+                    .filter(|c| c.sequence > after)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        page.sort_by_key(|c| c.sequence);
+        page.truncate(PULL_PAGE_EVENT_LIMIT);
+        page
+    }
+
+    /// Answers a decoded pull exactly as `SyncServer::handle_pull` answers the
+    /// same WAL: the same checks in the same order, the same poll page, and the
+    /// same complete-frame packing through the same sizing helpers.
+    fn serve_pull(&self, request: &PullRequest) -> Result<WireReply<PullPage>, SyncError> {
+        let me = self.peer_instance_id;
+        if let Some(reply) = self.refuse_pull(request) {
+            return Ok(reply);
+        }
+        let batch_size = usize::try_from(request.batch_size).unwrap_or(usize::MAX);
+        let reply_cap = usize::try_from(request.reply_limit_bytes)
+            .unwrap_or(usize::MAX)
+            .min(self.receive_limit_bytes);
+
+        let page = self.poll_page(request.cursor.sequence);
+
+        let envelope_at = |scan: u64| -> Result<usize, SyncError> {
+            wire::encoded_len(&WireReply::ok(
+                me,
+                PullPage {
+                    changes: Vec::new(),
+                    has_more: true,
+                    scan_position: SyncPosition::new(me, scan),
+                },
+            ))
+        };
+        let mut sizer = wire::FrameSizer::new(envelope_at(request.cursor.sequence)?);
+        let mut changes: Vec<SyncChange> = Vec::new();
+        let mut scanned = request.cursor.sequence;
+        let mut truncated = false;
+        let polled = page.len();
+
+        for change in page {
+            let excluded = request
+                .collectives
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&change.collective_id));
+            if excluded {
+                if !advance_scan_within_cap(&mut sizer, &mut scanned, change.sequence, reply_cap)? {
+                    truncated = true;
+                    break;
+                }
+                continue;
+            }
+            if changes.len() >= batch_size {
+                truncated = true;
+                break;
+            }
+            let mut candidate = sizer;
+            candidate.rebase(envelope_at(change.sequence)?);
+            let item = wire::item_len(&change)?;
+            if candidate.len_with(item) > reply_cap {
+                if changes.is_empty() && scanned <= request.cursor.sequence {
+                    return Ok(WireReply {
+                        protocol_version: SYNC_PROTOCOL_VERSION,
+                        responder: me,
+                        result: WireResult::ChangeTooLarge {
+                            sequence: change.sequence,
+                            needed: candidate.len_with(item) as u64,
+                            cap: reply_cap as u64,
+                        },
+                    });
+                }
+                truncated = true;
+                break;
+            }
+            candidate.push(item);
+            sizer = candidate;
+            scanned = change.sequence;
+            changes.push(change);
+        }
+
+        Ok(WireReply::ok(
+            me,
+            PullPage {
+                changes,
+                has_more: truncated || polled >= PULL_PAGE_EVENT_LIMIT,
+                scan_position: SyncPosition::new(me, scanned),
+            },
+        ))
+    }
+
     /// Round-trips a REQUEST through the real frame codec, honestly split by
     /// direction.
     ///
@@ -199,27 +381,23 @@ impl SyncTransport for InMemorySyncTransport {
         let request: PushRequest =
             self.round_trip_request(WireOperation::Push, &request, send_budget_bytes)?;
 
-        // Route FIRST: a batch addressed to somebody else is not this peer's to
+        if let Some(reply) = self.protocol_mismatch(request.protocol_version) {
+            return self.round_trip_reply(WireOperation::Push, &reply);
+        }
+        // Route next: a batch addressed to somebody else is not this peer's to
         // record, so nothing is written.
         if request.target_instance != self.peer_instance_id {
             let reply = WireReply::peer_changed(self.peer_instance_id, request.target_instance);
             return self.round_trip_reply(WireOperation::Push, &reply);
         }
-        if let Some(foreign) = request
-            .changes
-            .iter()
-            .find(|c| c.source_instance != request.source_instance)
-        {
-            let reply = WireReply::rejected(
-                self.peer_instance_id,
-                WireErrorCode::InvalidRequest,
-                format!(
-                    "change {} claims source {} but the request declares {}",
-                    foreign.sequence, foreign.source_instance, request.source_instance
-                ),
-            );
+        // Then the server's own batch-metadata and reply-capacity checks, in
+        // its order, before the lane is touched.
+        if let Err(detail) = validate_batch_metadata(&request) {
+            let reply =
+                WireReply::rejected(self.peer_instance_id, WireErrorCode::InvalidRequest, detail);
             return self.round_trip_reply(WireOperation::Push, &reply);
         }
+        preflight_reply_budget(request.reply_limit_bytes, self.receive_limit_bytes)?;
 
         let total = request.changes.len() as u64;
         let safe_through = request.changes.iter().map(|c| c.sequence).max();
@@ -253,59 +431,7 @@ impl SyncTransport for InMemorySyncTransport {
     ) -> Result<WireReply<PullPage>, SyncError> {
         let request: PullRequest =
             self.round_trip_request(WireOperation::Pull, &request, send_budget_bytes)?;
-
-        if request.target_instance != self.peer_instance_id {
-            let reply = WireReply::peer_changed(self.peer_instance_id, request.target_instance);
-            return self.round_trip_reply(WireOperation::Pull, &reply);
-        }
-        if request.batch_size == 0 {
-            let reply = WireReply::rejected(
-                self.peer_instance_id,
-                WireErrorCode::InvalidRequest,
-                "pull requested zero changes",
-            );
-            return self.round_trip_reply(WireOperation::Pull, &reply);
-        }
-
-        let after_seq = request.cursor.sequence;
-        let batch_size = usize::try_from(request.batch_size).unwrap_or(usize::MAX);
-
-        let mut matching: Vec<SyncChange> = {
-            let lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
-            lanes
-                .lanes
-                .get(&self.peer_instance_id)
-                .map(|lane| {
-                    lane.iter()
-                        .filter(|c| c.sequence > after_seq)
-                        .filter(|c| {
-                            request
-                                .collectives
-                                .as_ref()
-                                .is_none_or(|ids| ids.contains(&c.collective_id))
-                        })
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        matching.sort_by_key(|c| c.sequence);
-
-        let has_more = matching.len() > batch_size;
-        let changes: Vec<SyncChange> = matching.into_iter().take(batch_size).collect();
-        // The scan position belongs to the emitted prefix, never to some eager
-        // end position: this lane scanned exactly as far as its last emitted
-        // change.
-        let scanned = changes.last().map_or(after_seq, |c| c.sequence);
-
-        let reply = WireReply::ok(
-            self.peer_instance_id,
-            PullPage {
-                changes,
-                has_more,
-                scan_position: SyncPosition::new(self.peer_instance_id, scanned),
-            },
-        );
+        let reply = self.serve_pull(&request)?;
         self.round_trip_reply(WireOperation::Pull, &reply)
     }
 

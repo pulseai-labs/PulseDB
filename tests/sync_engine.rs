@@ -19,9 +19,17 @@ use common::{
     copy_fixture, fixtures_dir, server_for, server_for_with, sync_both_ways, ServerBackedTransport,
 };
 use pulsedb::sync::config::{ConflictResolution, SyncConfig, SyncDirection};
+use pulsedb::sync::error::SyncError;
 use pulsedb::sync::manager::SyncManager;
+use pulsedb::sync::server::SyncServer;
+use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_mem::InMemorySyncTransport;
+use pulsedb::sync::types::{
+    InstanceId, PullPage, PullRequest, PushRequest, SyncChange, SyncPosition, WireErrorCode,
+    WireReply, WireResult,
+};
 use pulsedb::sync::SyncStatus;
+use pulsedb::sync::{wire, SYNC_PROTOCOL_VERSION};
 use pulsedb::{
     CollectiveId, Config, ExperienceId, ExperienceUpdate, InsightType, NewDerivedInsight,
     NewExperience, NewExperienceRelation, PulseDB, RelationType,
@@ -3423,4 +3431,910 @@ async fn recovery_v5_oversized_change_is_not_reclassified_as_request_too_large()
         1,
         "the oversized change keeps its cursor unadvanced"
     );
+}
+
+// ============================================================================
+// PR #88 completion C2 — the in-memory transport is a conformance adapter
+// (T5, T7, and #90's double-side half)
+//
+// The double holds no database and applies nothing, so conformance is bounded
+// to framing, routing, protocol version and materialized-lane paging/byte
+// progress. Within that domain it must match a real `SyncServer` exactly;
+// storage resolution and apply outcomes stay server-backed.
+// ============================================================================
+
+const WIDE_CAP: usize = 64 * 1024 * 1024;
+
+/// Every change `server` holds, in WAL order, re-owned by `owner` — the lane an
+/// `InMemorySyncTransport` answering as `owner` serves for the same WAL.
+fn materialize_lane(server: &SyncServer, owner: InstanceId) -> Vec<SyncChange> {
+    let page = server
+        .handle_pull(PullRequest {
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            source_instance: InstanceId::new(),
+            target_instance: server.instance_id(),
+            cursor: SyncPosition::new(server.instance_id(), 0),
+            batch_size: 10_000,
+            reply_limit_bytes: u64::MAX,
+            collectives: None,
+        })
+        .unwrap()
+        .into_result(server.instance_id())
+        .unwrap();
+    assert!(!page.has_more, "the fixture must fit one poll page");
+    page.changes
+        .into_iter()
+        .map(|mut change| {
+            change.source_instance = owner;
+            change
+        })
+        .collect()
+}
+
+fn completion_pull(
+    target: InstanceId,
+    from: u64,
+    cap: usize,
+    collectives: Option<Vec<CollectiveId>>,
+) -> PullRequest {
+    PullRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        source_instance: InstanceId::new(),
+        target_instance: target,
+        cursor: SyncPosition::new(target, from),
+        batch_size: 500,
+        reply_limit_bytes: cap as u64,
+        collectives,
+    }
+}
+
+/// What a pull reply says, stripped of the responder's identity so a double
+/// and a server answering as different ids can be compared field for field.
+#[derive(Debug, PartialEq)]
+enum PullShape {
+    Page {
+        sequences: Vec<u64>,
+        has_more: bool,
+        scan: u64,
+    },
+    ChangeTooLarge {
+        sequence: u64,
+        needed: u64,
+        cap: u64,
+    },
+    Rejected {
+        code: WireErrorCode,
+        detail: String,
+    },
+    PeerChanged,
+    Failed(String),
+}
+
+fn pull_shape(reply: Result<WireReply<PullPage>, SyncError>) -> PullShape {
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(e) => return PullShape::Failed(format!("{e:?}")),
+    };
+    match reply.result {
+        WireResult::Ok(page) => {
+            assert_eq!(page.scan_position.instance_id, reply.responder);
+            PullShape::Page {
+                sequences: page.changes.iter().map(|c| c.sequence).collect(),
+                has_more: page.has_more,
+                scan: page.scan_position.sequence,
+            }
+        }
+        WireResult::ChangeTooLarge {
+            sequence,
+            needed,
+            cap,
+        } => PullShape::ChangeTooLarge {
+            sequence,
+            needed,
+            cap,
+        },
+        WireResult::Rejected { code, detail } => PullShape::Rejected { code, detail },
+        WireResult::PeerChanged { .. } => PullShape::PeerChanged,
+    }
+}
+
+/// A real server over `db` and a double serving the same WAL as its lane, both
+/// under the endpoint policy `cap`.
+struct ParityPair {
+    server: Arc<SyncServer>,
+    double: InMemorySyncTransport,
+}
+
+impl ParityPair {
+    fn over(db: &Arc<PulseDB>, cap: usize) -> Self {
+        let server = server_for_with(
+            db,
+            SyncConfig {
+                max_request_bytes: cap,
+                ..SyncConfig::default()
+            },
+        );
+        let (_, double) = InMemorySyncTransport::new_pair();
+        let double = double.with_receive_limit_bytes(cap);
+        double.seed(materialize_lane(&server_for(db), double.instance_id()));
+        Self { server, double }
+    }
+
+    async fn pull(
+        &self,
+        from: u64,
+        cap: usize,
+        collectives: Option<Vec<CollectiveId>>,
+    ) -> (PullShape, PullShape) {
+        let server = pull_shape(self.server.handle_pull(completion_pull(
+            self.server.instance_id(),
+            from,
+            cap,
+            collectives.clone(),
+        )));
+        let double = pull_shape(
+            self.double
+                .pull_changes(
+                    completion_pull(self.double.instance_id(), from, cap, collectives),
+                    cap,
+                )
+                .await,
+        );
+        (server, double)
+    }
+}
+
+/// A store whose WAL is `count` collective creates, sequences `1..=count`.
+fn collectives_db(count: usize) -> (Arc<PulseDB>, tempfile::TempDir, Vec<CollectiveId>) {
+    let (db, dir) = open_db();
+    let ids = (0..count)
+        .map(|i| db.create_collective(&format!("lane-{i}")).unwrap())
+        .collect();
+    assert_eq!(db.get_current_sequence().unwrap(), count as u64);
+    (db, dir, ids)
+}
+
+/// A store whose sequence 2 is one experience too large for a 4 KiB body.
+fn oversized_db() -> (Arc<PulseDB>, tempfile::TempDir) {
+    let (db, dir) = open_db();
+    let cid = db.create_collective("oversized").unwrap(); // seq 1
+    db.record_experience(NewExperience {
+        collective_id: cid,
+        content: "x".repeat(8 * 1024),
+        embedding: Some(vec![0.1f32; 384]),
+        ..Default::default()
+    })
+    .unwrap(); // seq 2
+    (db, dir)
+}
+
+const OVERSIZE_CAP: usize = 4 * 1024;
+
+/// T7: a push declaring another protocol version is refused with
+/// `ProtocolVersion` before the double records anything.
+#[tokio::test]
+async fn recovery_completion_mem_protocol_mismatch_push_has_no_side_effect() {
+    let (db, _dir, _) = collectives_db(3);
+    let (_, double) = InMemorySyncTransport::new_pair();
+    let source = InstanceId::new();
+    let changes = materialize_lane(&server_for(&db), source);
+
+    let reply = double
+        .push_changes(
+            PushRequest {
+                protocol_version: SYNC_PROTOCOL_VERSION - 1,
+                source_instance: source,
+                target_instance: double.instance_id(),
+                reply_limit_bytes: WIDE_CAP as u64,
+                changes,
+            },
+            WIDE_CAP,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            reply.result,
+            WireResult::Rejected {
+                code: WireErrorCode::ProtocolVersion,
+                ..
+            }
+        ),
+        "a non-v5 push must be refused as a protocol mismatch, got {:?}",
+        reply.result
+    );
+    assert!(
+        double.received(source).is_empty(),
+        "the refused push must not write the lane"
+    );
+}
+
+/// T7, pull side: a non-v5 pull is refused before the lane is read.
+#[tokio::test]
+async fn recovery_completion_mem_protocol_mismatch_pull_has_no_side_effect() {
+    let (db, _dir, _) = collectives_db(3);
+    let (_, double) = InMemorySyncTransport::new_pair();
+    let lane = materialize_lane(&server_for(&db), double.instance_id());
+    double.seed(lane.clone());
+
+    let mut request = completion_pull(double.instance_id(), 0, WIDE_CAP, None);
+    request.protocol_version = SYNC_PROTOCOL_VERSION - 1;
+    let shape = pull_shape(double.pull_changes(request, WIDE_CAP).await);
+    assert!(
+        matches!(
+            shape,
+            PullShape::Rejected {
+                code: WireErrorCode::ProtocolVersion,
+                ..
+            }
+        ),
+        "a non-v5 pull must be refused as a protocol mismatch, got {shape:?}"
+    );
+    assert_eq!(
+        double.received(double.instance_id()).len(),
+        lane.len(),
+        "the lane is untouched"
+    );
+}
+
+/// The identical non-v5 request, to the double and to a real server, yields the
+/// identical refusal on both data endpoints.
+#[tokio::test]
+async fn recovery_completion_mem_protocol_error_matches_server() {
+    let (db, _dir, _) = collectives_db(1);
+    let pair = ParityPair::over(&db, WIDE_CAP);
+    let old = SYNC_PROTOCOL_VERSION - 1;
+
+    let mut pull = completion_pull(pair.server.instance_id(), 0, WIDE_CAP, None);
+    pull.protocol_version = old;
+    let server_pull = pull_shape(pair.server.handle_pull(pull));
+    let mut pull = completion_pull(pair.double.instance_id(), 0, WIDE_CAP, None);
+    pull.protocol_version = old;
+    let double_pull = pull_shape(pair.double.pull_changes(pull, WIDE_CAP).await);
+    assert!(matches!(
+        server_pull,
+        PullShape::Rejected {
+            code: WireErrorCode::ProtocolVersion,
+            ..
+        }
+    ));
+    assert_eq!(double_pull, server_pull, "pull refusals must match");
+
+    let push = |target: InstanceId| PushRequest {
+        protocol_version: old,
+        source_instance: InstanceId::new(),
+        target_instance: target,
+        reply_limit_bytes: WIDE_CAP as u64,
+        changes: Vec::new(),
+    };
+    let server_push = pair
+        .server
+        .handle_push(push(pair.server.instance_id()))
+        .unwrap()
+        .result;
+    let double_push = pair
+        .double
+        .push_changes(push(pair.double.instance_id()), WIDE_CAP)
+        .await
+        .unwrap()
+        .result;
+    match (server_push, double_push) {
+        (
+            WireResult::Rejected {
+                code: server_code,
+                detail: server_detail,
+            },
+            WireResult::Rejected {
+                code: double_code,
+                detail: double_detail,
+            },
+        ) => {
+            assert_eq!(server_code, WireErrorCode::ProtocolVersion);
+            assert_eq!(double_code, server_code);
+            assert_eq!(double_detail, server_detail);
+        }
+        other => panic!("both must refuse the non-v5 push, got {other:?}"),
+    }
+}
+
+/// T5: several changes that each fit, but not together, produce the fitting
+/// PREFIX — not a whole-page `PayloadTooLarge` — and paging through the double
+/// delivers every one of them in order.
+#[tokio::test]
+async fn recovery_completion_mem_packs_fitting_prefix() {
+    let (db, _dir, _) = collectives_db(40);
+    let cap = pulsedb::sync::MIN_CONTROL_FRAME_BYTES;
+    let pair = ParityPair::over(&db, cap);
+
+    let (server, double) = pair.pull(0, cap, None).await;
+    let PullShape::Page {
+        sequences,
+        has_more,
+        scan,
+    } = &double
+    else {
+        panic!("a fitting prefix must be served, got {double:?}");
+    };
+    assert!(
+        !sequences.is_empty() && sequences.len() < 40,
+        "a strict, non-empty prefix: {sequences:?}"
+    );
+    assert!(*has_more, "the omitted changes are reported as more");
+    assert_eq!(
+        *scan,
+        *sequences.last().unwrap(),
+        "the scan stops at the prefix"
+    );
+    assert_eq!(double, server, "the prefix is the server's prefix");
+
+    let mut delivered = sequences.clone();
+    let mut from = *scan;
+    for _ in 0..40 {
+        let (server, double) = pair.pull(from, cap, None).await;
+        assert_eq!(double, server, "every page matches the server's");
+        let PullShape::Page {
+            sequences,
+            has_more,
+            scan,
+        } = double
+        else {
+            panic!("got {double:?}");
+        };
+        assert!(scan > from, "every page makes progress");
+        delivered.extend(sequences);
+        from = scan;
+        if !has_more {
+            break;
+        }
+    }
+    assert_eq!(delivered, (1..=40).collect::<Vec<u64>>());
+}
+
+/// T5: one change that cannot fit on its own follows the server's typed
+/// `ChangeTooLarge` path, and a manager over the double leaves its pull cursor
+/// where it was.
+#[tokio::test]
+async fn recovery_completion_mem_single_change_too_large_does_not_advance() {
+    let (db, _dir) = oversized_db();
+    let pair = ParityPair::over(&db, OVERSIZE_CAP);
+
+    let (server, double) = pair.pull(1, OVERSIZE_CAP, None).await;
+    assert!(
+        matches!(double, PullShape::ChangeTooLarge { sequence: 2, .. }),
+        "got {double:?}"
+    );
+    assert_eq!(double, server);
+
+    let (client, _client_dir) = open_db();
+    let peer = pair.double.instance_id();
+    let mut manager = SyncManager::new(
+        Arc::clone(&client),
+        Box::new(pair.double.clone()),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..SyncConfig::default()
+        },
+    )
+    .unwrap();
+    manager
+        .sync_once()
+        .await
+        .expect("the collective in front of it fits");
+    let err = manager
+        .sync_once()
+        .await
+        .expect_err("the experience cannot fit on its own");
+    assert!(
+        matches!(err, SyncError::ChangeTooLarge { sequence: 2, .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        client
+            .storage_for_test()
+            .load_sync_cursor(&peer)
+            .unwrap()
+            .unwrap()
+            .pull_sequence,
+        1,
+        "the cursor stays below the change that cannot be served"
+    );
+    assert!(matches!(manager.status(), SyncStatus::Error(_)));
+}
+
+/// Counts every pull a manager issues through the double and refuses a cursor
+/// it has already asked for — the loop that would repeat forever is stopped by
+/// the tripwire and reported, never waited out.
+struct CursorTripwire {
+    inner: InMemorySyncTransport,
+    cursors: Arc<std::sync::Mutex<Vec<u64>>>,
+    max_calls: usize,
+}
+
+#[async_trait::async_trait]
+impl SyncTransport for CursorTripwire {
+    async fn handshake(
+        &self,
+        request: pulsedb::sync::types::HandshakeRequest,
+        send_budget_bytes: usize,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, SyncError> {
+        self.inner.handshake(request, send_budget_bytes).await
+    }
+
+    async fn push_changes(
+        &self,
+        request: PushRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<pulsedb::sync::types::PushAck>, SyncError> {
+        self.inner.push_changes(request, send_budget_bytes).await
+    }
+
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        {
+            let mut cursors = self.cursors.lock().unwrap();
+            let from = request.cursor.sequence;
+            if cursors.contains(&from) {
+                return Err(SyncError::transport(format!(
+                    "tripwire: cursor {from} requested twice"
+                )));
+            }
+            if cursors.len() >= self.max_calls {
+                return Err(SyncError::transport("tripwire: pull budget exhausted"));
+            }
+            cursors.push(from);
+        }
+        self.inner.pull_changes(request, send_budget_bytes).await
+    }
+
+    async fn health_check(&self) -> Result<(), SyncError> {
+        self.inner.health_check().await
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        self.inner.receive_limit_bytes()
+    }
+}
+
+/// T5 through the public manager: under a receive limit that holds only part of
+/// the lane, `initial_sync` over the double pages forward exactly as it does
+/// over HTTP, never re-requesting a cursor.
+#[tokio::test]
+async fn recovery_completion_mem_manager_advances_under_small_cap() {
+    let (db, _dir, ids) = collectives_db(40);
+    let pair = ParityPair::over(&db, pulsedb::sync::MIN_CONTROL_FRAME_BYTES);
+    let cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let (client, _client_dir) = open_db();
+    let mut manager = SyncManager::new(
+        Arc::clone(&client),
+        Box::new(CursorTripwire {
+            inner: pair.double.clone(),
+            cursors: Arc::clone(&cursors),
+            max_calls: ids.len() + 1,
+        }),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..SyncConfig::default()
+        },
+    )
+    .unwrap();
+
+    manager
+        .initial_sync(None)
+        .await
+        .expect("the manager pages forward under the small cap");
+
+    let cursors = cursors.lock().unwrap().clone();
+    assert!(
+        cursors.len() > 1,
+        "the cap must force more than one page, got {cursors:?}"
+    );
+    assert!(
+        cursors.windows(2).all(|w| w[0] < w[1]),
+        "every pull advances: {cursors:?}"
+    );
+    let missing = ids
+        .iter()
+        .filter(|id| client.get_collective(**id).unwrap().is_none())
+        .count();
+    assert_eq!(missing, 0, "every change arrives");
+    assert_eq!(manager.status(), SyncStatus::Idle);
+}
+
+/// The four-shape parity table: `(changes, has_more, scan_position, error)`
+/// from the double and from a real server over the same WAL.
+#[tokio::test]
+async fn recovery_completion_mem_server_parity_table() {
+    // ─── 1. Empty lane ──────────────────────────────────────────────
+    let (db, _d1) = open_db();
+    assert_eq!(db.get_current_sequence().unwrap(), 0);
+    let (server, double) = ParityPair::over(&db, WIDE_CAP)
+        .pull(0, WIDE_CAP, None)
+        .await;
+    assert_eq!(
+        server,
+        PullShape::Page {
+            sequences: vec![],
+            has_more: false,
+            scan: 0
+        }
+    );
+    assert_eq!(double, server, "empty lane");
+
+    // ─── 2. Fully filtered page, its scan crossing the 127 → 128 varint
+    //     width, so a reply that omitted the scan metadata is visible ──
+    let (db, _d2, _) = collectives_db(200);
+    let (server, double) = ParityPair::over(&db, WIDE_CAP)
+        .pull(0, WIDE_CAP, Some(vec![CollectiveId::new()]))
+        .await;
+    assert_eq!(
+        server,
+        PullShape::Page {
+            sequences: vec![],
+            has_more: false,
+            scan: 200
+        }
+    );
+    assert!(wire::varint_len(200) > wire::varint_len(0));
+    assert_eq!(double, server, "fully filtered page");
+
+    // ─── 3. Filtered tail behind a fitting prefix. The cap IS the prefix's
+    //     own frame, so walking the filtered run from 127 to 128 widens
+    //     the scan varint past it: the scan must hold at 127 ──────────
+    let (db, _d3) = open_db();
+    let kept = db.create_collective("kept").unwrap(); // seq 1
+    let dropped = db.create_collective("dropped").unwrap(); // seq 2
+    for _ in 0..10 {
+        db.record_experience(minimal_exp(kept)).unwrap(); // seq 3..=12
+    }
+    let probe = server_for(&db);
+    let prefix = probe
+        .handle_pull(completion_pull(
+            probe.instance_id(),
+            0,
+            WIDE_CAP,
+            Some(vec![kept]),
+        ))
+        .unwrap()
+        .into_result(probe.instance_id())
+        .unwrap();
+    let cap = wire::encoded_len(&WireReply::ok(
+        probe.instance_id(),
+        PullPage {
+            changes: prefix.changes.clone(),
+            has_more: true,
+            scan_position: SyncPosition::new(probe.instance_id(), 12),
+        },
+    ))
+    .unwrap();
+    for _ in 0..118 {
+        db.record_experience(minimal_exp(dropped)).unwrap(); // seq 13..=130
+    }
+    db.record_experience(minimal_exp(kept)).unwrap(); // seq 131
+    let (server, double) = ParityPair::over(&db, cap)
+        .pull(0, cap, Some(vec![kept]))
+        .await;
+    let mut expected: Vec<u64> = vec![1];
+    expected.extend(3..=12);
+    assert_eq!(
+        server,
+        PullShape::Page {
+            sequences: expected,
+            has_more: true,
+            scan: 127
+        }
+    );
+    assert_eq!(double, server, "filtered tail behind a fitting prefix");
+
+    // ─── 4. One oversized change ────────────────────────────────────
+    let (db, _d4) = oversized_db();
+    let (server, double) = ParityPair::over(&db, OVERSIZE_CAP)
+        .pull(1, OVERSIZE_CAP, None)
+        .await;
+    assert!(
+        matches!(server, PullShape::ChangeTooLarge { sequence: 2, .. }),
+        "got {server:?}"
+    );
+    assert_eq!(double, server, "one oversized change");
+}
+
+// ============================================================================
+// PR #88 completion C3 — `SyncStatus` is current activity: a one-shot
+// `initial_sync` that has returned is never still `Syncing` (T6)
+// ============================================================================
+
+/// Handshakes once, then answers every pull as a DIFFERENT instance and refuses
+/// every later handshake — the endpoint was replaced by something unreachable.
+struct ReplacedThenUnreachable {
+    peer: InstanceId,
+    handshakes: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SyncTransport for ReplacedThenUnreachable {
+    async fn handshake(
+        &self,
+        _request: pulsedb::sync::types::HandshakeRequest,
+        _send_budget_bytes: usize,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, SyncError> {
+        if self
+            .handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return Err(SyncError::transport("the replacement is unreachable"));
+        }
+        Ok(pulsedb::sync::types::HandshakeResponse {
+            instance_id: self.peer,
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            accepted: true,
+            reason: None,
+            receive_limit_bytes: WIDE_CAP as u64,
+        })
+    }
+
+    async fn push_changes(
+        &self,
+        _request: PushRequest,
+        _send_budget_bytes: usize,
+    ) -> Result<WireReply<pulsedb::sync::types::PushAck>, SyncError> {
+        unreachable!("initial_sync never pushes");
+    }
+
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        _send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        Ok(WireReply::peer_changed(
+            InstanceId::new(),
+            request.target_instance,
+        ))
+    }
+
+    async fn health_check(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        WIDE_CAP
+    }
+}
+
+/// The endpoint changes identity mid-catch-up and the re-handshake fails: the
+/// error is returned and the manager is idle, not wedged in `Syncing`.
+#[tokio::test]
+async fn recovery_completion_initial_sync_rebind_error_returns_idle() {
+    let (db, _dir) = open_db();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(ReplacedThenUnreachable {
+            peer: InstanceId::new(),
+            handshakes: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        SyncConfig {
+            direction: SyncDirection::PullOnly,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    let err = manager
+        .initial_sync(None)
+        .await
+        .expect_err("the replacement cannot be re-established");
+    assert!(
+        matches!(err, SyncError::Transport(ref m) if m.contains("unreachable")),
+        "the re-handshake's own error is returned unchanged, got {err:?}"
+    );
+    assert_eq!(
+        manager.status(),
+        SyncStatus::Idle,
+        "a returned one-shot is not still syncing"
+    );
+}
+
+/// A change that fails to apply ends the catch-up with the typed incomplete
+/// error — and the manager is idle when it is returned.
+#[tokio::test]
+async fn recovery_completion_initial_sync_apply_error_returns_idle() {
+    let (db, _dir) = open_db();
+    let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let collective = CollectiveId::new();
+    let page = vec![
+        collective_change(1, collective, "apply-error"),
+        poison_change(2, collective),
+    ];
+    let mut manager = catchup_manager(&db, InstanceId::new(), &pulls, page, false);
+
+    let err = manager
+        .initial_sync(None)
+        .await
+        .expect_err("a change that never applied is not a completed catch-up");
+    assert!(err.is_catch_up_incomplete(), "got {err:?}");
+    assert_eq!(
+        manager.status(),
+        SyncStatus::Idle,
+        "a returned one-shot is not still syncing"
+    );
+}
+
+// ============================================================================
+// PR #88 completion follow-up F1 — the double's push refuses what
+// `SyncServer::handle_push` refuses, before any lane side effect; F2(b) —
+// `SyncManager::new` refuses an invalid configuration
+// ============================================================================
+
+/// What a push reply says, stripped of the responder's identity.
+#[derive(Debug, PartialEq)]
+enum PushShape {
+    Accepted(u64),
+    Rejected { code: WireErrorCode, detail: String },
+    Other(String),
+}
+
+fn push_shape(reply: Result<WireReply<pulsedb::sync::types::PushAck>, SyncError>) -> PushShape {
+    match reply {
+        Ok(WireReply {
+            result: WireResult::Ok(ack),
+            ..
+        }) => PushShape::Accepted(ack.accepted),
+        Ok(WireReply {
+            result: WireResult::Rejected { code, detail },
+            ..
+        }) => PushShape::Rejected { code, detail },
+        Ok(other) => PushShape::Other(format!("{:?}", other.result)),
+        Err(e) => PushShape::Other(format!("{e:?}")),
+    }
+}
+
+/// One real change owned by `source`, at WAL sequence 1.
+fn one_change(source: InstanceId) -> (SyncChange, tempfile::TempDir) {
+    let (db, dir, _) = collectives_db(1);
+    let mut lane = materialize_lane(&server_for(&db), source);
+    (lane.remove(0), dir)
+}
+
+fn push_to(target: InstanceId, source: InstanceId, changes: Vec<SyncChange>) -> PushRequest {
+    PushRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        source_instance: source,
+        target_instance: target,
+        reply_limit_bytes: WIDE_CAP as u64,
+        changes,
+    }
+}
+
+/// A batch naming one sequence twice is refused as the server refuses it, and
+/// the double's lane is left untouched.
+#[tokio::test]
+async fn recovery_completion_mem_duplicate_sequence_push_is_rejected_without_side_effect() {
+    let (_, double) = InMemorySyncTransport::new_pair();
+    let source = InstanceId::new();
+    let (change, _dir) = one_change(source);
+
+    let shape = push_shape(
+        double
+            .push_changes(
+                push_to(double.instance_id(), source, vec![change.clone(), change]),
+                WIDE_CAP,
+            )
+            .await,
+    );
+    assert!(
+        matches!(
+            shape,
+            PushShape::Rejected {
+                code: WireErrorCode::InvalidRequest,
+                ref detail
+            } if detail.contains("more than once")
+        ),
+        "a duplicate sequence must be refused as invalid, got {shape:?}"
+    );
+    assert!(
+        double.received(source).is_empty(),
+        "the refused push must not write the lane"
+    );
+}
+
+/// A change at sequence 0 — below the first WAL sequence — is refused, and the
+/// double's lane is left untouched.
+#[tokio::test]
+async fn recovery_completion_mem_zero_sequence_push_is_rejected_without_side_effect() {
+    let (_, double) = InMemorySyncTransport::new_pair();
+    let source = InstanceId::new();
+    let (mut change, _dir) = one_change(source);
+    change.sequence = 0;
+
+    let shape = push_shape(
+        double
+            .push_changes(
+                push_to(double.instance_id(), source, vec![change]),
+                WIDE_CAP,
+            )
+            .await,
+    );
+    assert!(
+        matches!(
+            shape,
+            PushShape::Rejected {
+                code: WireErrorCode::InvalidRequest,
+                ref detail
+            } if detail.contains("sequence 0")
+        ),
+        "a sequence-0 change must be refused as invalid, got {shape:?}"
+    );
+    assert!(
+        double.received(source).is_empty(),
+        "the refused push must not write the lane"
+    );
+}
+
+/// The double and a real server refuse the same push batches identically:
+/// duplicate sequence, sequence 0, and a reply budget below the control
+/// minimum (the server's reply-capacity preflight).
+#[tokio::test]
+async fn recovery_completion_mem_push_refusals_match_server() {
+    let (db, _dir, _) = collectives_db(1);
+    let pair = ParityPair::over(&db, WIDE_CAP);
+    let source = InstanceId::new();
+    let (change, _change_dir) = one_change(source);
+    let mut zero = change.clone();
+    zero.sequence = 0;
+
+    let cases: Vec<(&str, Vec<SyncChange>, u64)> = vec![
+        (
+            "duplicate sequence",
+            vec![change.clone(), change.clone()],
+            WIDE_CAP as u64,
+        ),
+        ("sequence 0", vec![zero], WIDE_CAP as u64),
+        ("reply budget below the control minimum", vec![change], 100),
+    ];
+    for (name, changes, reply_limit) in cases {
+        let mut to_server = push_to(pair.server.instance_id(), source, changes.clone());
+        to_server.reply_limit_bytes = reply_limit;
+        let mut to_double = push_to(pair.double.instance_id(), source, changes);
+        to_double.reply_limit_bytes = reply_limit;
+
+        let server = push_shape(pair.server.handle_push(to_server));
+        let double = push_shape(pair.double.push_changes(to_double, WIDE_CAP).await);
+        assert!(
+            !matches!(server, PushShape::Accepted(_)),
+            "{name}: the server refuses this batch, got {server:?}"
+        );
+        assert_eq!(
+            double, server,
+            "{name}: the double must refuse it identically"
+        );
+        assert!(
+            pair.double.received(source).is_empty(),
+            "{name}: nothing is written"
+        );
+    }
+}
+
+/// F2(b), #91: `SyncManager::new` validates before anything is built.
+#[test]
+fn recovery_completion_sync_manager_new_rejects_invalid_config() {
+    let (db, _dir) = open_db();
+    let (transport, _) = InMemorySyncTransport::new_pair();
+    let config = SyncConfig {
+        batch_size: 0,
+        ..SyncConfig::default()
+    };
+    assert!(config.validate().is_err(), "the fixture must be invalid");
+
+    let err = match SyncManager::new(Arc::clone(&db), Box::new(transport), config) {
+        Ok(_) => panic!("an invalid configuration must be refused at construction"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, SyncError::Config(ref m) if m.contains("batch_size")),
+        "expected the typed Config error, got {err:?}"
+    );
+    assert!(err.is_config());
 }

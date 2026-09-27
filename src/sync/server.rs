@@ -69,7 +69,7 @@ use super::SYNC_PROTOCOL_VERSION;
 /// page (the WAL may hold more) from a short one (the WAL is exhausted) and a
 /// limit it did not set is a limit it cannot see. The value is the poller's own
 /// default, so the page size is exactly what it has always been.
-const PULL_PAGE_EVENT_LIMIT: usize = 1000;
+pub(crate) const PULL_PAGE_EVENT_LIMIT: usize = 1000;
 
 /// Server-side sync handler.
 ///
@@ -553,16 +553,22 @@ impl SyncServer {
     /// server's own policy)`. Every reply this checks is a bounded control
     /// frame, so the worst case is computable rather than estimated.
     fn preflight_reply(&self, requester_limit: u64) -> Result<(), SyncError> {
-        let requester = usize::try_from(requester_limit).unwrap_or(usize::MAX);
-        let budget = requester.min(self.config.max_request_bytes);
-        if budget < MIN_CONTROL_FRAME_BYTES {
-            return Err(SyncError::PayloadTooLarge {
-                size: MIN_CONTROL_FRAME_BYTES,
-                max: budget,
-            });
-        }
-        Ok(())
+        preflight_reply_budget(requester_limit, self.config.max_request_bytes)
     }
+}
+
+/// [`SyncServer::preflight_reply`] against an explicit endpoint `policy`, so
+/// the in-memory double runs the identical check under its own receive limit.
+pub(crate) fn preflight_reply_budget(requester_limit: u64, policy: usize) -> Result<(), SyncError> {
+    let requester = usize::try_from(requester_limit).unwrap_or(usize::MAX);
+    let budget = requester.min(policy);
+    if budget < MIN_CONTROL_FRAME_BYTES {
+        return Err(SyncError::PayloadTooLarge {
+            size: MIN_CONTROL_FRAME_BYTES,
+            max: budget,
+        });
+    }
+    Ok(())
 }
 
 /// Moves a pull's reported scan position to `sequence` — but only if the
@@ -592,7 +598,7 @@ impl SyncServer {
 /// hand-maintained size formula. Nothing is committed until the candidate fits:
 /// a sizer left describing a frame the handler does not emit is precisely the
 /// defect this repairs.
-fn advance_scan_within_cap(
+pub(crate) fn advance_scan_within_cap(
     sizer: &mut wire::FrameSizer,
     scanned: &mut u64,
     sequence: u64,
@@ -633,7 +639,7 @@ fn advance_scan_within_cap(
 /// Order is deliberately NOT constrained: a peer chooses its batch's order, and
 /// the applier's failure-floor rule is by sequence rather than by position
 /// precisely so that it does not have to be.
-fn validate_batch_metadata(request: &PushRequest) -> Result<(), String> {
+pub(crate) fn validate_batch_metadata(request: &PushRequest) -> Result<(), String> {
     use std::collections::BTreeSet;
 
     let mut seen: BTreeSet<u64> = BTreeSet::new();

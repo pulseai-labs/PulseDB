@@ -14,6 +14,13 @@
 //! and refused the moment it crosses the cap — either way as the typed
 //! [`SyncError::PayloadTooLarge`], before any postcard decode.
 //!
+//! An error response is classified by its **status first**. A `413 Payload Too
+//! Large` is the typed, terminal [`SyncError::PeerRejectedSize`] — carrying the
+//! operation and the framed length actually sent — and its body is never read.
+//! Any other client error stays [`SyncError::InvalidPayload`] and a server
+//! error stays [`SyncError::Transport`], even when the error body is over the
+//! response cap.
+//!
 //! That cap is **inbound only**. What this client will read says nothing about
 //! what a peer will accept, so an outbound request is encoded against the
 //! `send_budget_bytes` its caller supplies — the cap its packer sized against —
@@ -160,8 +167,21 @@ impl HttpSyncTransport {
     /// postcard or the frame header. [`post_framed`](Self::post_framed) layers
     /// framing and validation on top. The response body is read under
     /// [`Self::max_response_bytes`].
-    async fn post_raw(&self, path: &str, body: Vec<u8>) -> Result<Vec<u8>, SyncError> {
+    ///
+    /// The HTTP status is classified **before** any error body is read. A 413
+    /// is [`SyncError::PeerRejectedSize`] at once — its body is untrusted and
+    /// carries nothing the error needs, so it is neither read nor waited for.
+    /// Any other error status keeps its class whatever its body does: an error
+    /// page over the response cap cannot relabel the peer's failure as a local
+    /// payload-size one (#93).
+    async fn post_raw(
+        &self,
+        operation: WireOperation,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, SyncError> {
         let url = format!("{}{}", self.base_url, path);
+        let sent = body.len() as u64;
 
         let mut req = self
             .client
@@ -184,15 +204,23 @@ impl HttpSyncTransport {
         })?;
 
         let status = response.status();
+        if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            warn!(
+                ?operation,
+                sent, "Sync request refused by the peer as too large (HTTP 413)"
+            );
+            return Err(SyncError::PeerRejectedSize { operation, sent });
+        }
         if !status.is_success() {
-            // Error bodies are read under the same cap. An oversized one keeps
-            // its typed identity — a caller checking `is_payload_too_large()`
-            // must see it whether the cap was hit on a success or an error
-            // response — while an ordinary unreadable body degrades to
-            // "unknown" rather than masking the status.
+            // The status is the classification; the body is only detail. It is
+            // read under the same cap, and one that cannot be read — oversized
+            // included — degrades to a placeholder rather than masking the
+            // status.
             let body_text = match Self::read_body_bounded(response, self.max_response_bytes).await {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(err @ SyncError::PayloadTooLarge { .. }) => return Err(err),
+                Err(SyncError::PayloadTooLarge { size, max }) => {
+                    format!("<error body of at least {size} bytes, over the {max}-byte cap>")
+                }
                 Err(_) => "unknown".into(),
             };
             return Err(if status.is_client_error() {
@@ -232,7 +260,7 @@ impl HttpSyncTransport {
     {
         let body = wire::encode_bounded(operation, request, send_budget)
             .map_err(|e| request_too_large(operation, e))?;
-        let response_bytes = self.post_raw(path, body).await?;
+        let response_bytes = self.post_raw(operation, path, body).await?;
         wire::decode_bounded(operation, &response_bytes, self.max_response_bytes)
     }
 }

@@ -324,12 +324,13 @@ impl SyncManager {
         if let Err(e) = result {
             // A deterministic dead end is recorded, not just returned: a caller
             // that polls `status()` must see the same terminal condition the
-            // background loop would record. Both size failures qualify — one
-            // change that can never be sent, or a request this side built that
-            // the peer will never read — because retrying either rebuilds a
-            // body already known not to fit. Anything else is transient and the
-            // manager is simply idle again.
-            self.set_status(if e.is_change_too_large() || e.is_request_too_large() {
+            // background loop would record. Every size failure qualifies — one
+            // change that can never be sent, a request this side built that the
+            // peer will never read, or a body the peer refused with a 413 —
+            // because retrying any of them rebuilds a body already known not to
+            // fit. Anything else is transient and the manager is simply idle
+            // again.
+            self.set_status(if is_terminal_size(&e) {
                 SyncStatus::Error(e.to_string())
             } else {
                 SyncStatus::Idle
@@ -371,15 +372,51 @@ impl SyncManager {
     /// call whose `Ok` a caller is entitled to trust. A single background cycle
     /// ([`sync_once`](Self::sync_once)) still returns `Ok` with a change left
     /// unapplied — there the next cycle retries it, which is the design.
+    ///
+    /// # Status
+    ///
+    /// [`status()`](Self::status) is `Syncing` only while the catch-up runs.
+    /// Once this returns — `Ok` or any `Err` — it is `Idle`, and the `Result`
+    /// carries the outcome. The initial handshake runs before `Syncing` is
+    /// entered. Cancellation (dropping the future mid-await) and panics are not
+    /// covered by this guarantee.
     #[instrument(skip(self, progress))]
     pub async fn initial_sync(
         &mut self,
         progress: Option<Box<dyn SyncProgressCallback>>,
     ) -> Result<(), SyncError> {
-        let mut binding = self.bound_peer().await?;
+        let binding = self.bound_peer().await?;
 
         self.set_status(SyncStatus::Syncing);
+        let status = Arc::clone(&self.status);
+        Self::settle_idle(&status, self.catch_up(binding, progress)).await
+    }
 
+    /// Runs one-shot work that has already entered `Syncing`, returns `status`
+    /// to `Idle` exactly once when it resolves, and hands its `Result` back
+    /// unchanged.
+    ///
+    /// The single exit of [`initial_sync`](Self::initial_sync): every `?` and
+    /// `return` in the work lands here, so no error path can leave the manager
+    /// reporting an activity that has stopped.
+    async fn settle_idle<T>(
+        status: &RwLock<SyncStatus>,
+        work: impl std::future::Future<Output = Result<T, SyncError>>,
+    ) -> Result<T, SyncError> {
+        let outcome = work.await;
+        if let Ok(mut s) = status.write() {
+            *s = SyncStatus::Idle;
+        }
+        outcome
+    }
+
+    /// The body of [`initial_sync`](Self::initial_sync), run inside
+    /// [`settle_idle`](Self::settle_idle).
+    async fn catch_up(
+        &mut self,
+        mut binding: PeerBinding,
+        progress: Option<Box<dyn SyncProgressCallback>>,
+    ) -> Result<(), SyncError> {
         let applier = RemoteChangeApplier::new(Arc::clone(&self.db), self.config.clone());
 
         let mut total_pulled = 0usize;
@@ -424,7 +461,6 @@ impl SyncManager {
                     // Discard it whole, re-establish, restart from the NEW
                     // peer's own cursor.
                     if rebinds_left == 0 {
-                        self.set_status(SyncStatus::Idle);
                         return Err(SyncError::handshake(format!(
                             "peer identity changed twice during one initial_sync \
                              (bound {}, now {responder}); refusing to keep re-establishing",
@@ -453,10 +489,7 @@ impl SyncManager {
                     stalled_with_more = false;
                     continue;
                 }
-                Err(e) => {
-                    self.set_status(SyncStatus::Idle);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             };
 
             let batch_size = page.changes.len();
@@ -526,11 +559,6 @@ impl SyncManager {
                 break;
             }
         }
-
-        // The status transition is the same one the success path makes: the
-        // manager is no longer syncing either way, and a stopped catch-up must
-        // not leave it wedged in `Syncing`.
-        self.set_status(SyncStatus::Idle);
 
         // Stopping short is not completion. Both shapes leave the pull position
         // persisted where the run stopped, so a retry resumes from there.
@@ -943,14 +971,16 @@ impl SyncManager {
                                 *s = SyncStatus::Syncing;
                             }
                         }
-                        Err(e) if e.is_change_too_large() || e.is_request_too_large() => {
+                        Err(e) if is_terminal_size(&e) => {
                             // Deterministic and terminal: the same change, or
                             // the same request, rebuilt next cycle is the same
-                            // size against the same cap. Retrying would send a
-                            // body already known not to fit, forever. Record it
-                            // and stop; an explicit `start()` after the operator
-                            // raises the cap — or narrows the filter — runs
-                            // again.
+                            // size against the same cap — and a 413 is the same
+                            // body meeting the same limit, which no re-handshake
+                            // can discover when a proxy imposed it. Retrying
+                            // would send a body already known not to fit,
+                            // forever. Record it and stop; an explicit `start()`
+                            // after the operator raises the cap — or narrows the
+                            // filter — runs again.
                             error!("Sync stopped: {}", e);
                             if let Ok(mut s) = status.write() {
                                 *s = SyncStatus::Error(e.to_string());
@@ -1081,5 +1111,42 @@ impl SyncManager {
             "peer identity changed twice during one sync cycle \
              (bound {bound}, now {observed}); refusing to keep re-establishing"
         ))
+    }
+}
+
+/// The size failures no retry can fix: one change that can never be sent, a
+/// request this side built that the peer will never read, and a body the peer
+/// refused outright (HTTP 413).
+fn is_terminal_size(e: &SyncError) -> bool {
+    e.is_change_too_large() || e.is_request_too_large() || e.is_peer_rejected_size()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The common reset, driven directly. `initial_sync` has five `Result`
+    /// exits after `Syncing` is entered — the first pull-position load,
+    /// re-establishment, the post-rebind pull-position load, apply and save —
+    /// and every one of them is a `?` or `return` inside the work this wraps.
+    /// Three have no storage fault seam to reach them for real, so the reset
+    /// is proven here, on an injected `Err`, for all of them at once.
+    #[tokio::test]
+    async fn recovery_completion_status_wrapper_resets_idle_on_injected_error() {
+        let status = RwLock::new(SyncStatus::Syncing);
+        let outcome: Result<(), SyncError> = SyncManager::settle_idle(&status, async {
+            Err(SyncError::transport("injected storage failure"))
+        })
+        .await;
+        assert!(
+            matches!(outcome, Err(SyncError::Transport(ref m)) if m == "injected storage failure"),
+            "the Result is returned unchanged, got {outcome:?}"
+        );
+        assert_eq!(*status.read().unwrap(), SyncStatus::Idle);
+
+        let status = RwLock::new(SyncStatus::Syncing);
+        let outcome = SyncManager::settle_idle(&status, async { Ok::<u8, SyncError>(7) }).await;
+        assert_eq!(outcome.unwrap(), 7);
+        assert_eq!(*status.read().unwrap(), SyncStatus::Idle);
     }
 }

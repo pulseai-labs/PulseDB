@@ -5,7 +5,7 @@
 
 #![cfg(feature = "sync-http")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -30,7 +30,7 @@ use pulsedb::sync::{
     read_wire_preamble, write_wire_preamble, SYNC_PROTOCOL_VERSION, SYNC_WIRE_MAGIC,
     SYNC_WIRE_PREAMBLE_LEN, WIRE_FORMAT_VERSION,
 };
-use pulsedb::{CollectiveId, Config, NewExperience, PulseDB};
+use pulsedb::{CollectiveId, Config, ExperienceId, NewExperience, PulseDB};
 use tempfile::tempdir;
 
 /// The outbound budget a DIRECT transport call supplies.
@@ -1433,15 +1433,84 @@ const SERVER_PULL_PAGE_EVENTS: usize = 1000;
 
 /// Fills a store's WAL with `count` collective-create events, in WAL order.
 ///
-/// A collective create is the cheapest write that still yields a `SyncChange`
-/// (no embedding, no vector on the wire), and it is the payload that survives a
-/// serializing transport intact — issue #96 keeps experiences off it — so one
-/// fixture serves both the `handle_pull` assertions and the catch-up that runs
-/// over real HTTP.
+/// For SHORT fixtures only. Every collective carries its own vector index, so a
+/// fixture that must cross the 1 000-event poll page uses
+/// [`fill_wal_with_reinforcements`] instead, which crosses it with O(1)
+/// collectives.
 fn fill_wal_with_collectives(db: &PulseDB, count: usize) -> Vec<CollectiveId> {
     (0..count)
         .map(|i| db.create_collective(&format!("page-fill-{i}")).unwrap())
         .collect()
+}
+
+/// The class-Q fixture at O(1) collectives and indexes: `events` WAL events
+/// from ONE collective and ONE experience, the rest repeated reinforcements.
+///
+/// `reinforce_experience` records one `ExperienceUpdated` WAL event per call,
+/// and the server turns each polled event into one change, so the page boundary
+/// is crossed by real events without allocating a collective (and its vector
+/// index) per event. The sequence delta is asserted, not assumed.
+struct ReinforcedFiller {
+    collective: CollectiveId,
+    experience: ExperienceId,
+    embedding: Vec<f32>,
+    /// The G-counter total the source holds after the last reinforcement.
+    applications: u32,
+}
+
+fn fill_wal_with_reinforcements(db: &PulseDB, events: usize) -> ReinforcedFiller {
+    assert!(events >= 2, "a collective and an experience come first");
+    let before = db.get_current_sequence().unwrap();
+    let collective = db.create_collective("page-fill").unwrap();
+    let embedding: Vec<f32> = (0..384).map(|i| (i as f32 + 1.0) / 384.0).collect();
+    let experience = db
+        .record_experience(NewExperience {
+            collective_id: collective,
+            content: "page-fill".into(),
+            embedding: Some(embedding.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut applications = 0;
+    for _ in 0..events - 2 {
+        applications = db.reinforce_experience(experience).unwrap();
+    }
+    assert_eq!(
+        db.get_current_sequence().unwrap() - before,
+        events as u64,
+        "one WAL event per operation: the fixture must not collapse reinforcements"
+    );
+    ReinforcedFiller {
+        collective,
+        experience,
+        embedding,
+        applications,
+    }
+}
+
+/// End-to-end completion for the compact fixture: the filler experience is
+/// durable on the client with the source's vector, is searchable, and carries
+/// the exact final G-counter state.
+fn assert_filler_arrived(source: &PulseDB, client: &PulseDB, filler: &ReinforcedFiller) {
+    let arrived = client
+        .get_experience(filler.experience)
+        .unwrap()
+        .expect("the filler experience must arrive");
+    assert_eq!(arrived.embedding, filler.embedding, "vector equality");
+    let expected = source.get_experience(filler.experience).unwrap().unwrap();
+    assert_eq!(arrived.applications(), filler.applications);
+    assert_eq!(
+        arrived.applications, expected.applications,
+        "the final G-counter state, per instance"
+    );
+    assert!(
+        client
+            .search_similar(filler.collective, &filler.embedding, 5)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.experience.id == filler.experience),
+        "the filler experience must be searchable on the client"
+    );
 }
 
 /// One pull straight at the server handler, bypassing HTTP.
@@ -1494,7 +1563,15 @@ fn open_client() -> (Arc<PulseDB>, tempfile::TempDir) {
 #[tokio::test]
 async fn a_full_poll_page_reports_more_even_when_every_event_yielded_a_change() {
     let server = start_test_server().await;
-    let ids = fill_wal_with_collectives(&server.db, SERVER_PULL_PAGE_EVENTS + 5);
+    let filler = fill_wal_with_reinforcements(&server.db, SERVER_PULL_PAGE_EVENTS);
+    // A DISTINCT entity after event 1 000. Repeated updates resolve from the
+    // source's current state, so the filler's final G-counter could arrive on
+    // the first page alone; only this sentinel proves a suffix page was fetched.
+    let sentinel = server.db.create_collective("tail-sentinel").unwrap();
+    assert_eq!(
+        server.db.get_current_sequence().unwrap(),
+        SERVER_PULL_PAGE_EVENTS as u64 + 1
+    );
     let batch_size = 2 * SERVER_PULL_PAGE_EVENTS;
 
     let response = pull_page(&server.server, 0, batch_size, None);
@@ -1523,16 +1600,11 @@ async fn a_full_poll_page_reports_more_even_when_every_event_yielded_a_change() 
         .await
         .expect("every change applies, so the catch-up completes");
 
-    let missing = ids
-        .iter()
-        .filter(|id| db_client.get_collective(**id).unwrap().is_none())
-        .count();
-    assert_eq!(
-        missing,
-        0,
-        "`Ok(())` means the catch-up completed, but {missing} of {} collectives \
-         never arrived",
-        ids.len()
+    assert_filler_arrived(&server.db, &db_client, &filler);
+    assert!(
+        db_client.get_collective(sentinel).unwrap().is_some(),
+        "`Ok(())` means the catch-up completed, but the sentinel behind the full \
+         page never arrived"
     );
 }
 
@@ -1546,7 +1618,7 @@ async fn a_full_poll_page_reports_more_even_when_every_event_yielded_a_change() 
 #[tokio::test]
 async fn a_page_that_exactly_exhausts_the_wal_over_reports_and_still_completes() {
     let server = start_test_server().await;
-    let ids = fill_wal_with_collectives(&server.db, SERVER_PULL_PAGE_EVENTS);
+    let filler = fill_wal_with_reinforcements(&server.db, SERVER_PULL_PAGE_EVENTS);
     assert_eq!(
         server.db.get_current_sequence().unwrap(),
         SERVER_PULL_PAGE_EVENTS as u64,
@@ -1593,11 +1665,7 @@ async fn a_page_that_exactly_exhausts_the_wal_over_reports_and_still_completes()
         .await
         .expect("the conservative has_more costs one empty pull, not the completion");
 
-    let missing = ids
-        .iter()
-        .filter(|id| db_client.get_collective(**id).unwrap().is_none())
-        .count();
-    assert_eq!(missing, 0, "{missing} collectives never arrived");
+    assert_filler_arrived(&server.db, &db_client, &filler);
 }
 
 /// A page SHORT of the poll limit is untouched by the saturation rule: the
@@ -1656,10 +1724,13 @@ async fn a_short_poll_page_reports_exactly_what_it_did_before() {
 #[tokio::test]
 async fn recovery_v5_filtered_full_page_reaches_next_match() {
     let server = start_test_server().await;
-    // > 1 000 excluded events, then the one that matters.
-    let excluded = fill_wal_with_collectives(&server.db, SERVER_PULL_PAGE_EVENTS + 5);
+    // > 1 000 events in ONE excluded collective, then the one that matters.
+    let excluded = fill_wal_with_reinforcements(&server.db, SERVER_PULL_PAGE_EVENTS + 5);
     let wanted = server.db.create_collective("the-one-that-matters").unwrap();
-    assert!(excluded.len() > SERVER_PULL_PAGE_EVENTS);
+    assert_eq!(
+        server.db.get_current_sequence().unwrap(),
+        SERVER_PULL_PAGE_EVENTS as u64 + 6
+    );
 
     // The first page is entirely filtered, and it still advances.
     let first = pull_page(&server.server, 0, 500, Some(vec![wanted]));
@@ -1696,11 +1767,17 @@ async fn recovery_v5_filtered_full_page_reaches_next_match() {
         "the included collective sits behind a full page of excluded events and \
          must still be delivered"
     );
-    let leaked = excluded
-        .iter()
-        .filter(|id| db_client.get_collective(**id).unwrap().is_some())
-        .count();
-    assert_eq!(leaked, 0, "the filter still excludes what it excludes");
+    assert!(
+        db_client
+            .get_collective(excluded.collective)
+            .unwrap()
+            .is_none()
+            && db_client
+                .get_experience(excluded.experience)
+                .unwrap()
+                .is_none(),
+        "the filter still excludes what it excludes"
+    );
 }
 
 /// The trailing half of the same rule: a SHORT page that ends in filtered
@@ -3806,4 +3883,356 @@ async fn recovery_v5_pull_encodes_against_the_peer_budget_not_the_response_reade
         0,
         "no pull crossed to the peer — the refusal is local, before transmission"
     );
+}
+
+// ============================================================================
+// PR #88 completion C1 — a 413 is a terminal, typed size refusal, and the
+// HTTP status is classified before an untrusted error body is read (T4, #93)
+// ============================================================================
+
+/// Polls `condition` until it holds, or fails the test after 5 seconds.
+///
+/// A wait, never evidence: every C1/C2 assertion that matters is read off a
+/// counter, a tripwire or a typed error once the wait is over.
+async fn await_until(condition: impl Fn() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting: {what}");
+}
+
+/// Aborts the stub server's task however the test ends, and releases any
+/// handler still parked on a stalled body.
+struct StubServer {
+    base_url: String,
+    task: tokio::task::JoinHandle<()>,
+    _release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for StubServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn serve_stub(
+    router: Router,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+) -> StubServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    StubServer {
+        base_url,
+        task,
+        _release: release,
+    }
+}
+
+/// Every data route answers with `status` and `body`, and records the length of
+/// each request body it received.
+fn status_stub(status: StatusCode, body: Vec<u8>, seen: Arc<Mutex<Vec<usize>>>) -> Router {
+    let answer = move |request: Bytes| {
+        let seen = Arc::clone(&seen);
+        let body = body.clone();
+        async move {
+            seen.lock().unwrap().push(request.len());
+            (status, body)
+        }
+    };
+    Router::new()
+        .route("/sync/handshake", post(answer.clone()))
+        .route("/sync/push", post(answer.clone()))
+        .route("/sync/pull", post(answer))
+}
+
+/// The one-attempt proof. The endpoint handshakes honestly and answers every
+/// push with 413; a second push would trip the wire. The background loop runs
+/// on a 10 ms interval with a 1 ms backoff, so a loop that treated the 413 as
+/// transient would come straight back.
+///
+/// Termination is read structurally, not off a clock: the runtime is
+/// single-threaded, so when this task observes the `Error` status the loop is
+/// either finished or parked at its next await. `stop()` leaves an exited
+/// task's `Error` in place and resets a live one to `Idle` — so an `Error` that
+/// survives `stop()` is a loop that had already exited.
+#[tokio::test]
+async fn recovery_completion_http_413_is_terminal_after_one_attempt() {
+    #[derive(Clone)]
+    struct St {
+        server: Arc<SyncServer>,
+        pushes: Arc<std::sync::atomic::AtomicUsize>,
+        first: Arc<tokio::sync::Notify>,
+        tripwire: Arc<tokio::sync::Notify>,
+    }
+    async fn handshake(State(st): State<St>, body: Bytes) -> Result<Vec<u8>, StatusCode> {
+        st.server.handle_handshake_bytes(&body).map_err(status_for)
+    }
+    async fn push(State(st): State<St>) -> StatusCode {
+        let n = st.pushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if n == 1 {
+            st.first.notify_one();
+        } else {
+            st.tripwire.notify_one();
+        }
+        StatusCode::PAYLOAD_TOO_LARGE
+    }
+
+    let (server, _dir) = in_process_server();
+    let st = St {
+        server,
+        pushes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        first: Arc::new(tokio::sync::Notify::new()),
+        tripwire: Arc::new(tokio::sync::Notify::new()),
+    };
+    let router = Router::new()
+        .route("/sync/handshake", post(handshake))
+        .route("/sync/push", post(push))
+        .with_state(st.clone());
+    let stub = serve_stub(router, None).await;
+
+    let (db_client, _dir_client) = open_client();
+    db_client.create_collective("pending").unwrap();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(HttpSyncTransport::new(&stub.base_url)),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            retry: pulsedb::sync::config::RetryConfig {
+                max_retries: 1000,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                backoff_multiplier: 1.0,
+            },
+            ..SyncConfig::default()
+        },
+    )
+    .unwrap();
+
+    manager.start().await.unwrap();
+    st.first.notified().await;
+    tokio::select! {
+        _ = st.tripwire.notified() => panic!("a 413 was retried: the manager submitted a second push"),
+        _ = await_until(
+            || matches!(manager.status(), SyncStatus::Error(_)),
+            "the 413 is recorded",
+        ) => {}
+    }
+
+    manager.stop().await.unwrap();
+    match manager.status() {
+        SyncStatus::Error(message) => assert!(
+            message.contains("413") || message.contains("refused"),
+            "the recorded reason names the size refusal, got {message}"
+        ),
+        other => panic!(
+            "stop() reset the status to {other:?}: the loop was still live after the 413, \
+             so it was going to retry"
+        ),
+    }
+    assert_eq!(
+        st.pushes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one push reached the peer"
+    );
+
+    // The one-shot path records the same terminal condition.
+    let err = manager
+        .sync_once()
+        .await
+        .expect_err("a one-shot push meets the same 413");
+    assert!(err.is_peer_rejected_size(), "got {err:?}");
+    assert!(
+        matches!(manager.status(), SyncStatus::Error(_)),
+        "a deterministic dead end is recorded, not reported as idle"
+    );
+}
+
+/// A 413 is classified from its status alone: an error body far larger than
+/// the response cap is not read, so it cannot turn into a local size error.
+#[tokio::test]
+async fn recovery_completion_http_413_ignores_oversized_body() {
+    const CAP: usize = 1024;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = serve_stub(
+        status_stub(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            vec![0u8; 64 * CAP],
+            Arc::clone(&seen),
+        ),
+        None,
+    )
+    .await;
+    let transport = HttpSyncTransport::new(&stub.base_url).with_max_response_bytes(CAP);
+
+    let err = transport
+        .pull_changes(pull_request(InstanceId::new(), 0, 10), DIRECT_SEND_BUDGET)
+        .await
+        .expect_err("a 413 is a refusal");
+    assert!(
+        matches!(
+            err,
+            SyncError::PeerRejectedSize {
+                operation: WireOperation::Pull,
+                ..
+            }
+        ),
+        "the oversized 413 body must not mask the refusal, got {err:?}"
+    );
+    assert!(!err.is_payload_too_large());
+}
+
+/// `PeerRejectedSize` reports what was actually submitted: the operation, and
+/// the exact framed body length the peer received. A 413 carries no
+/// trustworthy peer cap, so none is reported.
+#[tokio::test]
+async fn recovery_completion_http_413_reports_truthful_fields() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = serve_stub(
+        status_stub(StatusCode::PAYLOAD_TOO_LARGE, Vec::new(), Arc::clone(&seen)),
+        None,
+    )
+    .await;
+    let transport = HttpSyncTransport::new(&stub.base_url);
+
+    let source = InstanceId::new();
+    let target = InstanceId::new();
+    let push = push_request(source, target, Vec::new());
+    let expected_push = wire::encode_bounded(WireOperation::Push, &push, DIRECT_SEND_BUDGET)
+        .unwrap()
+        .len() as u64;
+    let err = transport
+        .push_changes(push, DIRECT_SEND_BUDGET)
+        .await
+        .expect_err("413");
+    match err {
+        SyncError::PeerRejectedSize { operation, sent } => {
+            assert_eq!(operation, WireOperation::Push);
+            assert_eq!(sent, expected_push, "the framed length that was submitted");
+        }
+        other => panic!("expected PeerRejectedSize, got {other:?}"),
+    }
+
+    let pull = pull_request(target, 0, 10);
+    let expected_pull = wire::encode_bounded(WireOperation::Pull, &pull, DIRECT_SEND_BUDGET)
+        .unwrap()
+        .len() as u64;
+    let err = transport
+        .pull_changes(pull, DIRECT_SEND_BUDGET)
+        .await
+        .expect_err("413");
+    match err {
+        SyncError::PeerRejectedSize { operation, sent } => {
+            assert_eq!(operation, WireOperation::Pull);
+            assert_eq!(sent, expected_pull);
+        }
+        other => panic!("expected PeerRejectedSize, got {other:?}"),
+    }
+
+    let received = seen.lock().unwrap().clone();
+    assert_eq!(
+        received,
+        vec![expected_push as usize, expected_pull as usize],
+        "`sent` is exactly what the peer received"
+    );
+}
+
+/// A non-413 client error keeps its class: still `InvalidPayload`, still not a
+/// size refusal.
+#[tokio::test]
+async fn recovery_completion_http_400_remains_invalid_payload() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = serve_stub(
+        status_stub(StatusCode::BAD_REQUEST, b"bad request".to_vec(), seen),
+        None,
+    )
+    .await;
+    let transport = HttpSyncTransport::new(&stub.base_url);
+
+    let err = transport
+        .pull_changes(pull_request(InstanceId::new(), 0, 10), DIRECT_SEND_BUDGET)
+        .await
+        .expect_err("400");
+    assert!(
+        matches!(err, SyncError::InvalidPayload(ref m) if m.contains("400")),
+        "got {err:?}"
+    );
+    assert!(!err.is_peer_rejected_size());
+}
+
+/// #93: a 503 whose error page exceeds the response cap is still a 503. The
+/// status is classified first; the body cannot relabel the peer's failure as a
+/// payload-size one.
+#[tokio::test]
+async fn recovery_completion_http_503_oversized_body_preserves_status() {
+    const CAP: usize = 1024;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let stub = serve_stub(
+        status_stub(StatusCode::SERVICE_UNAVAILABLE, vec![b'x'; 64 * CAP], seen),
+        None,
+    )
+    .await;
+    let transport = HttpSyncTransport::new(&stub.base_url).with_max_response_bytes(CAP);
+
+    let err = transport
+        .pull_changes(pull_request(InstanceId::new(), 0, 10), DIRECT_SEND_BUDGET)
+        .await
+        .expect_err("503");
+    assert!(
+        matches!(err, SyncError::Transport(ref m) if m.contains("503")),
+        "the transport status must survive an oversized error page, got {err:?}"
+    );
+    assert!(!err.is_payload_too_large());
+    assert!(!err.is_peer_rejected_size());
+}
+
+/// A 413 whose body never arrives is answered from its headers. The handler
+/// sends the status and then stalls; teardown releases it however the test
+/// ends.
+#[tokio::test]
+async fn recovery_completion_http_413_does_not_wait_for_body() {
+    const BODY_STALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let (release, stalled) = tokio::sync::oneshot::channel::<()>();
+    let stalled = Arc::new(tokio::sync::Mutex::new(Some(stalled)));
+    let router = Router::new().route(
+        "/sync/push",
+        post(move || {
+            let stalled = Arc::clone(&stalled);
+            async move {
+                let gate = stalled.lock().await.take();
+                let body = futures::stream::once(async move {
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                    Ok::<_, std::io::Error>(Bytes::from_static(b"never"))
+                });
+                (StatusCode::PAYLOAD_TOO_LARGE, Body::from_stream(body))
+            }
+        }),
+    );
+    let stub = serve_stub(router, Some(release)).await;
+    let transport = HttpSyncTransport::new(&stub.base_url);
+
+    let outcome = tokio::time::timeout(
+        BODY_STALL_DEADLINE,
+        transport.push_changes(
+            push_request(InstanceId::new(), InstanceId::new(), Vec::new()),
+            DIRECT_SEND_BUDGET,
+        ),
+    )
+    .await;
+    drop(stub);
+    let err = outcome
+        .expect("a 413 must be classified without waiting for its body")
+        .expect_err("413");
+    assert!(err.is_peer_rejected_size(), "got {err:?}");
 }
