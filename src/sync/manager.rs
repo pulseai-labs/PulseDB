@@ -148,7 +148,7 @@ pub struct SyncManager {
     /// `stop()` whose task had already exited would otherwise stop the NEXT
     /// task the instant it starts.
     shutdown: Arc<Notify>,
-    task_handle: Option<JoinHandle<()>>,
+    task_handle: Option<JoinHandle<LoopExit>>,
 }
 
 impl SyncManager {
@@ -258,7 +258,7 @@ impl SyncManager {
             Self::background_loop(
                 db, transport, config, local_id, binding, status, stats, shutdown,
             )
-            .await;
+            .await
         });
 
         self.task_handle = Some(handle);
@@ -268,20 +268,30 @@ impl SyncManager {
 
     /// Stops the background sync loop.
     ///
-    /// A task that already exited on a terminal error is reaped without
-    /// disturbing the recorded [`SyncStatus::Error`], so the reason survives
-    /// the stop.
+    /// Signals shutdown, waits for the task to exit, and only then decides the
+    /// final status from **why** it exited:
+    ///
+    /// - it stopped because of this shutdown → [`SyncStatus::Idle`]. The task
+    ///   records `Idle` itself on that exit, so the status ends `Idle` even if
+    ///   this `stop()` future is dropped after signalling shutdown;
+    /// - it stopped on a terminal error (one no retry can fix) →
+    ///   the [`SyncStatus::Error`] it recorded is left in place, so the reason
+    ///   survives the stop. That holds whether the task had already exited
+    ///   before `stop()` was called or exited on its own after shutdown was
+    ///   signalled but before it was observed. Nothing writes `Idle` over it.
+    ///
+    /// A task that panicked is reported as a [`SyncError::Transport`] and the
+    /// status is left as it was.
     #[instrument(skip(self))]
     pub async fn stop(&mut self) -> Result<(), SyncError> {
         if let Some(handle) = self.task_handle.take() {
-            let already_finished = handle.is_finished();
-            if !already_finished {
-                self.shutdown.notify_one();
-            }
-            handle
+            // A permit left on a signal whose task already exited is harmless:
+            // `start()` replaces the signal for the next run.
+            self.shutdown.notify_one();
+            let exit = handle
                 .await
                 .map_err(|e| SyncError::transport(format!("Background task panicked: {}", e)))?;
-            if !already_finished {
+            if exit == LoopExit::Shutdown {
                 self.set_status(SyncStatus::Idle);
             }
             info!("SyncManager stopped");
@@ -910,6 +920,11 @@ impl SyncManager {
     }
 
     /// Background loop that runs push+pull on configured intervals.
+    ///
+    /// Its exit records the final status itself: a shutdown exit writes
+    /// [`SyncStatus::Idle`] and returns [`LoopExit::Shutdown`]; a terminal exit
+    /// writes [`SyncStatus::Error`] and returns [`LoopExit::Terminal`], and
+    /// never `Idle`.
     #[allow(clippy::too_many_arguments)]
     async fn background_loop(
         db: Arc<PulseDB>,
@@ -920,7 +935,7 @@ impl SyncManager {
         status: Arc<RwLock<SyncStatus>>,
         stats: Arc<Mutex<SyncStats>>,
         shutdown: Arc<Notify>,
-    ) {
+    ) -> LoopExit {
         // Rebound in place by `run_sync_cycle` when a reply reveals that the
         // endpoint is answering under a different identity.
         let mut binding = binding;
@@ -933,10 +948,6 @@ impl SyncManager {
         let initial_backoff = config.retry.initial_backoff_ms;
         let max_backoff = config.retry.max_backoff_ms;
         let multiplier = config.retry.backoff_multiplier;
-        // Set when the loop stops on a failure that retrying cannot fix. The
-        // recorded `Error` status is left in place on the way out.
-        let mut terminal = false;
-
         loop {
             let sleep_duration = if consecutive_failures > 0 {
                 // Exponential backoff
@@ -951,7 +962,12 @@ impl SyncManager {
             tokio::select! {
                 _ = shutdown.notified() => {
                     debug!("Sync background loop shutting down");
-                    break;
+                    // Recorded here, not only by `stop()`: a `stop()` dropped
+                    // after signalling shutdown never reaches its own write.
+                    if let Ok(mut s) = status.write() {
+                        *s = SyncStatus::Idle;
+                    }
+                    return LoopExit::Shutdown;
                 }
                 _ = tokio::time::sleep(sleep_duration) => {
                     let applier = RemoteChangeApplier::new(Arc::clone(&db), config.clone());
@@ -985,8 +1001,7 @@ impl SyncManager {
                             if let Ok(mut s) = status.write() {
                                 *s = SyncStatus::Error(e.to_string());
                             }
-                            terminal = true;
-                            break;
+                            return LoopExit::Terminal;
                         }
                         Err(e) => {
                             consecutive_failures += 1;
@@ -1003,12 +1018,6 @@ impl SyncManager {
                         }
                     }
                 }
-            }
-        }
-
-        if !terminal {
-            if let Ok(mut s) = status.write() {
-                *s = SyncStatus::Idle;
             }
         }
     }
@@ -1112,6 +1121,17 @@ impl SyncManager {
              (bound {bound}, now {observed}); refusing to keep re-establishing"
         ))
     }
+}
+
+/// Why the background task exited — reported through its `JoinHandle` so
+/// [`SyncManager::stop`] decides the final status after the join, never from a
+/// pre-join guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopExit {
+    /// A `stop()` signalled shutdown; the task recorded [`SyncStatus::Idle`].
+    Shutdown,
+    /// A terminal failure; the task recorded [`SyncStatus::Error`] first.
+    Terminal,
 }
 
 /// The size failures no retry can fix: one change that can never be sent, a

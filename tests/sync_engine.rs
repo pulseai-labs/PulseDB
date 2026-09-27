@@ -4338,3 +4338,167 @@ fn recovery_completion_sync_manager_new_rejects_invalid_config() {
     );
     assert!(err.is_config());
 }
+
+// ============================================================================
+// PR #88 review round 1 — `stop()` preserves a terminal error recorded by a
+// task that exits AFTER `stop()` signalled shutdown
+// ============================================================================
+
+/// Handshakes normally, then parks every push until released and answers it
+/// with a terminal size refusal.
+struct ParkedTerminalPush {
+    peer: InstanceId,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl SyncTransport for ParkedTerminalPush {
+    async fn handshake(
+        &self,
+        _request: pulsedb::sync::types::HandshakeRequest,
+        _send_budget_bytes: usize,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, SyncError> {
+        Ok(pulsedb::sync::types::HandshakeResponse {
+            instance_id: self.peer,
+            protocol_version: SYNC_PROTOCOL_VERSION,
+            accepted: true,
+            reason: None,
+            receive_limit_bytes: WIDE_CAP as u64,
+        })
+    }
+
+    async fn push_changes(
+        &self,
+        _request: PushRequest,
+        _send_budget_bytes: usize,
+    ) -> Result<WireReply<pulsedb::sync::types::PushAck>, SyncError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Err(SyncError::PeerRejectedSize {
+            operation: wire::WireOperation::Push,
+            sent: 1,
+        })
+    }
+
+    async fn pull_changes(
+        &self,
+        _request: PullRequest,
+        _send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        unreachable!("a PushOnly manager never pulls");
+    }
+
+    async fn health_check(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        WIDE_CAP
+    }
+}
+
+/// The interleaving, pinned without a clock. The background push is parked
+/// inside the transport; `stop()` is polled exactly once, so it has seen the
+/// task still running, signalled shutdown and is waiting on the join; only
+/// then is the push released to fail terminally. The task records `Error` and
+/// exits on its own terms — and `stop()` must not overwrite that with `Idle`.
+#[tokio::test]
+async fn recovery_completion_stop_preserves_terminal_error_when_racing_task_exit() {
+    let (db, _dir) = open_db();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(ParkedTerminalPush {
+            peer: InstanceId::new(),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        SyncConfig {
+            direction: SyncDirection::PushOnly,
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    manager.start().await.unwrap();
+    entered.notified().await;
+
+    {
+        let mut stop = std::pin::pin!(manager.stop());
+        assert!(
+            futures::poll!(stop.as_mut()).is_pending(),
+            "stop() must be waiting on the parked task's join"
+        );
+        release.notify_one();
+        stop.await.expect("the task exited without panicking");
+    }
+
+    match manager.status() {
+        SyncStatus::Error(message) => assert!(
+            message.contains("413"),
+            "the terminal reason survives the stop, got {message}"
+        ),
+        other => panic!("stop() erased the terminal error the task recorded: {other:?}"),
+    }
+}
+
+/// The plain case: a stop with no terminal error ends `Idle`.
+#[tokio::test]
+async fn recovery_completion_stop_without_terminal_error_ends_idle() {
+    let (db, _dir) = open_db();
+    let (transport, _) = InMemorySyncTransport::new_pair();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(transport),
+        SyncConfig {
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+
+    manager.start().await.unwrap();
+    assert_eq!(manager.status(), SyncStatus::Syncing);
+    manager.stop().await.unwrap();
+    assert_eq!(manager.status(), SyncStatus::Idle);
+}
+
+/// A `stop()` that is cancelled after signalling shutdown — polled once, then
+/// dropped — still leaves the manager `Idle`: the task records `Idle` itself on
+/// its shutdown exit, whether or not anyone is still awaiting the join.
+#[tokio::test]
+async fn recovery_completion_cancelled_stop_still_ends_idle() {
+    let (db, _dir) = open_db();
+    let (transport, _) = InMemorySyncTransport::new_pair();
+    let mut manager =
+        SyncManager::new(Arc::clone(&db), Box::new(transport), sync_config()).unwrap();
+
+    manager.start().await.unwrap();
+    assert_eq!(manager.status(), SyncStatus::Syncing);
+    {
+        let mut stop = std::pin::pin!(manager.stop());
+        // Single-threaded runtime: the task cannot run until this test yields,
+        // so the first poll signals shutdown and parks on the join.
+        assert!(
+            futures::poll!(stop.as_mut()).is_pending(),
+            "stop() must be waiting on the join when it is dropped"
+        );
+    }
+
+    for _ in 0..100 {
+        if manager.status() == SyncStatus::Idle {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        manager.status(),
+        SyncStatus::Idle,
+        "a shutdown exit ends Idle even when the stop() awaiting it was dropped"
+    );
+}
