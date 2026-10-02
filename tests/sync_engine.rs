@@ -4502,3 +4502,227 @@ async fn recovery_completion_cancelled_stop_still_ends_idle() {
         "a shutdown exit ends Idle even when the stop() awaiting it was dropped"
     );
 }
+
+// ============================================================================
+// PR #88 review round 2 — `peer_instance_id()` follows a rebind made by the
+// background task
+// ============================================================================
+
+/// A [`RestorableTransport`] that signals every push the endpoint accepted.
+/// A push is the last exchange of a bidirectional cycle, so the signal marks a
+/// cycle that has finished talking to the peer.
+///
+/// When `restore_after_pull` is armed, the next pull the endpoint answers is
+/// followed by a restore — the endpoint is replaced between a cycle's pull and
+/// its push, so the PUSH is what detects the change.
+struct SignallingRestorable {
+    inner: RestorableTransport,
+    pushed: Arc<tokio::sync::Notify>,
+    restore_after_pull: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl SyncTransport for SignallingRestorable {
+    async fn handshake(
+        &self,
+        request: pulsedb::sync::types::HandshakeRequest,
+        send_budget_bytes: usize,
+    ) -> Result<pulsedb::sync::types::HandshakeResponse, SyncError> {
+        self.inner.handshake(request, send_budget_bytes).await
+    }
+
+    async fn push_changes(
+        &self,
+        request: PushRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<pulsedb::sync::types::PushAck>, SyncError> {
+        let reply = self.inner.push_changes(request, send_budget_bytes).await?;
+        if matches!(reply.result, WireResult::Ok(_)) {
+            self.pushed.notify_one();
+        }
+        Ok(reply)
+    }
+
+    async fn pull_changes(
+        &self,
+        request: PullRequest,
+        send_budget_bytes: usize,
+    ) -> Result<WireReply<PullPage>, SyncError> {
+        let reply = self.inner.pull_changes(request, send_budget_bytes).await?;
+        if matches!(reply.result, WireResult::Ok(_))
+            && self
+                .restore_after_pull
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.inner.0.restore(Vec::new());
+        }
+        Ok(reply)
+    }
+
+    async fn health_check(&self) -> Result<(), SyncError> {
+        self.inner.health_check().await
+    }
+
+    fn receive_limit_bytes(&self) -> usize {
+        self.inner.receive_limit_bytes()
+    }
+}
+
+/// The background task rebinds to a restored endpoint, and the manager's
+/// accessor reports the identity the task is now bound to — not the one
+/// `start()` captured. The last bound identity survives `stop()`, and a restart
+/// binds to the endpoint as it is now, with no further rebind.
+///
+/// Sequenced without a clock: `start()` completes its handshake before the
+/// task first runs, so the restore lands before the first cycle; on this
+/// single-threaded runtime the test wakes from the accepted-push signal only
+/// once the task has finished that cycle and parked on its interval.
+#[tokio::test]
+async fn recovery_completion_peer_instance_id_follows_background_rebind() {
+    let endpoint = RestorableEndpoint::new(Vec::new());
+    let (db, _dir) = open_db();
+    let cid = db.create_collective("bg-rebind-identity").unwrap();
+    db.record_experience(minimal_exp(cid)).unwrap();
+    let pushed = Arc::new(tokio::sync::Notify::new());
+    let mut manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(SignallingRestorable {
+            inner: RestorableTransport(Arc::clone(&endpoint)),
+            pushed: Arc::clone(&pushed),
+            restore_after_pull: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+        SyncConfig {
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+    let original = endpoint.peer();
+
+    manager.start().await.unwrap();
+    assert_eq!(manager.peer_instance_id(), Some(original));
+
+    let restored = endpoint.restore(Vec::new());
+    assert_ne!(restored, original);
+    pushed.notified().await;
+    assert_eq!(
+        endpoint.handshakes(),
+        2,
+        "the first cycle must have rebound to the restored endpoint"
+    );
+    assert_eq!(
+        manager.peer_instance_id(),
+        Some(restored),
+        "peer_instance_id() must report the identity the background task rebound to"
+    );
+
+    manager.stop().await.unwrap();
+    assert_eq!(
+        manager.peer_instance_id(),
+        Some(restored),
+        "stop() keeps the last bound identity"
+    );
+
+    manager.start().await.unwrap();
+    assert_eq!(manager.peer_instance_id(), Some(restored));
+    pushed.notified().await;
+    assert_eq!(
+        endpoint.handshakes(),
+        3,
+        "a restart binds to the endpoint as it is now and needs no further rebind"
+    );
+    assert_eq!(manager.peer_instance_id(), Some(restored));
+    manager.stop().await.unwrap();
+}
+
+// ============================================================================
+// PR #88 review round 2 amendment — the push-side and `initial_sync` rebinds
+// are published too
+// ============================================================================
+
+/// The endpoint is replaced after the background cycle's pull is answered and
+/// before its push, so the pull still sees the old peer and the PUSH detects
+/// the change. The rebind made there is what `peer_instance_id()` must report.
+///
+/// Sequenced as the round-2 test is: the swap is armed before `start()`, whose
+/// handshake involves no pull, and the test wakes from the accepted-push signal
+/// only once the task has finished the rebinding cycle.
+#[tokio::test]
+async fn recovery_completion_peer_instance_id_follows_background_push_side_rebind() {
+    let endpoint = RestorableEndpoint::new(Vec::new());
+    let (db, _dir) = open_db();
+    let cid = db.create_collective("bg-push-rebind-identity").unwrap();
+    db.record_experience(minimal_exp(cid)).unwrap();
+    let pushed = Arc::new(tokio::sync::Notify::new());
+    let restore_after_pull = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(SignallingRestorable {
+            inner: RestorableTransport(Arc::clone(&endpoint)),
+            pushed: Arc::clone(&pushed),
+            restore_after_pull: Arc::clone(&restore_after_pull),
+        }),
+        SyncConfig {
+            push_interval_ms: 10,
+            pull_interval_ms: 10,
+            ..sync_config()
+        },
+    )
+    .unwrap();
+    let original = endpoint.peer();
+
+    manager.start().await.unwrap();
+    assert_eq!(manager.peer_instance_id(), Some(original));
+
+    pushed.notified().await;
+    let restored = endpoint.peer();
+    assert_ne!(
+        restored, original,
+        "the swap must have fired after the pull"
+    );
+    assert!(!restore_after_pull.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        endpoint.handshakes(),
+        2,
+        "the push must have detected the replacement and rebound once"
+    );
+    assert_eq!(
+        manager.peer_instance_id(),
+        Some(restored),
+        "peer_instance_id() must report the identity the push-side rebind bound to"
+    );
+    manager.stop().await.unwrap();
+}
+
+/// `initial_sync` re-establishes on its own path (`catch_up`), separately from
+/// the sync cycle, and must publish that rebind too.
+#[tokio::test]
+async fn recovery_completion_peer_instance_id_follows_initial_sync_rebind() {
+    let endpoint = RestorableEndpoint::new(Vec::new());
+    let (db, _dir) = open_db();
+    let mut manager = SyncManager::new(
+        Arc::clone(&db),
+        Box::new(RestorableTransport(Arc::clone(&endpoint))),
+        sync_config(),
+    )
+    .unwrap();
+    let original = endpoint.peer();
+
+    manager.sync_once().await.unwrap();
+    assert_eq!(manager.peer_instance_id(), Some(original));
+
+    let restored = endpoint.restore(Vec::new());
+    assert_ne!(restored, original);
+    manager.initial_sync(None).await.unwrap();
+    assert_eq!(
+        endpoint.handshakes(),
+        2,
+        "initial_sync must have re-established against the restored endpoint"
+    );
+    assert_eq!(
+        manager.peer_instance_id(),
+        Some(restored),
+        "peer_instance_id() must report the identity initial_sync re-established"
+    );
+}

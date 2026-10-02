@@ -141,7 +141,11 @@ pub struct SyncManager {
     /// The peer this session is bound to, or `None` before the first
     /// handshake. Re-established whenever a reply reveals a different
     /// responder.
-    peer: Option<PeerBinding>,
+    ///
+    /// Shared with the background task, which publishes every rebind it makes
+    /// here: the one record [`peer_instance_id`](Self::peer_instance_id),
+    /// `sync_once` and `initial_sync` all read.
+    peer: Arc<RwLock<Option<PeerBinding>>>,
     status: Arc<RwLock<SyncStatus>>,
     stats: Arc<Mutex<SyncStats>>,
     /// Replaced on every [`start`](Self::start): a `Notify` permit stored by a
@@ -200,7 +204,7 @@ impl SyncManager {
             transport,
             config,
             local_instance_id,
-            peer: None,
+            peer: Arc::new(RwLock::new(None)),
             status: Arc::new(RwLock::new(SyncStatus::Idle)),
             stats: Arc::new(Mutex::new(SyncStats::default())),
             shutdown: Arc::new(Notify::new()),
@@ -238,7 +242,7 @@ impl SyncManager {
             self.config.max_request_bytes,
         )
         .await?;
-        self.peer = Some(binding);
+        Self::publish_peer(&self.peer, binding);
 
         self.set_status(SyncStatus::Syncing);
 
@@ -250,13 +254,14 @@ impl SyncManager {
         let transport = Arc::clone(&self.transport);
         let config = self.config.clone();
         let local_id = self.local_instance_id;
+        let peer = Arc::clone(&self.peer);
         let status = Arc::clone(&self.status);
         let stats = Arc::clone(&self.stats);
         let shutdown = Arc::clone(&self.shutdown);
 
         let handle = tokio::spawn(async move {
             Self::background_loop(
-                db, transport, config, local_id, binding, status, stats, shutdown,
+                db, transport, config, local_id, binding, peer, status, stats, shutdown,
             )
             .await
         });
@@ -325,12 +330,10 @@ impl SyncManager {
             &self.config,
             self.local_instance_id,
             &mut binding,
+            &self.peer,
             &self.stats,
         )
         .await;
-        // The binding is written back whatever happened: a rebind that occurred
-        // before the failure is still the truth about the endpoint.
-        self.peer = Some(binding);
         if let Err(e) = result {
             // A deterministic dead end is recorded, not just returned: a caller
             // that polls `status()` must see the same terminal condition the
@@ -486,7 +489,7 @@ impl SyncManager {
                         self.config.max_request_bytes,
                     )
                     .await?;
-                    self.peer = Some(binding);
+                    Self::publish_peer(&self.peer, binding);
                     position = SyncPosition::new(
                         binding.identity,
                         Self::load_pull_sequence(&self.db, binding.identity)?,
@@ -618,15 +621,25 @@ impl SyncManager {
     }
 
     /// The peer identity this session is bound to, if any.
+    ///
+    /// Current whichever path made the binding: `start()`, `sync_once`,
+    /// `initial_sync`, or a rebind the background loop made after detecting a
+    /// remint or a replaced endpoint — the loop publishes each rebind as it
+    /// makes it.
+    ///
+    /// `None` only before the first handshake. After [`stop()`](Self::stop),
+    /// and after the loop exits on a terminal error, this keeps reporting the
+    /// **last** identity bound; the next `start()` handshakes again and
+    /// replaces it with whatever the endpoint answers as then.
     pub fn peer_instance_id(&self) -> Option<InstanceId> {
-        self.peer.map(|b| b.identity)
+        Self::current_peer(&self.peer).map(|b| b.identity)
     }
 
     // ─── Internal helpers ────────────────────────────────────────────
 
     /// The peer this session is bound to, handshaking once if it has none yet.
     async fn bound_peer(&mut self) -> Result<PeerBinding, SyncError> {
-        match self.peer {
+        match Self::current_peer(&self.peer) {
             Some(binding) => Ok(binding),
             None => {
                 let binding = Self::handshake_with(
@@ -635,10 +648,20 @@ impl SyncManager {
                     self.config.max_request_bytes,
                 )
                 .await?;
-                self.peer = Some(binding);
+                Self::publish_peer(&self.peer, binding);
                 Ok(binding)
             }
         }
+    }
+
+    /// The binding last published to `peer`.
+    fn current_peer(peer: &RwLock<Option<PeerBinding>>) -> Option<PeerBinding> {
+        *peer.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records `binding` as the one this session is bound to.
+    fn publish_peer(peer: &RwLock<Option<PeerBinding>>, binding: PeerBinding) {
+        *peer.write().unwrap_or_else(|e| e.into_inner()) = Some(binding);
     }
 
     /// Re-establishes the peer after a reply came back from a different
@@ -932,12 +955,14 @@ impl SyncManager {
         config: SyncConfig,
         local_id: InstanceId,
         binding: PeerBinding,
+        peer: Arc<RwLock<Option<PeerBinding>>>,
         status: Arc<RwLock<SyncStatus>>,
         stats: Arc<Mutex<SyncStats>>,
         shutdown: Arc<Notify>,
     ) -> LoopExit {
         // Rebound in place by `run_sync_cycle` when a reply reveals that the
-        // endpoint is answering under a different identity.
+        // endpoint is answering under a different identity, which also
+        // publishes the rebind to the manager's shared `peer`.
         let mut binding = binding;
 
         let interval_ms = std::cmp::max(config.push_interval_ms, config.pull_interval_ms);
@@ -973,7 +998,8 @@ impl SyncManager {
                     let applier = RemoteChangeApplier::new(Arc::clone(&db), config.clone());
 
                     let result = Self::run_sync_cycle(
-                        &applier, &transport, &db, &config, local_id, &mut binding, &stats,
+                        &applier, &transport, &db, &config, local_id, &mut binding, &peer,
+                        &stats,
                     )
                     .await;
 
@@ -1026,7 +1052,10 @@ impl SyncManager {
     ///
     /// `binding` is rebound **in place** when a reply reveals a different
     /// responder, which is what keeps a long-lived task from running the rest
-    /// of its life against the identity it was spawned with.
+    /// of its life against the identity it was spawned with. Each rebind is
+    /// published to `peer` the moment it is made — before the cycle continues,
+    /// so a cycle that later fails still leaves the truth about the endpoint
+    /// behind.
     ///
     /// **One rebind for the whole cycle**, shared between the pull and the push.
     /// On a rebind the cycle restarts from the top against the new identity's
@@ -1040,6 +1069,7 @@ impl SyncManager {
         config: &SyncConfig,
         local_id: InstanceId,
         binding: &mut PeerBinding,
+        peer: &RwLock<Option<PeerBinding>>,
         stats: &Mutex<SyncStats>,
     ) -> Result<(), SyncError> {
         let mut rebinds_left = 1u32;
@@ -1067,6 +1097,7 @@ impl SyncManager {
                             config.max_request_bytes,
                         )
                         .await?;
+                        Self::publish_peer(peer, *binding);
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -1106,6 +1137,7 @@ impl SyncManager {
                             config.max_request_bytes,
                         )
                         .await?;
+                        Self::publish_peer(peer, *binding);
                         continue;
                     }
                 }
