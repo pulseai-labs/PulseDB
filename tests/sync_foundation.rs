@@ -11,12 +11,20 @@ use pulsedb::sync::guard::{is_sync_applying, SyncApplyGuard};
 use pulsedb::sync::transport::SyncTransport;
 use pulsedb::sync::transport_mem::InMemorySyncTransport;
 use pulsedb::sync::types::{
-    HandshakeRequest, InstanceId, PullRequest, SyncChange, SyncCursor, SyncEntityType, SyncPayload,
-    SyncStatus,
+    HandshakeRequest, InstanceId, PullRequest, PushRequest, SyncChange, SyncCursor, SyncEntityType,
+    SyncPayload, SyncPosition, SyncStatus,
 };
 use pulsedb::sync::SYNC_PROTOCOL_VERSION;
 use pulsedb::{Collective, CollectiveId, Config, Timestamp};
 use tempfile::tempdir;
+
+/// The outbound budget a DIRECT transport call supplies.
+///
+/// A direct caller is not the pusher, so nothing computed a packing cap for it;
+/// it states its own budget explicitly. The encoder still enforces it — see the
+/// direct-caller regression, which passes a budget smaller than the request and
+/// gets `RequestTooLarge` back before anything is transmitted.
+const DIRECT_SEND_BUDGET: usize = 64 * 1024 * 1024;
 
 // ============================================================================
 // InstanceId persistence
@@ -78,7 +86,8 @@ fn test_sync_cursor_save_and_load() {
     let peer_id = InstanceId::new();
     let cursor = SyncCursor {
         instance_id: peer_id,
-        last_sequence: 42,
+        push_sequence: 42,
+        pull_sequence: 0,
     };
 
     // Save
@@ -114,7 +123,8 @@ fn test_sync_cursor_upsert() {
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_id,
-            last_sequence: 10,
+            push_sequence: 10,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -122,12 +132,13 @@ fn test_sync_cursor_upsert() {
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_id,
-            last_sequence: 50,
+            push_sequence: 50,
+            pull_sequence: 0,
         })
         .unwrap();
 
     let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
-    assert_eq!(loaded.last_sequence, 50);
+    assert_eq!(loaded.push_sequence, 50);
 }
 
 #[test]
@@ -144,19 +155,22 @@ fn test_sync_cursor_list_multiple_peers() {
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_a,
-            last_sequence: 10,
+            push_sequence: 10,
+            pull_sequence: 0,
         })
         .unwrap();
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_b,
-            last_sequence: 20,
+            push_sequence: 20,
+            pull_sequence: 0,
         })
         .unwrap();
     storage
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_c,
-            last_sequence: 30,
+            push_sequence: 30,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -184,7 +198,8 @@ fn test_sync_cursor_persists_across_reopens() {
         storage
             .save_sync_cursor(&SyncCursor {
                 instance_id: peer_id,
-                last_sequence: 99,
+                push_sequence: 99,
+                pull_sequence: 0,
             })
             .unwrap();
         drop(storage);
@@ -194,8 +209,164 @@ fn test_sync_cursor_persists_across_reopens() {
     {
         let storage = pulsedb::storage::RedbStorage::open(&path, &config).unwrap();
         let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
-        assert_eq!(loaded.last_sequence, 99);
+        assert_eq!(loaded.push_sequence, 99);
     }
+}
+
+// ============================================================================
+// Cursor positions are monotonic non-decreasing (PR #88 review, class A)
+// ============================================================================
+
+/// A push whose FIRST change fails to apply is acknowledged as sequence 0.
+/// Writing that 0 over an already-advanced `push_sequence` would permanently
+/// wedge `compact_wal` — it blocks while any peer's push position is 0 — and
+/// re-push the whole WAL every cycle forever. The zero ack must leave the
+/// stored position exactly where it was.
+#[test]
+fn test_zero_push_acknowledgement_does_not_rewind_the_stored_position() {
+    let dir = tempdir().unwrap();
+    let config = Config::default();
+    let storage =
+        pulsedb::storage::RedbStorage::open(dir.path().join("cursor.db"), &config).unwrap();
+
+    let peer_id = InstanceId::new();
+
+    // The peer has acknowledged through 120 over previous cycles.
+    storage.update_push_cursor(&peer_id, 120).unwrap();
+    assert_eq!(
+        storage
+            .load_sync_cursor(&peer_id)
+            .unwrap()
+            .unwrap()
+            .push_sequence,
+        120
+    );
+
+    // The next batch's first change fails to apply: the peer acknowledges 0.
+    storage.update_push_cursor(&peer_id, 0).unwrap();
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(
+        loaded.push_sequence, 120,
+        "a zero acknowledgement must never move the push position backwards"
+    );
+    assert_eq!(loaded.pull_sequence, 0, "the pull side is untouched");
+}
+
+/// The same rule for every backwards acknowledgement, not just zero, and on
+/// both sides of the record.
+#[test]
+fn test_cursor_positions_are_monotonic_non_decreasing() {
+    let dir = tempdir().unwrap();
+    let config = Config::default();
+    let storage =
+        pulsedb::storage::RedbStorage::open(dir.path().join("cursor.db"), &config).unwrap();
+
+    let peer_id = InstanceId::new();
+
+    storage.update_push_cursor(&peer_id, 50).unwrap();
+    storage.update_pull_cursor(&peer_id, 70).unwrap();
+
+    // Backwards acknowledgements are absorbed.
+    storage.update_push_cursor(&peer_id, 20).unwrap();
+    storage.update_pull_cursor(&peer_id, 0).unwrap();
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(loaded.push_sequence, 50);
+    assert_eq!(loaded.pull_sequence, 70);
+
+    // Forward acknowledgements still advance.
+    storage.update_push_cursor(&peer_id, 51).unwrap();
+    storage.update_pull_cursor(&peer_id, 71).unwrap();
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(loaded.push_sequence, 51);
+    assert_eq!(loaded.pull_sequence, 71);
+}
+
+/// The monotonic clamp must not stop an absent record from being created — a
+/// zero-valued update is how an empty pull registers a `PullOnly` peer.
+#[test]
+fn test_zero_update_still_registers_an_unknown_peer() {
+    let dir = tempdir().unwrap();
+    let config = Config::default();
+    let storage =
+        pulsedb::storage::RedbStorage::open(dir.path().join("cursor.db"), &config).unwrap();
+
+    let peer_id = InstanceId::new();
+    storage.update_pull_cursor(&peer_id, 0).unwrap();
+
+    let loaded = storage
+        .load_sync_cursor(&peer_id)
+        .unwrap()
+        .expect("an empty pull must still create the peer's record");
+    assert_eq!(loaded.push_sequence, 0);
+    assert_eq!(loaded.pull_sequence, 0);
+}
+
+/// The pull path persists its position on every cycle, empty pulls included,
+/// and the intervals default to one second — so a no-op update must not pay a
+/// durable write. An update that changes nothing about an existing record
+/// leaves the store file untouched.
+///
+/// # Why the witness is `(len, mtime)` and not the bytes
+///
+/// redb takes an exclusive **whole-file** lock while the store is open, so
+/// reading the file's bytes fails on Windows. `fs::metadata` does not touch the
+/// locked byte range and is legal on every platform this ships to.
+///
+/// Both components are needed and neither alone would do: a commit need not
+/// resize the file, so length alone can miss a real write, and a coarse
+/// filesystem clock can miss an mtime change inside one tick. Dropping and
+/// reopening the store to take a byte snapshot is not an alternative — that
+/// operation itself makes redb flush and rewrite allocator state, so the
+/// snapshot would witness the drop rather than the guard.
+///
+/// The positive control below is what keeps the no-op assertion from passing
+/// vacuously: if this filesystem cannot show a real commit through either
+/// component, the test FAILS rather than silently asserting nothing.
+#[test]
+fn test_no_op_cursor_update_does_not_touch_the_store() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cursor.db");
+    let config = Config::default();
+    let storage = pulsedb::storage::RedbStorage::open(&path, &config).unwrap();
+
+    let peer_id = InstanceId::new();
+    storage.update_pull_cursor(&peer_id, 7).unwrap();
+
+    let witness = || {
+        let m = std::fs::metadata(&path).expect("the store file is always stat-able");
+        (m.len(), m.modified().expect("mtime is available"))
+    };
+    let before = witness();
+
+    // Ten idle cycles' worth of "persist the position we already have".
+    for _ in 0..10 {
+        storage.update_pull_cursor(&peer_id, 7).unwrap();
+        storage.update_push_cursor(&peer_id, 0).unwrap();
+    }
+
+    assert_eq!(
+        before,
+        witness(),
+        "a cursor update that changes nothing must not commit a write transaction"
+    );
+
+    // Positive control: a REAL advance must move the witness in this
+    // environment, or the assertion above proves nothing. This is the
+    // non-vacuity guard, not a claim about clock resolution in general.
+    storage.update_pull_cursor(&peer_id, 8).unwrap();
+    assert_ne!(
+        before,
+        witness(),
+        "the witness did not move for a real cursor commit, so the no-op \
+         assertion above is vacuous on this filesystem"
+    );
+
+    let loaded = storage.load_sync_cursor(&peer_id).unwrap().unwrap();
+    assert_eq!(loaded.pull_sequence, 8);
+    assert_eq!(loaded.push_sequence, 0);
 }
 
 // ============================================================================
@@ -233,9 +404,13 @@ fn test_sync_apply_guard_resets_on_panic() {
 // ============================================================================
 
 fn make_change(seq: u64, cid: CollectiveId) -> SyncChange {
+    make_change_from(seq, cid, InstanceId::new())
+}
+
+fn make_change_from(seq: u64, cid: CollectiveId, source: InstanceId) -> SyncChange {
     SyncChange {
         sequence: seq,
-        source_instance: InstanceId::new(),
+        source_instance: source,
         collective_id: cid,
         entity_type: SyncEntityType::Collective,
         payload: SyncPayload::CollectiveCreated(Collective {
@@ -250,92 +425,160 @@ fn make_change(seq: u64, cid: CollectiveId) -> SyncChange {
     }
 }
 
+/// A routed pull addressed to `target`.
+fn pull_request(target: InstanceId, from: u64, batch_size: u64) -> PullRequest {
+    PullRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        source_instance: InstanceId::new(),
+        target_instance: target,
+        cursor: SyncPosition::new(target, from),
+        batch_size,
+        reply_limit_bytes: 64 * 1024 * 1024,
+        collectives: None,
+    }
+}
+
+/// A routed push from `source` to `target`.
+fn push_request(source: InstanceId, target: InstanceId, changes: Vec<SyncChange>) -> PushRequest {
+    PushRequest {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        source_instance: source,
+        target_instance: target,
+        reply_limit_bytes: 64 * 1024 * 1024,
+        changes,
+    }
+}
+
 #[tokio::test]
 async fn test_memory_transport_full_roundtrip() {
     let (local, remote) = InMemorySyncTransport::new_pair();
     let cid = CollectiveId::new();
+    let sender = InstanceId::new();
 
     // Handshake
     let hs_req = HandshakeRequest {
-        instance_id: InstanceId::new(),
+        instance_id: sender,
         protocol_version: SYNC_PROTOCOL_VERSION,
         capabilities: vec!["push".into(), "pull".into()],
     };
-    let hs_resp = local.handshake(hs_req).await.unwrap();
+    let hs_resp = local.handshake(hs_req, DIRECT_SEND_BUDGET).await.unwrap();
     assert!(hs_resp.accepted);
     assert_eq!(hs_resp.protocol_version, SYNC_PROTOCOL_VERSION);
+    assert_eq!(
+        hs_resp.receive_limit_bytes as usize,
+        local.receive_limit_bytes(),
+        "the handshake advertises the responder's ACTUAL inbound limit"
+    );
 
     // Health check
     assert!(local.health_check().await.is_ok());
     assert!(remote.health_check().await.is_ok());
 
-    // Push changes from local
+    // Push changes into the SENDER's lane.
     let changes = vec![
-        make_change(1, cid),
-        make_change(2, cid),
-        make_change(3, cid),
+        make_change_from(1, cid, sender),
+        make_change_from(2, cid, sender),
+        make_change_from(3, cid, sender),
     ];
-    let push_resp = local.push_changes(changes).await.unwrap();
-    assert_eq!(push_resp.accepted, 3);
-    assert_eq!(push_resp.rejected, 0);
+    let ack = local
+        .push_changes(
+            push_request(sender, local.instance_id(), changes),
+            DIRECT_SEND_BUDGET,
+        )
+        .await
+        .unwrap()
+        .into_result(local.instance_id())
+        .unwrap();
+    assert_eq!(ack.accepted, 3);
+    assert_eq!(ack.rejected, 0);
+    assert_eq!(ack.total, 3);
+    assert_eq!(
+        ack.wal_owner, sender,
+        "a push acknowledges a position in the SENDER's WAL"
+    );
 
-    // Pull changes from remote (shared buffer)
-    let pull_req = PullRequest {
-        cursor: SyncCursor::new(remote.instance_id()),
-        batch_size: 500,
-        collectives: None,
-    };
-    let pull_resp = remote.pull_changes(pull_req).await.unwrap();
-    assert_eq!(pull_resp.changes.len(), 3);
-    assert!(!pull_resp.has_more);
+    // A pull reads the addressed peer's OWN lane, which the push did not touch.
+    let page = remote
+        .pull_changes(
+            pull_request(remote.instance_id(), 0, 500),
+            DIRECT_SEND_BUDGET,
+        )
+        .await
+        .unwrap()
+        .into_result(remote.instance_id())
+        .unwrap();
+    assert!(
+        page.changes.is_empty(),
+        "push and pull are separate lanes: one peer's WAL is not the other's"
+    );
 
-    // Verify sequence ordering
-    assert_eq!(pull_resp.changes[0].sequence, 1);
-    assert_eq!(pull_resp.changes[1].sequence, 2);
-    assert_eq!(pull_resp.changes[2].sequence, 3);
+    // Seeded into the peer's own lane, the same changes come back in order.
+    remote.seed(vec![
+        make_change_from(1, cid, remote.instance_id()),
+        make_change_from(2, cid, remote.instance_id()),
+        make_change_from(3, cid, remote.instance_id()),
+    ]);
+    let page = remote
+        .pull_changes(
+            pull_request(remote.instance_id(), 0, 500),
+            DIRECT_SEND_BUDGET,
+        )
+        .await
+        .unwrap()
+        .into_result(remote.instance_id())
+        .unwrap();
+    assert_eq!(page.changes.len(), 3);
+    assert!(!page.has_more);
+    assert_eq!(page.changes[0].sequence, 1);
+    assert_eq!(page.changes[1].sequence, 2);
+    assert_eq!(page.changes[2].sequence, 3);
+    assert_eq!(page.scan_position.instance_id, remote.instance_id());
+    assert_eq!(page.scan_position.sequence, 3);
 }
 
 #[tokio::test]
 async fn test_memory_transport_incremental_pull() {
-    let (local, remote) = InMemorySyncTransport::new_pair();
+    let (_local, remote) = InMemorySyncTransport::new_pair();
     let cid = CollectiveId::new();
+    let peer = remote.instance_id();
 
-    // Push 5 changes
-    let changes: Vec<SyncChange> = (1..=5).map(|s| make_change(s, cid)).collect();
-    local.push_changes(changes).await.unwrap();
+    remote.seed((1..=5).map(|s| make_change_from(s, cid, peer)).collect());
 
-    // Pull first batch (size 2)
-    let pull1 = PullRequest {
-        cursor: SyncCursor::new(remote.instance_id()),
-        batch_size: 2,
-        collectives: None,
-    };
-    let resp1 = remote.pull_changes(pull1).await.unwrap();
-    assert_eq!(resp1.changes.len(), 2);
-    assert!(resp1.has_more);
-    assert_eq!(resp1.new_cursor.last_sequence, 2);
+    let page1 = remote
+        .pull_changes(pull_request(peer, 0, 2), DIRECT_SEND_BUDGET)
+        .await
+        .unwrap()
+        .into_result(peer)
+        .unwrap();
+    assert_eq!(page1.changes.len(), 2);
+    assert!(page1.has_more);
+    assert_eq!(page1.scan_position.sequence, 2);
 
-    // Pull next batch from cursor
-    let pull2 = PullRequest {
-        cursor: resp1.new_cursor,
-        batch_size: 2,
-        collectives: None,
-    };
-    let resp2 = remote.pull_changes(pull2).await.unwrap();
-    assert_eq!(resp2.changes.len(), 2);
-    assert!(resp2.has_more);
-    assert_eq!(resp2.new_cursor.last_sequence, 4);
+    let page2 = remote
+        .pull_changes(
+            pull_request(peer, page1.scan_position.sequence, 2),
+            DIRECT_SEND_BUDGET,
+        )
+        .await
+        .unwrap()
+        .into_result(peer)
+        .unwrap();
+    assert_eq!(page2.changes.len(), 2);
+    assert!(page2.has_more);
+    assert_eq!(page2.scan_position.sequence, 4);
 
-    // Pull remainder
-    let pull3 = PullRequest {
-        cursor: resp2.new_cursor,
-        batch_size: 100,
-        collectives: None,
-    };
-    let resp3 = remote.pull_changes(pull3).await.unwrap();
-    assert_eq!(resp3.changes.len(), 1);
-    assert!(!resp3.has_more);
-    assert_eq!(resp3.new_cursor.last_sequence, 5);
+    let page3 = remote
+        .pull_changes(
+            pull_request(peer, page2.scan_position.sequence, 100),
+            DIRECT_SEND_BUDGET,
+        )
+        .await
+        .unwrap()
+        .into_result(peer)
+        .unwrap();
+    assert_eq!(page3.changes.len(), 1);
+    assert!(!page3.has_more);
+    assert_eq!(page3.scan_position.sequence, 5);
 }
 
 // ============================================================================
@@ -348,7 +591,7 @@ fn test_sync_config_defaults_are_valid() {
     assert!(config.validate().is_ok());
     assert_eq!(config.direction, SyncDirection::Bidirectional);
     assert_eq!(config.conflict_resolution, ConflictResolution::ServerWins);
-    assert_eq!(config.batch_size, 500);
+    assert_eq!(config.batch_size, 250);
 }
 
 #[test]
@@ -418,7 +661,8 @@ fn test_instance_id_postcard_roundtrip() {
 fn test_sync_cursor_postcard_roundtrip() {
     let cursor = SyncCursor {
         instance_id: InstanceId::new(),
-        last_sequence: 12345,
+        push_sequence: 12345,
+        pull_sequence: 0,
     };
     let bytes = postcard::to_stdvec(&cursor).unwrap();
     let restored: SyncCursor = postcard::from_bytes(&bytes).unwrap();
@@ -444,9 +688,15 @@ fn test_sync_config_postcard_roundtrip() {
 // ============================================================================
 
 #[test]
-fn test_protocol_version_is_four() {
-    // Bumped 3→4 in VS-4.3.2 work-1.04 (tags field on Experience + SerializableExperienceUpdate).
-    assert_eq!(SYNC_PROTOCOL_VERSION, 4);
+fn recovery_v5_protocol_and_wire_versions_are_five_and_four() {
+    // Bumped 4→5 in 0.8.0: wire-carried embeddings, routed requests,
+    // responder-named replies and exact body budgets. There is no v4
+    // interoperability — both replicas upgrade.
+    assert_eq!(SYNC_PROTOCOL_VERSION, 5);
+    // The frame header moved in lockstep: it grew an operation byte, so a v4
+    // frame is not a v5 frame even where the body would have decoded.
+    assert_eq!(pulsedb::sync::WIRE_FORMAT_VERSION, 4);
+    assert_eq!(pulsedb::sync::SYNC_WIRE_PREAMBLE_LEN, 4);
 }
 
 // ============================================================================
@@ -662,6 +912,71 @@ fn test_apply_synced_experience_writes_data() {
     assert_eq!(retrieved.applications(), 5);
 }
 
+/// #96 (atomicity half): a sync create whose embedding cannot go into the
+/// collective's vector index must leave NOTHING behind — not the experience
+/// row, not its secondary index entries, not a WAL event.
+///
+/// The zero-length embedding is the real case: `Experience::embedding` is
+/// `#[serde(skip)]`, so an `ExperienceCreated` crossing a serializing transport
+/// arrives with an empty vector. Saving the record first and only then failing
+/// the index insert left `get_experience` answering `Some` for something
+/// `search_similar` could never find, and made the failure one-shot — the
+/// applier's create arm short-circuits on an existing record, so every retry
+/// resolved as applied and carried the cursors past it.
+#[test]
+fn apply_synced_experience_writes_nothing_when_the_embedding_cannot_be_indexed() {
+    use pulsedb::sync::guard::SyncApplyGuard;
+
+    let (db, _dir) = open_test_db();
+    let cid = db.create_collective("apply-atomicity").unwrap();
+    let seq_before = db.get_current_sequence().unwrap();
+
+    let exp_id = pulsedb::ExperienceId::new();
+    let timestamp = Timestamp::now();
+    let exp = pulsedb::Experience {
+        id: exp_id,
+        collective_id: cid,
+        content: "arrives without its vector".to_string(),
+        // What a serializing transport delivers (#96): no embedding at all.
+        embedding: vec![],
+        experience_type: ExperienceType::Generic { category: None },
+        importance: 0.5,
+        confidence: 0.8,
+        applications: std::collections::BTreeMap::new(),
+        domain: vec![],
+        tags: std::collections::BTreeMap::from([("k".to_string(), "v".to_string())]),
+        related_files: vec![],
+        source_agent: pulsedb::AgentId::new("sync-test"),
+        source_task: None,
+        timestamp,
+        last_reinforced: timestamp,
+        archived: false,
+    };
+
+    let guard = SyncApplyGuard::enter();
+    let err = db
+        .apply_synced_experience(exp)
+        .expect_err("an embedding the index cannot take must not be applied");
+    drop(guard);
+
+    assert!(
+        db.get_experience(exp_id).unwrap().is_none(),
+        "the record must not be in the store after a rejected apply, got: {err}"
+    );
+    assert!(
+        db.list_experiences(cid, 100, 0)
+            .unwrap()
+            .iter()
+            .all(|e| e.id != exp_id),
+        "the by-collective index must not carry the rejected experience either"
+    );
+    assert_eq!(
+        db.get_current_sequence().unwrap(),
+        seq_before,
+        "the rejected apply must not record a WAL event (SyncApplyGuard held)"
+    );
+}
+
 #[test]
 fn test_apply_synced_collective_creates_indexes() {
     use pulsedb::sync::guard::SyncApplyGuard;
@@ -759,7 +1074,8 @@ fn test_compact_wal_single_peer() {
     let peer_id = InstanceId::new();
     let cursor = SyncCursor {
         instance_id: peer_id,
-        last_sequence: 4,
+        push_sequence: 4,
+        pull_sequence: 0,
     };
     db.storage_for_test().save_sync_cursor(&cursor).unwrap();
 
@@ -791,13 +1107,15 @@ fn test_compact_wal_multiple_peers_uses_min_cursor() {
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_a,
-            last_sequence: 3,
+            push_sequence: 3,
+            pull_sequence: 0,
         })
         .unwrap();
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: peer_b,
-            last_sequence: 7,
+            push_sequence: 7,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -825,7 +1143,8 @@ fn test_compact_wal_preserves_events_above_cursor() {
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: InstanceId::new(),
-            last_sequence: 2,
+            push_sequence: 2,
+            pull_sequence: 0,
         })
         .unwrap();
 
@@ -848,7 +1167,8 @@ fn test_compact_wal_idempotent() {
     db.storage_for_test()
         .save_sync_cursor(&SyncCursor {
             instance_id: InstanceId::new(),
-            last_sequence: 2,
+            push_sequence: 2,
+            pull_sequence: 0,
         })
         .unwrap();
 

@@ -66,6 +66,7 @@
 use pulsedb::fault_injection::{
     arm_upgrade_fault, disarm, disarm_upgrade_fault, Action, ArmGuard, Boundary, UpgradeFault,
 };
+use pulsedb::storage::SCHEMA_VERSION;
 use pulsedb::{Config, ExperienceId, PulseDB, PulseDBError, StorageError};
 use redb::{ReadableDatabase, TableDefinition};
 use serde_json::Value;
@@ -187,8 +188,8 @@ fn assert_clean_rerun_value_identical(store: &Path, manifest: &Value) {
         .unwrap_or_else(|e| panic!("clean re-run migrate+open failed: {e:?}"));
     assert_eq!(
         db.metadata().schema_version,
-        4,
-        "re-run must reach schema v4"
+        SCHEMA_VERSION,
+        "re-run must reach the current schema version"
     );
     // marker is now CURRENT ({redb-v3, postcard}) — the migration completed.
     // (re-open must be dropped before reading the marker via a 2nd redb handle)

@@ -42,20 +42,35 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # `--all-targets` puts tests, benches and examples under the same
+      # `-D warnings` gate as the library. Most of the sync surface's evidence
+      # lives in integration tests, which a lib-only lint never compiles.
       - name: Clippy (default features)
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Clippy (builtin-embeddings)
-        run: cargo clippy --features builtin-embeddings -- -D warnings
+        run: cargo clippy --all-targets --features builtin-embeddings -- -D warnings
 
       - name: Clippy (sync)
-        run: cargo clippy --features sync -- -D warnings
+        run: cargo clippy --all-targets --features sync -- -D warnings
 
       - name: Clippy (sync-http)
-        run: cargo clippy --features sync-http -- -D warnings
+        run: cargo clippy --all-targets --features sync-http -- -D warnings
+
+      - name: Clippy (sync-websocket)
+        run: cargo clippy --all-targets --features sync-websocket -- -D warnings
+
+      # The combination gate: feature-gated code that only conflicts when two
+      # features are on together is invisible to every single-feature lint.
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   # ─────────────────────────────────────────────
-  # Job 2: Test matrix (3 OS x 2 feature sets)
+  # Job 2: Test matrix
+  # Linux carries every feature set; macOS and Windows carry default,
+  # builtin-embeddings and BOTH sync feature sets. The sync path opens files,
+  # spawns tasks and binds loopback sockets, none of which is portable by
+  # construction, so a Linux-only sync gate proves nothing about the other two.
   # ─────────────────────────────────────────────
   test:
     name: Test (${{ matrix.name }})
@@ -82,12 +97,24 @@ jobs:
           - os: macos-latest
             features: "--features builtin-embeddings"
             name: macOS / builtin-embeddings
+          - os: macos-latest
+            features: "--features sync"
+            name: macOS / sync
+          - os: macos-latest
+            features: "--features sync-http"
+            name: macOS / sync-http
           - os: windows-latest
             features: ""
             name: Windows / default
           - os: windows-latest
             features: "--features builtin-embeddings"
             name: Windows / builtin-embeddings
+          - os: windows-latest
+            features: "--features sync"
+            name: Windows / sync
+          - os: windows-latest
+            features: "--features sync-http"
+            name: Windows / sync-http
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -165,6 +192,15 @@ jobs:
 
       - name: Test (builtin-embeddings)
         run: cargo test --features builtin-embeddings
+
+      # sync-http pulls in the whole sync surface (it enables `sync`), so this
+      # one pair covers both against the declared minimum toolchain. Without it
+      # the MSRV claim in Cargo.toml holds only for the default build.
+      - name: Build (sync-http)
+        run: cargo build --features sync-http
+
+      - name: Test (sync-http)
+        run: cargo test --features sync-http
 
   # ─────────────────────────────────────────────
   # Job 4: Code coverage

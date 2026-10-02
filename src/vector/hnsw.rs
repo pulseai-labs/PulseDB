@@ -135,11 +135,16 @@ impl HnswIndex {
         }
     }
 
-    /// Inserts an experience embedding into the index.
+    /// Checks an embedding against this index's dimension WITHOUT inserting it.
     ///
-    /// Assigns a new internal usize ID and records the mapping.
-    /// If the ExperienceId is already present, this is a no-op.
-    pub fn insert_experience(&self, exp_id: ExperienceId, embedding: &[f32]) -> Result<()> {
+    /// [`insert_experience`](Self::insert_experience) applies exactly this
+    /// check, so a caller that needs to know an insert would be rejected —
+    /// before it commits anything else that would have to be undone — can ask
+    /// here and get the same answer for the same reason.
+    ///
+    /// A pass is not a promise: the insert can still fail afterwards (a
+    /// poisoned state lock), and nothing here reserves the id.
+    pub fn validate_embedding(&self, embedding: &[f32]) -> Result<()> {
         if embedding.len() != self.dimension {
             return Err(PulseDBError::vector(format!(
                 "Embedding dimension mismatch: expected {}, got {}",
@@ -147,6 +152,15 @@ impl HnswIndex {
                 embedding.len()
             )));
         }
+        Ok(())
+    }
+
+    /// Inserts an experience embedding into the index.
+    ///
+    /// Assigns a new internal usize ID and records the mapping.
+    /// If the ExperienceId is already present, this is a no-op.
+    pub fn insert_experience(&self, exp_id: ExperienceId, embedding: &[f32]) -> Result<()> {
+        self.validate_embedding(embedding)?;
 
         let mut state = self
             .state

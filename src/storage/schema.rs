@@ -46,7 +46,11 @@ use crate::types::{AgentId, CollectiveId, ExperienceId, InstanceId, TaskId, Time
 /// Increment this when making breaking changes to the schema.
 /// Version 2 adds `entity_type` to `WatchEventRecord` for sync protocol support.
 /// Version 3 reshapes `Experience` for temporal decay and G-counter applications.
-pub const SCHEMA_VERSION: u32 = 4;
+/// Version 4 adds key-value `tags` to `Experience`.
+/// Version 5 splits the per-peer sync cursor into separate push and pull
+/// positions (`SyncCursor { push_sequence, pull_sequence }`, issue #9); every
+/// existing cursor is reset to 0/0 on migration.
+pub const SCHEMA_VERSION: u32 = 5;
 
 // ============================================================================
 // Substrate Format Marker (storage-format axis — distinct from SCHEMA_VERSION)
@@ -361,12 +365,46 @@ pub const PROVIDER_IDENTITY_STAMPED_AT_KEY: &str = "provider_identity_stamped_at
 
 /// Sync cursors table — per-peer sync position tracking.
 ///
-/// Each entry records the last WAL sequence number successfully synced
-/// with a specific peer instance. Key is the peer's InstanceId (16 bytes),
-/// value is bincode-serialized `SyncCursor`.
+/// Each entry records, per peer instance, the local WAL sequence the peer has
+/// acknowledged (`push_sequence`) and the remote WAL sequence applied from it
+/// (`pull_sequence`) — split in schema v5 (issue #9). Key is the peer's
+/// InstanceId (16 bytes), value is postcard-serialized `SyncCursor`.
 #[cfg(feature = "sync")]
 pub const SYNC_CURSORS_TABLE: TableDefinition<&[u8; 16], &[u8]> =
     TableDefinition::new("sync_cursors");
+
+/// Feature-independent probe for the `sync_cursors` table — the SAME name and
+/// key/value types as [`SYNC_CURSORS_TABLE`], declared without the `sync` gate so
+/// the schema v4→v5 cursor migration can run on a build WITHOUT `sync` (where
+/// the live table constant and the `SyncCursor` type are cfg'd out). Migration
+/// use only; runtime cursor access goes through `SYNC_CURSORS_TABLE`.
+pub(crate) const SYNC_CURSORS_MIGRATION_TABLE: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("sync_cursors");
+
+/// Schema ≤ 4 sync cursor record (for migration deserialization only).
+///
+/// Mirrors the exact serialized layout of the pre-0.8.0 `SyncCursor`: a single
+/// `last_sequence` slot that the push and pull paths both overwrote (issue #9).
+/// Declared feature-independently so a non-`sync` build can still run the v4→v5
+/// reset; the live `SyncCursor` type lives behind the `sync` feature.
+#[derive(Deserialize)]
+pub(crate) struct SyncCursorV4 {
+    pub instance_id: InstanceId,
+    pub last_sequence: u64,
+}
+
+/// Schema v5 sync cursor record as WRITTEN by the v4→v5 migrator.
+///
+/// Field order and types match `crate::sync::SyncCursor` exactly, so the
+/// postcard bytes are identical and a `sync` build reads the migrated row back
+/// as the live type (pinned by `sync_cursor_v5_record_matches_live_encoding`).
+/// Feature-independent for the same reason as [`SyncCursorV4`].
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SyncCursorV5 {
+    pub instance_id: InstanceId,
+    pub push_sequence: u64,
+    pub pull_sequence: u64,
+}
 
 // ============================================================================
 // Watch Events Tables (E4-S02)
@@ -816,7 +854,33 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
+    }
+
+    /// The feature-independent migration record must encode exactly like the
+    /// live `SyncCursor`, or a `sync` build would misread migrated rows.
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_cursor_v5_record_matches_live_encoding() {
+        let id = InstanceId::from_bytes([0x5A; 16]);
+        let record = SyncCursorV5 {
+            instance_id: id,
+            push_sequence: 0,
+            pull_sequence: 0,
+        };
+        let live = crate::sync::SyncCursor::new(id);
+        assert_eq!(
+            postcard::to_stdvec(&record).unwrap(),
+            postcard::to_stdvec(&live).unwrap()
+        );
+        // And the legacy v4 record decodes the pre-0.8.0 wire/disk shape:
+        // `varint(16) ‖ uuid ‖ varint(last_sequence)`.
+        let mut legacy_bytes = vec![0x10];
+        legacy_bytes.extend_from_slice(&[0x5A; 16]);
+        legacy_bytes.push(0x07);
+        let legacy: SyncCursorV4 = postcard::from_bytes(&legacy_bytes).unwrap();
+        assert_eq!(legacy.instance_id, id);
+        assert_eq!(legacy.last_sequence, 7);
     }
 
     #[test]

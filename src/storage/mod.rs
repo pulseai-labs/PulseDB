@@ -559,9 +559,33 @@ pub trait StorageEngine: Send + Sync {
     #[cfg(feature = "sync")]
     fn instance_id(&self) -> crate::sync::InstanceId;
 
-    /// Saves a sync cursor for a peer instance.
+    /// Replaces the persisted instance ID with a freshly minted one and
+    /// returns it.
     ///
-    /// Upserts the cursor in the `SYNC_CURSORS_TABLE`.
+    /// One write transaction: the new id is written under the instance-id
+    /// metadata key and the in-memory copy [`instance_id`](Self::instance_id)
+    /// reports is updated in the same step. Nothing else changes — existing
+    /// `applications` buckets keyed by the old id stay exactly as they are,
+    /// and no WAL/sync event is recorded (identity is not replicated state).
+    ///
+    /// Used by `PulseDB::remint_instance_id` to give a restored file copy of a
+    /// store a distinct sync identity before it reinforces anything.
+    #[cfg(feature = "sync")]
+    fn remint_instance_id(&self) -> Result<crate::sync::InstanceId>;
+
+    /// Replaces a peer's whole sync-cursor record.
+    ///
+    /// **This is a full-record replace, not a per-side update.** The record
+    /// carries both positions, so a caller that means to set only
+    /// `push_sequence` and leaves `pull_sequence` at its default silently
+    /// resets the pull position to 0 (and vice versa) — the two sides are owned
+    /// by different code paths and neither may clobber the other's half.
+    ///
+    /// Use [`update_push_cursor`](Self::update_push_cursor) or
+    /// [`update_pull_cursor`](Self::update_pull_cursor) to move one side: they
+    /// are single-transaction read-modify-writes and monotonic
+    /// non-decreasing. This method is for seeding or restoring a complete
+    /// record whose *both* positions the caller already knows.
     #[cfg(feature = "sync")]
     fn save_sync_cursor(&self, cursor: &crate::sync::SyncCursor) -> Result<()>;
 
@@ -579,6 +603,32 @@ pub trait StorageEngine: Send + Sync {
     /// Returns cursors for all known peer instances.
     #[cfg(feature = "sync")]
     fn list_sync_cursors(&self) -> Result<Vec<crate::sync::SyncCursor>>;
+
+    /// Advances the **push** position for `peer` — the local WAL sequence the
+    /// peer has acknowledged — leaving its pull position untouched.
+    ///
+    /// A single-transaction read-modify-write, so the pusher and the puller
+    /// can never lose each other's half of the record. Creates the record
+    /// (with `pull_sequence = 0`) if the peer has none yet.
+    ///
+    /// **Monotonic non-decreasing.** The persisted value is
+    /// `max(stored, sequence)`: an acknowledgement below the stored position —
+    /// including the zero a peer reports when the batch's *first* change failed
+    /// to apply — never moves the position backwards. A backwards step would
+    /// wedge [`compact_wal`](crate::PulseDB::compact_wal), which blocks while
+    /// any peer's push position is 0, and re-push the whole WAL every cycle.
+    #[cfg(feature = "sync")]
+    fn update_push_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()>;
+
+    /// Advances the **pull** position for `peer` — the remote WAL sequence
+    /// applied locally — leaving its push position untouched.
+    ///
+    /// Same single-transaction read-modify-write and monotonic non-decreasing
+    /// contract as [`update_push_cursor`](Self::update_push_cursor). Creates
+    /// the record (with `push_sequence = 0`, which keeps compaction blocked for
+    /// the peer) if the peer has none yet.
+    #[cfg(feature = "sync")]
+    fn update_pull_cursor(&self, peer: &crate::sync::InstanceId, sequence: u64) -> Result<()>;
 
     /// Compacts the WAL by deleting events with sequence <= `up_to_seq`.
     ///
