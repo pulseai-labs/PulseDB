@@ -828,8 +828,17 @@ fn collective_memory_partial_denominator_uses_collectives_done() {
 // Counter sanity
 // ============================================================================
 
-/// Proves the counter is not vacuous: a 1 MiB reservation must move both
-/// counters. Runs in the ordinary suite, on every feature set.
+/// Proves the counter is not vacuous: a 1 MiB reservation must raise the
+/// **requested** counter by at least 1 MiB. Runs in the ordinary suite, on every
+/// feature set.
+///
+/// It asserts on the requested counter alone, and that is deliberate. The
+/// requested counter is monotonic — every `alloc`/`alloc_zeroed`/`realloc` adds
+/// to it and nothing subtracts — so no other test can move it backwards. The
+/// live counter is process-global: this binary's other tests free memory
+/// concurrently, and a free landing between the two reads below lowers the live
+/// delta below the reservation. Asserting on it made this test fail at random
+/// (Dispatch 3).
 #[test]
 fn collective_memory_counter_sees_a_known_reservation() {
     let before = counters();
@@ -845,11 +854,6 @@ fn collective_memory_counter_sees_a_known_reservation() {
         after.0 - before.0 >= 1 << 20,
         "reserving 1 MiB moved the requested counter by {} bytes",
         after.0 - before.0
-    );
-    assert!(
-        after.1 as i64 - before.1 as i64 >= 1 << 20,
-        "reserving 1 MiB moved the live counter by {} bytes",
-        after.1 as i64 - before.1 as i64
     );
 
     drop(reservation);
