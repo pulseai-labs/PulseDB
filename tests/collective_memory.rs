@@ -219,9 +219,10 @@ fn os_metric_name() -> &'static str {
     "none"
 }
 
-/// Audit C4's ceiling: on Windows the `10 000 × 1000` point re-creates PR #88's
-/// ~10.9 GiB commit, so the child stops itself at 2 GiB and reports what it has
-/// (`"aborted": true`) rather than taking the runner down.
+/// Audit C4's ceiling: on Windows the 10 000-wide arm commits tens of MiB per
+/// collective — round 1 measured 57.9 MiB and crossed 2 GiB at 36 collectives,
+/// the shape of PR #88's ~10.9 GiB leg — so the child stops itself at 2 GiB and
+/// reports what it has (`"aborted": true`) rather than taking the runner down.
 const OS_CEILING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The ceiling comparison itself, platform-independent so its boundary is
@@ -288,19 +289,22 @@ impl Phase {
     }
 }
 
-/// The grid (spec Approach §1, grill Q1). Every platform yields six
-/// combinations, which with both phases is the 12 points AC-3 counts.
+/// The grid (spec Approach §1, grill Q1; Windows counts amended 2026-10-03).
+/// Off Windows it yields six combinations — with both phases the 12 points AC-3
+/// counts — and Windows seven, so 14 there.
 ///
-/// Windows keeps the 10 000-wide arm short because `10 000 × 1000` is the point
-/// that re-created PR #88's ~10.9 GiB commit. Both arms still include the common
-/// count of 100 that `VERDICT-INPUT` compares the two `max_elements` on.
+/// Windows keeps the 10 000-wide arm short: it committed 57.9 MiB per collective
+/// in round 1, so the amended top of 25 stays near 1.45 GiB and the reopen phase
+/// gets measured. Both arms still include the count `VERDICT-INPUT` compares the
+/// two `max_elements` on — 25 on Windows, 100 elsewhere.
 fn grid() -> &'static [(usize, usize)] {
     #[cfg(windows)]
     const POINTS: &[(usize, usize)] = &[
         (10_000, 0),
-        (10_000, 50),
-        (10_000, 100),
+        (10_000, 10),
+        (10_000, 25),
         (100, 0),
+        (100, 25),
         (100, 100),
         (100, 1000),
     ];
@@ -322,6 +326,12 @@ const WIDE_MAX_ELEMENTS: usize = 10_000;
 const NARROW_MAX_ELEMENTS: usize = 100;
 
 /// The count both arms share, so their per-collective figures compare directly.
+/// It is 25 on Windows — round 1 crossed the 2 GiB ceiling at 36 collectives at
+/// 10 000, while 25 stays near 1.45 GiB — and 100 elsewhere. Both values are
+/// written out so a reader can check either by inspection.
+#[cfg(windows)]
+const COMMON_COUNT: usize = 25;
+#[cfg(not(windows))]
 const COMMON_COUNT: usize = 100;
 
 /// The point's config: only `hnsw.max_elements` moves, everything else default.
@@ -349,7 +359,7 @@ fn features_label() -> &'static str {
 /// Creates `collectives` empty collectives in `store`, checking the audit C4
 /// ceiling after **every** `create_collective`. Both phases drive their creates
 /// through here, so the reopen phase's build is guarded exactly as the create
-/// phase's measured loop is — a `10 000 × 50/100` reopen point would otherwise
+/// phase's measured loop is — a `10 000 × 10/25` reopen point would otherwise
 /// commit gigabytes before any stop.
 ///
 /// Returns how many creates completed and whether the ceiling stopped the loop.
@@ -801,16 +811,17 @@ fn collective_memory_partial_denominator_uses_collectives_done() {
         })
     };
 
-    // Aborted at 7 of the planned 100, having measured 700 bytes: the
-    // per-collective figure is 700/7 = 100, not 700/100 = 7.
-    let aborted = vec![point("create", 10_000, 100, 7, 700)];
+    // Aborted at 7 of the planned common count, having measured 700 bytes: the
+    // per-collective figure is 700/7 = 100, not the smaller figure a planned
+    // denominator would give.
+    let aborted = vec![point("create", 10_000, COMMON_COUNT as u64, 7, 700)];
     assert_eq!(
         per_collective(&aborted, Phase::Create, 10_000, "alloc_requested_delta"),
         Some(100.0)
     );
 
     // Nothing measured: undefined, and reported as such rather than as 0.
-    let nothing = vec![point("reopen", 10_000, 100, 0, 0)];
+    let nothing = vec![point("reopen", 10_000, COMMON_COUNT as u64, 0, 0)];
     assert_eq!(
         per_collective(&nothing, Phase::Reopen, 10_000, "alloc_requested_delta"),
         None
@@ -822,6 +833,26 @@ fn collective_memory_partial_denominator_uses_collectives_done() {
         per_collective(&other_count, Phase::Create, 10_000, "alloc_requested_delta"),
         None
     );
+}
+
+// ============================================================================
+// Grid regression (Dispatch 4)
+// ============================================================================
+
+/// Both arms of the grid must carry the common count: `per_collective` matches
+/// on it exactly, so a count the platform's grid never measures would leave the
+/// per-collective figures and the ratio silently `null`. This is the only test
+/// that sees the platform's own array — CI compiles the Windows one on
+/// windows-latest, where `COMMON_COUNT` is 25.
+#[test]
+fn collective_memory_grid_carries_the_common_count_in_both_arms() {
+    let points = grid();
+    for max_elements in [WIDE_MAX_ELEMENTS, NARROW_MAX_ELEMENTS] {
+        assert!(
+            points.contains(&(max_elements, COMMON_COUNT)),
+            "the grid has no ({max_elements}, {COMMON_COUNT}) point: {points:?}"
+        );
+    }
 }
 
 // ============================================================================
