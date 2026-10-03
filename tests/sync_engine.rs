@@ -4726,3 +4726,281 @@ async fn recovery_completion_peer_instance_id_follows_initial_sync_rebind() {
         "peer_instance_id() must report the identity initial_sync re-established"
     );
 }
+
+// ============================================================================
+// r1.s5.w3 — a synced create is acknowledged only once it is searchable (#96)
+// ============================================================================
+
+/// A's push position for its peer, as persisted.
+fn push_position(db: &Arc<PulseDB>, peer: InstanceId) -> u64 {
+    db.storage_for_test()
+        .load_sync_cursor(&peer)
+        .unwrap()
+        .expect("the peer must be on record")
+        .push_sequence
+}
+
+/// A synced create whose row the receiver already holds WITHOUT an index entry
+/// is repaired from redb before it is acknowledged.
+///
+/// The #96 residual left by PR #88: the record, its embedding and the secondary
+/// indexes commit in one redb transaction, but the in-process HNSW insert runs
+/// after that commit. A create that failed to index therefore leaves a row
+/// `get_experience` finds and `search_similar` never will — and the applier's
+/// create arm short-circuited on the existing row, so the retry was an
+/// idempotent skip and the row stayed invisible forever.
+///
+/// The repair reads the embedding back from redb (never the payload's copy),
+/// which is why the fixture writes the row through the storage port: the record
+/// and its embedding are in the store, exactly as a failed index insert leaves
+/// them, and only the index entry is missing.
+#[tokio::test]
+async fn synced_create_repairs_unindexed_row_before_ack() {
+    let mut pair = setup_sync_pair();
+
+    // The collective crosses first, so B holds a real index for it.
+    let cid = pair.db_a.create_collective("repair-unindexed").unwrap();
+    pair.manager_a.sync_once().await.unwrap();
+    assert!(
+        pair.db_b.get_collective(cid).unwrap().is_some(),
+        "B must hold the collective before its index can be the thing under test"
+    );
+
+    // The experience is created AFTER that push, so it arrives on the next one.
+    let exp_id = pair.db_a.record_experience(minimal_exp(cid)).unwrap();
+
+    // B holds the row and its embedding, with no index entry.
+    let stored = pair.db_a.get_experience(exp_id).unwrap().unwrap();
+    assert!(
+        !stored.embedding.is_empty(),
+        "the fixture must carry a vector, or the repair has nothing to insert"
+    );
+    pair.db_b
+        .storage_for_test()
+        .save_experience(&stored)
+        .unwrap();
+
+    let query = vec![0.1f32; 384];
+    assert!(
+        pair.db_b.search_similar(cid, &query, 5).unwrap().is_empty(),
+        "the fixture must start unsearchable, or the repair is not what makes it findable"
+    );
+
+    // A re-pushes the create. B has the row, so this is the existing-row branch.
+    let peer_b = pair.manager_a.peer_instance_id().expect("A knows its peer");
+    let pushed_before = push_position(&pair.db_a, peer_b);
+    pair.manager_a
+        .sync_once()
+        .await
+        .expect("a repaired create must not fail the cycle");
+    assert!(
+        push_position(&pair.db_a, peer_b) > pushed_before,
+        "the create must be acknowledged once it is searchable, not left pending"
+    );
+
+    assert!(
+        pair.db_b.get_experience(exp_id).unwrap().is_some(),
+        "the record was already on B and must still be there"
+    );
+    let hits = pair.db_b.search_similar(cid, &query, 5).unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.experience.id == exp_id),
+        "a create acknowledged as applied must be findable: the missing index \
+         entry has to be repaired from redb, not skipped over"
+    );
+}
+
+/// The insight half of the same contract: an insight create whose row the
+/// receiver already holds without an index entry is repaired from the stored
+/// insight's own embedding before the change is acknowledged.
+///
+/// Insights are indexed in their own per-collective map, keyed by the insight
+/// id reinterpreted as an `ExperienceId`, so the repair has a second place to
+/// go wrong — and the insight's embedding is stored inline rather than in the
+/// embeddings table, which is the other half of why this is its own test.
+#[tokio::test]
+async fn synced_insight_create_repairs_unindexed_row_before_ack() {
+    let mut pair = setup_sync_pair();
+
+    let cid = pair.db_a.create_collective("repair-insight").unwrap();
+    pair.manager_a.sync_once().await.unwrap();
+    assert!(
+        pair.db_b.get_collective(cid).unwrap().is_some(),
+        "B must hold the collective, and so an insight index for it"
+    );
+
+    let exp_id = pair.db_a.record_experience(minimal_exp(cid)).unwrap();
+    let insight_id = pair
+        .db_a
+        .store_insight(NewDerivedInsight {
+            collective_id: cid,
+            content: "insight that arrived without its index entry".to_string(),
+            embedding: Some(vec![0.3f32; 384]),
+            source_experience_ids: vec![exp_id],
+            insight_type: InsightType::Pattern,
+            confidence: 0.7,
+            domain: vec!["repair".to_string()],
+        })
+        .unwrap();
+
+    // B holds the insight row (embedding and all) with no index entry.
+    let stored = pair.db_a.get_insight(insight_id).unwrap().unwrap();
+    assert!(
+        !stored.embedding.is_empty(),
+        "the fixture must carry a vector, or the repair has nothing to insert"
+    );
+    pair.db_b.storage_for_test().save_insight(&stored).unwrap();
+
+    let query = vec![0.3f32; 384];
+    assert!(
+        pair.db_b.get_insights(cid, &query, 5).unwrap().is_empty(),
+        "the fixture must start unsearchable, or the repair is not what makes it findable"
+    );
+
+    pair.manager_a
+        .sync_once()
+        .await
+        .expect("a repaired insight create must not fail the cycle");
+
+    assert!(
+        pair.db_b.get_insight(insight_id).unwrap().is_some(),
+        "the insight row was already on B and must still be there"
+    );
+    let hits = pair.db_b.get_insights(cid, &query, 5).unwrap();
+    assert!(
+        hits.iter().any(|(insight, _)| insight.id == insight_id),
+        "an insight create acknowledged as applied must be findable"
+    );
+}
+
+/// A create whose collective has no index is REFUSED, not stored-and-skipped.
+///
+/// The `if let Some(index)` arm this replaces stored the record with no vector
+/// at all and then acknowledged it, so the peer compacted past a change search
+/// could never find — and nothing downstream would repair it either, because
+/// the applier's create arm reads the row's existence as a finished create.
+/// Before lazy index creation lands, an absent index is an error by design
+/// (A2): the record is not written, and the change stays unacknowledged so the
+/// next attempt offers it again.
+#[tokio::test]
+async fn synced_create_into_collective_without_index_is_refused_and_not_acknowledged() {
+    let mut pair = setup_sync_pair();
+
+    // A: the collective, and an experience recorded in it.
+    let cid = pair
+        .db_a
+        .create_collective("refused-without-index")
+        .unwrap();
+    let exp_id = pair.db_a.record_experience(minimal_exp(cid)).unwrap();
+
+    // B: the collective written straight into its store. redb knows it; no
+    // index was ever built for it, which is the state the refusal exists for.
+    let collective = pair.db_a.get_collective(cid).unwrap().unwrap();
+    pair.db_b
+        .storage_for_test()
+        .save_collective(&collective)
+        .unwrap();
+
+    // The create's own WAL sequence, so "not past the change" is exact rather
+    // than a guess about how many events A happened to record.
+    let create_sequence = pair
+        .db_a
+        .storage_for_test()
+        .poll_sync_events(0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|(_, event)| event.entity_id == *exp_id.as_bytes())
+        .map(|(sequence, _)| sequence)
+        .expect("A's WAL must hold the create event");
+
+    let error = pair
+        .manager_b
+        .initial_sync(None)
+        .await
+        .expect_err("a create that cannot be indexed is not a completed catch-up");
+    assert!(
+        error.is_catch_up_incomplete(),
+        "the refusal must surface as the typed catch-up error, got: {error}"
+    );
+
+    assert!(
+        pair.db_b.get_experience(exp_id).unwrap().is_none(),
+        "the refusal happens BEFORE the write: no record, no secondary index \
+         entry, no WAL event"
+    );
+
+    let cursors = pair.db_b.storage_for_test().list_sync_cursors().unwrap();
+    assert_eq!(cursors.len(), 1, "B must be on record for exactly one peer");
+    assert!(
+        cursors[0].pull_sequence < create_sequence,
+        "the refused change must stay ahead of the pull position ({} vs {}) so \
+         the next attempt fetches it again",
+        cursors[0].pull_sequence,
+        create_sequence
+    );
+}
+
+/// A synced create that arrives after a local delete must end up searchable.
+///
+/// The audit C2 case, and the reason "contains" is not the repair's predicate:
+/// a soft-deleted id keeps its mapping, so a create for it takes the
+/// already-present path — the record is written back to redb, and the index
+/// insert that follows is a silent no-op because the id is still mapped. The
+/// row is then present and invisible: acknowledged, and unfindable.
+///
+/// A re-sync from position 0 is what r1.s1's one-time full resync does, and it
+/// is the trigger: the create is offered again for an id this store has already
+/// deleted. Only "index follows redb" is asserted — whether a delete ought to
+/// win over a late create (tombstones) is out of scope.
+#[tokio::test]
+async fn synced_create_after_local_delete_is_searchable() {
+    let mut pair = setup_sync_pair();
+
+    // A: the collective and an experience. Both reach B normally.
+    let cid = pair.db_a.create_collective("create-after-delete").unwrap();
+    let exp_id = pair.db_a.record_experience(minimal_exp(cid)).unwrap();
+    pair.manager_a.sync_once().await.unwrap();
+
+    let query = vec![0.1f32; 384];
+    assert!(
+        pair.db_b
+            .search_similar(cid, &query, 5)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.experience.id == exp_id),
+        "B must start with the experience indexed, or the delete is not what \
+         makes this interesting"
+    );
+
+    // B deletes it locally: the row goes, the index entry is soft-deleted.
+    pair.db_b.delete_experience(exp_id).unwrap();
+    assert!(
+        pair.db_b.get_experience(exp_id).unwrap().is_none(),
+        "the local delete must remove the row"
+    );
+
+    // B re-syncs from position 0 — the one-time full resync of r1.s1, which is
+    // a PULL on the receiving side. A push would drag B's own delete event
+    // along with it and delete the row again, which is the tombstone question
+    // this test deliberately leaves out of scope.
+    let peer_a = pair.db_a.instance_id();
+    pair.db_b
+        .storage_for_test()
+        .save_sync_cursor(&pulsedb::sync::SyncCursor::new(peer_a))
+        .unwrap();
+    pair.manager_b
+        .initial_sync(None)
+        .await
+        .expect("re-offering a create this store deleted must not fail the catch-up");
+
+    assert!(
+        pair.db_b.get_experience(exp_id).unwrap().is_some(),
+        "the create rewrote the row, so it must be there"
+    );
+    let hits = pair.db_b.search_similar(cid, &query, 5).unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.experience.id == exp_id),
+        "a row that redb holds must be searchable: the create has to clear the \
+         soft-delete mark, not no-op on an id that is still mapped"
+    );
+}

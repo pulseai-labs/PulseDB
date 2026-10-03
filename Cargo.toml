@@ -148,6 +148,17 @@ redb = "~4.2"
 # uuid: parse manifest id strings back into typed ids for by-id read-back lookups.
 uuid = "1"
 
+# r1.s5.w1 (F-CI2b evidence): `tests/collective_memory.rs` reads the process's
+# own commit charge (`PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`) on Windows —
+# the figure PR #88's leg ran out of. Windows-only, dev-only: it resolves to the
+# 0.61.2 already in the dependency graph and adds no runtime dependency.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 # Feature-gated integration tests (#92): declare the gate so cargo skips the
 # target when the feature is off, instead of building it empty ("running 0 tests").
 [[test]]
