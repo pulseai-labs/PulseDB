@@ -305,7 +305,35 @@ impl RemoteChangeApplier {
                         experience.applications.len()
                     )));
                 }
+                // The collective is the create's dependency, and an absent one
+                // is a non-completion rather than an idempotent skip (A2): the
+                // change is left unacknowledged so it repeats, instead of
+                // surfacing later as a transport-shaped string from the apply
+                // below. A collective that exists WITHOUT an index is a
+                // different case — that error comes from the apply itself.
+                let collective_id = experience.collective_id;
+                if self
+                    .db
+                    .get_collective(collective_id)
+                    .map_err(map_err)?
+                    .is_none()
+                {
+                    return Err(SyncError::MissingDependency {
+                        entity: "collective",
+                        id: collective_id.to_string(),
+                    });
+                }
                 if self.db.get_experience(id).map_err(map_err)?.is_some() {
+                    // The row is already here. Before this counts as an
+                    // idempotent create, its index entry has to exist: an
+                    // earlier index failure leaves the row present and
+                    // unsearchable, and acknowledging it would move the cursors
+                    // (and `compact_wal`) past a record search can never find
+                    // (#96). Repair first, then the unchanged counter merge.
+                    let repaired = self
+                        .db
+                        .ensure_synced_experience_indexed(id)
+                        .map_err(map_err)?;
                     let merged = self
                         .db
                         .apply_synced_experience_counter_merge(
@@ -314,8 +342,12 @@ impl RemoteChangeApplier {
                             Some(experience.last_reinforced),
                         )
                         .map_err(map_err)?;
-                    if merged {
-                        trace!(id = %id, "Merged ExperienceCreated counter collision");
+                    if repaired || merged {
+                        if repaired {
+                            trace!(id = %id, "Repaired ExperienceCreated: existing row was unsearchable");
+                        } else {
+                            trace!(id = %id, "Merged ExperienceCreated counter collision");
+                        }
                         return Ok(ApplyOutcome::Applied);
                     }
                     trace!(id = %id, "Skipping ExperienceCreated: already exists");
@@ -460,8 +492,28 @@ impl RemoteChangeApplier {
             // ─── Insight ─────────────────────────────────────────────
             SyncPayload::InsightCreated(insight) => {
                 let id = insight.id;
-                // Idempotent: skip if already exists
+                // Same dependency rule as the experience create above: the
+                // collective must be here, and its absence is a non-completion.
+                let collective_id = insight.collective_id;
+                if self
+                    .db
+                    .get_collective(collective_id)
+                    .map_err(map_err)?
+                    .is_none()
+                {
+                    return Err(SyncError::MissingDependency {
+                        entity: "collective",
+                        id: collective_id.to_string(),
+                    });
+                }
                 if self.db.get_insight(id).map_err(map_err)?.is_some() {
+                    // An existing row is only a finished create once the insight
+                    // is searchable — same repair-before-skip as experiences.
+                    let repaired = self.db.ensure_synced_insight_indexed(id).map_err(map_err)?;
+                    if repaired {
+                        trace!(id = %id, "Repaired InsightCreated: existing row was unsearchable");
+                        return Ok(ApplyOutcome::Applied);
+                    }
                     trace!(id = %id, "Skipping InsightCreated: already exists");
                     return Ok(ApplyOutcome::Skipped);
                 }
