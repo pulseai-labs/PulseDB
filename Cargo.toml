@@ -148,6 +148,32 @@ redb = "~4.2"
 # uuid: parse manifest id strings back into typed ids for by-id read-back lookups.
 uuid = "1"
 
+# Feature-gated integration tests (#92): declare the gate so cargo skips the
+# target when the feature is off, instead of building it empty ("running 0 tests").
+[[test]]
+name = "embedding_onnx"
+required-features = ["builtin-embeddings"]
+
+[[test]]
+name = "storage_migration_fault_injection"
+required-features = ["fault-injection"]
+
+[[test]]
+name = "sync_engine"
+required-features = ["sync"]
+
+[[test]]
+name = "sync_foundation"
+required-features = ["sync"]
+
+[[test]]
+name = "sync_http"
+required-features = ["sync-http"]
+
+[[test]]
+name = "sync_identity"
+required-features = ["sync"]
+
 [[bench]]
 name = "lifecycle"
 harness = false
