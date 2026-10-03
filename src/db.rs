@@ -3377,6 +3377,120 @@ impl PulseDB {
 
     /// Applies a synced experience from a remote peer.
     ///
+    /// Repairs a synced experience's index entry from redb, so an acknowledged
+    /// create is one search can find (#96).
+    ///
+    /// Returns `Ok(true)` when the index was repaired — an entry inserted, or a
+    /// soft-delete mark cleared — and `Ok(false)` when the id was already
+    /// searchable and nothing was needed.
+    ///
+    /// # The repair reads redb, never the payload
+    ///
+    /// The vector comes from `storage.get_embedding(id)`, not from the copy the
+    /// sync change carried. redb is the only durable truth (ADR-001) and the
+    /// index is derived from it, so the repair must reproduce what a reopen
+    /// would rebuild rather than what a peer claims about an id.
+    ///
+    /// # "Searchable" has two halves
+    ///
+    /// A mapped id can still be unsearchable: a create arriving after a local
+    /// delete finds its id mapped but soft-deleted, and inserting it again is a
+    /// no-op. That case clears the mark instead — the graph point already
+    /// carries this id's embedding, and experience embeddings are immutable per
+    /// id, so there is nothing to re-insert.
+    ///
+    /// # Errors, each of which repeats on every sync
+    ///
+    /// - the record is absent from redb;
+    /// - the collective has no index in this process (A2: before lazy index
+    ///   creation lands, an absent index is an error by design);
+    /// - the record has no usable stored embedding: a **store-consistency
+    ///   violation**, because a record and its embedding commit in one
+    ///   transaction, so this state can only mean the store was altered outside
+    ///   PulseDB. It is never a silent pass (C6), and it repeats on every sync
+    ///   until the record is removed.
+    ///
+    /// None of them is acknowledged, so the peer keeps re-offering the change
+    /// instead of compacting past it.
+    #[cfg(feature = "sync")]
+    pub(crate) fn ensure_synced_experience_indexed(&self, id: ExperienceId) -> Result<bool> {
+        self.make_synced_experience_searchable(id, true)
+    }
+
+    /// The one implementation behind
+    /// [`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed).
+    ///
+    /// `repairing` says whether the record pre-existed the change being applied
+    /// (the applier's repair path) or was written moments ago by the caller
+    /// ([`apply_synced_experience`](Self::apply_synced_experience)). The work is
+    /// identical — the entry is always built from redb — but only the first is
+    /// a repair, and only a repair is worth a `warn!`: warning on every synced
+    /// create would say "repaired" about work that was never broken.
+    #[cfg(feature = "sync")]
+    fn make_synced_experience_searchable(&self, id: ExperienceId, repairing: bool) -> Result<bool> {
+        let experience = self.storage.get_experience(id)?.ok_or_else(|| {
+            PulseDBError::vector(format!(
+                "cannot make experience {id} searchable: the record is not in the store"
+            ))
+        })?;
+        let collective_id = experience.collective_id;
+
+        // Checked before the early return: a record whose embedding is missing
+        // is a broken store, and acknowledging it would hide that.
+        let embedding = self.storage.get_embedding(id)?.filter(|e| !e.is_empty());
+        let Some(embedding) = embedding else {
+            return Err(PulseDBError::vector(format!(
+                "store-consistency violation: experience {id} has no stored embedding \
+                 (absent or empty), so its index entry cannot be built; a record and \
+                 its embedding commit in one transaction, so the store was altered \
+                 outside PulseDB. This repeats on every sync until the record is removed"
+            )));
+        };
+
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        let index = vectors.get(&collective_id).ok_or_else(|| {
+            PulseDBError::vector(format!(
+                "collective {collective_id} has no vector index, so experience {id} \
+                 cannot be indexed"
+            ))
+        })?;
+
+        if index.is_searchable(id) {
+            return Ok(false);
+        }
+
+        if !index.clear_deleted_mark(id)? {
+            index.insert_experience(id, &embedding)?;
+        }
+
+        // Prove it before reporting it (grill A1: acknowledge only once the id
+        // is searchable). An insert that joins another thread's in-flight claim
+        // returns without adding a point, and a concurrent delete can re-mark
+        // the id between the two steps above — so "we did something" is not the
+        // same as "search can find it now", and this call must not report a
+        // repair it did not achieve. The change stays unacknowledged and the
+        // next sync retries.
+        if !index.is_searchable(id) {
+            return Err(PulseDBError::vector(format!(
+                "experience {id} is not searchable after the repair: its index entry is \
+                 not yet searchable (an insert for this id is still in flight, or the id \
+                 was deleted again); the change is not acknowledged and the next sync retries"
+            )));
+        }
+
+        if repairing {
+            tracing::warn!(
+                id = %id,
+                collective_id = %collective_id,
+                "repaired missing index entry from redb"
+            );
+        }
+        Ok(true)
+    }
+
     /// Writes the full experience to storage and inserts into HNSW.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
     ///
@@ -3394,13 +3508,18 @@ impl PulseDB {
     /// This is NOT atomicity. There is no transaction spanning the storage
     /// write and the in-memory HNSW index, so what remains possible is:
     ///
-    /// - the insert can still fail AFTER the record is saved — the state lock
-    ///   can be poisoned, or the collective's index can be replaced between the
-    ///   check and the insert — and nothing undoes the save. The error says so
-    ///   and is logged at `error!`; the row is left with no vector.
-    /// - a collective with no index yet takes the record with no vector at all,
-    ///   which is the long-standing behaviour of the `if let Some(index)` arm
-    ///   and is unchanged here.
+    /// - the index step can still fail AFTER the record is saved — the state
+    ///   lock can be poisoned, the collective's index can be replaced between
+    ///   the check and the insert, or the record can be left without a stored
+    ///   embedding — and nothing undoes the save. The error says so and is
+    ///   logged at `error!`; the row is left with no vector, and the next sync
+    ///   of the same create repairs it from redb rather than skipping it
+    ///   ([`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed)).
+    /// - a collective with no index is **refused before any write** (A2). The
+    ///   `if let Some(index)` skip this replaced stored the record with no
+    ///   vector at all and then acknowledged it, which is the corruption this
+    ///   item exists to stop; before lazy index creation lands there is no
+    ///   index to fall back on, so the change is not acknowledged.
     ///
     /// A genuine all-or-nothing apply needs a storage transaction that spans
     /// the record and the vector index (or a create-if-absent storage primitive
@@ -3415,41 +3534,42 @@ impl PulseDB {
         let id = experience.id;
         let embedding = experience.embedding.clone();
 
-        // Reject BEFORE the write: an embedding this index cannot take must
-        // leave no record, no secondary index entry and no WAL event behind.
+        // Reject BEFORE the write: an embedding this index cannot take — or a
+        // collective that has no index to take it — must leave no record, no
+        // secondary index entry and no WAL event behind.
         {
             let vectors = self
                 .vectors
                 .read()
                 .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-            if let Some(index) = vectors.get(&collective_id) {
-                index.validate_embedding(&embedding)?;
-            }
+            let index = vectors.get(&collective_id).ok_or_else(|| {
+                PulseDBError::vector(format!(
+                    "collective {collective_id} has no vector index, so experience {id} \
+                     cannot be indexed and is not stored"
+                ))
+            })?;
+            index.validate_embedding(&embedding)?;
         }
 
         self.storage.save_experience(&experience)?;
 
-        // Insert into HNSW index
-        let vectors = self
-            .vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-        if let Some(index) = vectors.get(&collective_id) {
-            if let Err(e) = index.insert_experience(id, &embedding) {
-                // The record is already committed and nothing here can take it
-                // back safely, so say plainly what was left behind rather than
-                // returning a bare index error.
-                tracing::error!(
-                    id = %id,
-                    collective_id = %collective_id,
-                    "Synced experience saved but NOT indexed; the record has no \
-                     vector and is not searchable: {e}"
-                );
-                return Err(PulseDBError::vector(format!(
-                    "experience {id} was saved but could not be indexed, so the \
-                     record remains without a vector and is not searchable: {e}"
-                )));
-            }
+        // Finish through the same make-searchable step the repair path uses, so
+        // a create whose id is mapped but soft-deleted becomes searchable
+        // instead of silently no-opping on the index insert.
+        if let Err(e) = self.make_synced_experience_searchable(id, false) {
+            // The record is already committed and nothing here can take it
+            // back safely, so say plainly what was left behind rather than
+            // returning a bare index error.
+            tracing::error!(
+                id = %id,
+                collective_id = %collective_id,
+                "Synced experience saved but NOT indexed; the record has no \
+                 vector and is not searchable: {e}"
+            );
+            return Err(PulseDBError::vector(format!(
+                "experience {id} was saved but could not be indexed, so the \
+                 record remains without a vector and is not searchable: {e}"
+            )));
         }
 
         debug!(id = %id, "Synced experience applied");
@@ -3576,6 +3696,91 @@ impl PulseDB {
         Ok(())
     }
 
+    /// Repairs a synced insight's index entry from redb — insight parity for
+    /// the #96 residual.
+    ///
+    /// The insight half of
+    /// [`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed),
+    /// with one difference: `DerivedInsight::embedding` is stored **inline**,
+    /// so the repair reads the stored insight's own vector rather than the
+    /// embeddings table. It is still the stored copy that is used, never the
+    /// one the sync change carried, and the insight index is keyed by the
+    /// insight id reinterpreted as an [`ExperienceId`] (byte conversion), which
+    /// is the same key `apply_synced_insight` inserts under.
+    ///
+    /// Errors are the same set, and repeat the same way: absent record, no
+    /// index for the collective, or a stored insight with no usable embedding —
+    /// the last a store-consistency violation that is never a silent pass.
+    #[cfg(feature = "sync")]
+    pub(crate) fn ensure_synced_insight_indexed(&self, id: InsightId) -> Result<bool> {
+        self.make_synced_insight_searchable(id, true)
+    }
+
+    /// The one implementation behind
+    /// [`ensure_synced_insight_indexed`](Self::ensure_synced_insight_indexed);
+    /// `repairing` carries the same meaning as it does for experiences.
+    #[cfg(feature = "sync")]
+    fn make_synced_insight_searchable(&self, id: InsightId, repairing: bool) -> Result<bool> {
+        let insight = self.storage.get_insight(id)?.ok_or_else(|| {
+            PulseDBError::vector(format!(
+                "cannot make insight {id} searchable: the record is not in the store"
+            ))
+        })?;
+        let collective_id = insight.collective_id;
+        // Insight HNSW keys insights by their id reinterpreted as an
+        // ExperienceId (byte conversion) — see `apply_synced_insight`.
+        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
+
+        // Checked before the early return, for the reason given on the
+        // experience path: an unindexable record is a broken store, and
+        // acknowledging it would hide that.
+        if insight.embedding.is_empty() {
+            return Err(PulseDBError::vector(format!(
+                "store-consistency violation: insight {id} has no stored embedding \
+                 (absent or empty), so its index entry cannot be built; a record and \
+                 its embedding commit in one transaction, so the store was altered \
+                 outside PulseDB. This repeats on every sync until the record is removed"
+            )));
+        }
+
+        let insight_vectors = self
+            .insight_vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        let index = insight_vectors.get(&collective_id).ok_or_else(|| {
+            PulseDBError::vector(format!(
+                "collective {collective_id} has no insight index, so insight {id} \
+                 cannot be indexed"
+            ))
+        })?;
+
+        if index.is_searchable(exp_id) {
+            return Ok(false);
+        }
+
+        if !index.clear_deleted_mark(exp_id)? {
+            index.insert_experience(exp_id, &insight.embedding)?;
+        }
+
+        // Same proof step as the experience path, and for the same reason.
+        if !index.is_searchable(exp_id) {
+            return Err(PulseDBError::vector(format!(
+                "insight {id} is not searchable after the repair: its index entry is \
+                 not yet searchable (an insert for this id is still in flight, or the id \
+                 was deleted again); the change is not acknowledged and the next sync retries"
+            )));
+        }
+
+        if repairing {
+            tracing::warn!(
+                id = %id,
+                collective_id = %collective_id,
+                "repaired missing index entry from redb"
+            );
+        }
+        Ok(true)
+    }
+
     /// Applies a synced insight from a remote peer.
     ///
     /// Writes to storage and inserts into insight HNSW index.
@@ -3584,22 +3789,26 @@ impl PulseDB {
     /// Same save-then-index shape, and the same limits, as
     /// [`apply_synced_experience`](Self::apply_synced_experience): the
     /// embedding is checked against the insight index before anything is
-    /// written, and an insert that fails after the save is reported and logged
+    /// written, a collective with no insight index is refused before any write,
+    /// and an index step that fails after the save is reported and logged
     /// rather than undone.
     ///
     /// Unlike `Experience::embedding`, `DerivedInsight::embedding` is stored
     /// inline and IS serialized, so this path does not meet #96's zero-length
     /// vector on the wire. The ordering is still what stops a dimension
     /// mismatch from any other source leaving a record behind with no vector.
+    ///
+    /// After the save, the record is made searchable through
+    /// [`ensure_synced_insight_indexed`](Self::ensure_synced_insight_indexed)'s
+    /// step — the entry is built from the stored insight, and a mapped but
+    /// soft-deleted id has its mark cleared rather than no-opping. That is what
+    /// lets a later sync repair a row this call left without an index entry.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_insight(&self, insight: DerivedInsight) -> Result<()> {
         let id = insight.id;
         let collective_id = insight.collective_id;
         let embedding = insight.embedding.clone();
-        // Insight HNSW keys insights by their id reinterpreted as an
-        // ExperienceId (byte conversion).
-        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
 
         // Reject BEFORE the write — see `apply_synced_experience`.
         {
@@ -3607,30 +3816,30 @@ impl PulseDB {
                 .insight_vectors
                 .read()
                 .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-            if let Some(index) = insight_vectors.get(&collective_id) {
-                index.validate_embedding(&embedding)?;
-            }
+            let index = insight_vectors.get(&collective_id).ok_or_else(|| {
+                PulseDBError::vector(format!(
+                    "collective {collective_id} has no insight index, so insight {id} \
+                     cannot be indexed and is not stored"
+                ))
+            })?;
+            index.validate_embedding(&embedding)?;
         }
 
         self.storage.save_insight(&insight)?;
 
-        let insight_vectors = self
-            .insight_vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-        if let Some(index) = insight_vectors.get(&collective_id) {
-            if let Err(e) = index.insert_experience(exp_id, &embedding) {
-                tracing::error!(
-                    id = %id,
-                    collective_id = %collective_id,
-                    "Synced insight saved but NOT indexed; the record has no \
-                     vector and is not searchable: {e}"
-                );
-                return Err(PulseDBError::vector(format!(
-                    "insight {id} was saved but could not be indexed, so the \
-                     record remains without a vector and is not searchable: {e}"
-                )));
-            }
+        // Same make-searchable step as the experience path, including the
+        // soft-deleted case.
+        if let Err(e) = self.make_synced_insight_searchable(id, false) {
+            tracing::error!(
+                id = %id,
+                collective_id = %collective_id,
+                "Synced insight saved but NOT indexed; the record has no \
+                 vector and is not searchable: {e}"
+            );
+            return Err(PulseDBError::vector(format!(
+                "insight {id} was saved but could not be indexed, so the \
+                 record remains without a vector and is not searchable: {e}"
+            )));
         }
 
         debug!(id = %id, "Synced insight applied");
@@ -5348,5 +5557,112 @@ mod provider_identity_persistence {
             ),
         }
         db.close().unwrap();
+    }
+}
+
+/// Tests for the synced-create index repair (#96 residual, r1.s5.w3).
+///
+/// Both live here rather than in an integration test because the repair entry
+/// points are `pub(crate)`: the crate's own tests are the only place that can
+/// call `ensure_synced_experience_indexed` and read the error it returns.
+#[cfg(all(test, feature = "sync"))]
+mod synced_index_repair_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn exp_in(cid: CollectiveId) -> NewExperience {
+        NewExperience {
+            collective_id: cid,
+            content: "record with an embedding".to_string(),
+            embedding: Some(vec![0.1f32; 384]),
+            ..Default::default()
+        }
+    }
+
+    /// C6: a stored record with no stored embedding is a store-consistency
+    /// error, never a silent pass — and it repeats rather than being one-shot.
+    ///
+    /// A record and its embedding commit in one transaction, so this state can
+    /// only mean the store was altered outside PulseDB. It is built here
+    /// through the storage port, which is the same `storage_for_test()`
+    /// construction the spec's sync tests use.
+    #[test]
+    fn ensure_synced_experience_indexed_refuses_a_record_with_no_stored_embedding() {
+        let dir = tempdir().unwrap();
+        let db = PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap();
+
+        let cid = db.create_collective("store-consistency").unwrap();
+        let exp_id = db.record_experience(exp_in(cid)).unwrap();
+
+        // Rewrite the row with an empty vector: the record is in redb, the
+        // embedding it committed with is not.
+        let mut stripped = db.get_experience(exp_id).unwrap().unwrap();
+        stripped.embedding = Vec::new();
+        db.storage_for_test().save_experience(&stripped).unwrap();
+
+        for attempt in 1..=2 {
+            let error = db
+                .ensure_synced_experience_indexed(exp_id)
+                .expect_err("a record with no stored embedding must never be repaired silently");
+            let message = error.to_string();
+            assert!(
+                message.contains(&exp_id.to_string()),
+                "attempt {attempt}: the error must name the id, got: {message}"
+            );
+            assert!(
+                message.contains("store-consistency violation"),
+                "attempt {attempt}: the error must call this what it is, got: {message}"
+            );
+        }
+    }
+
+    /// A repair that joins an insert still in flight publishes nothing, so it
+    /// must not be reported as a repair: the id is not searchable yet and the
+    /// change must not be acknowledged (grill A1 — ack only once the id is
+    /// searchable).
+    ///
+    /// The window is the one the two verifiers named: the other thread's insert
+    /// holds the claim and has not published, this call joins it and returns,
+    /// and if the claim holder then unwinds the create would be acknowledged
+    /// unsearchable. The claim is taken directly here because it is otherwise
+    /// reachable only with a second thread and a timing window; the panic hook
+    /// cannot hold it, since a panic releases the claim by design.
+    #[test]
+    fn a_repair_that_joins_an_in_flight_claim_is_not_reported_as_repaired() {
+        let dir_source = tempdir().unwrap();
+        let dir_target = tempdir().unwrap();
+        let source = PulseDB::open(dir_source.path().join("source.db"), Config::default()).unwrap();
+        let target = PulseDB::open(dir_target.path().join("target.db"), Config::default()).unwrap();
+
+        // The target holds the collective (so it has an index for it) and the
+        // record, but no index entry for it: the state a failed index insert
+        // leaves behind.
+        let cid = source.create_collective("in-flight-claim").unwrap();
+        let exp_id = source.record_experience(exp_in(cid)).unwrap();
+        let collective = source.get_collective(cid).unwrap().unwrap();
+        target.apply_synced_collective(collective).unwrap();
+        let stored = source.get_experience(exp_id).unwrap().unwrap();
+        target.storage_for_test().save_experience(&stored).unwrap();
+
+        // Another thread's insert for this id is in flight.
+        target
+            .with_vector_index(cid, |index| {
+                index.claim_for_test(exp_id);
+                Ok(())
+            })
+            .unwrap();
+
+        let error = target
+            .ensure_synced_experience_indexed(exp_id)
+            .expect_err("a repair that published nothing is not a repair");
+        let message = error.to_string();
+        assert!(
+            message.contains(&exp_id.to_string()),
+            "the error must name the id, got: {message}"
+        );
+        assert!(
+            message.contains("not") && message.contains("searchable"),
+            "the error must say the id is not searchable yet, got: {message}"
+        );
     }
 }
