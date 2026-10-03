@@ -31,7 +31,7 @@ fault-injection = ["dep:libc"]
 # only file-format v3 and HARD-REFUSES the v2 files written by <=v0.5.1; the
 # upgrade-on-open migration (VS-4.0.2) adds an aliased redb 2.6 to run
 # Database::upgrade() (v2->v3) before opening under 4.x.
-redb = "~4.2"
+redb = "~4.3"
 
 # Aliased redb 2.6 — the ONLY v2->v3 file-format upgrade bridge (`Database::upgrade()`
 # lives solely on the 2.6.x line; it is absent in 3.x/4.x). Used on the one-time
@@ -144,7 +144,7 @@ serde_json = "1.0"
 # bytes (EMBEDDINGS + raw metadata keys) for the C4 RAW byte-identity assertion —
 # pinned to the same 4.x the crate migrates INTO. Replaces the src/-side inspector
 # that 4.04 was to add but did not (round-ordering gap; see report).
-redb = "~4.2"
+redb = "~4.3"
 # uuid: parse manifest id strings back into typed ids for by-id read-back lookups.
 uuid = "1"
 
