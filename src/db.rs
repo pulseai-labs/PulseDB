@@ -892,8 +892,13 @@ impl PulseDB {
             if embeddings.is_empty() {
                 // No live embeddings remain; stale deleted marks must not
                 // survive a later synced re-create and crash before close.
-                if let Some(dir) = &hnsw_dir {
-                    HnswIndex::remove_files(dir, &collective.id.to_string())?;
+                if !config.read_only {
+                    if let Some(dir) = &hnsw_dir {
+                        if let Err(error) = HnswIndex::remove_files(dir, &collective.id.to_string())
+                        {
+                            warn!(collective = %collective.id, %error, "Failed to clean stale experience sidecar (non-fatal)");
+                        }
+                    }
                 }
                 continue;
             }
@@ -917,9 +922,14 @@ impl PulseDB {
                 idx
             };
 
-            // Restore deleted set from metadata if available
+            // Validate persisted marks, then reconcile them with redb's live rows.
+            // A stale mark from before a synced re-create must never hide a
+            // durable embedding, even when sidecar cleanup failed or was skipped.
             if let Some(meta) = metadata {
                 index.restore_deleted_set(&meta.deleted)?;
+                for id in exp_ids {
+                    index.clear_deleted_mark(id)?;
+                }
             }
 
             vectors.insert(collective.id, index);
@@ -963,8 +973,14 @@ impl PulseDB {
 
             if embeddings.is_empty() {
                 // Insight sidecars carry the same deleted-mark hazard.
-                if let Some(dir) = &hnsw_dir {
-                    HnswIndex::remove_files(dir, &format!("{}_insights", collective.id))?;
+                if !config.read_only {
+                    if let Some(dir) = &hnsw_dir {
+                        if let Err(error) =
+                            HnswIndex::remove_files(dir, &format!("{}_insights", collective.id))
+                        {
+                            warn!(collective = %collective.id, %error, "Failed to clean stale insight sidecar (non-fatal)");
+                        }
+                    }
                 }
                 continue;
             }
@@ -989,9 +1005,14 @@ impl PulseDB {
                 idx
             };
 
-            // Restore deleted set from metadata if available
+            // Validate persisted marks, then reconcile them with redb's live rows.
+            // A stale mark from before a synced re-create must never hide a
+            // durable embedding, even when sidecar cleanup failed or was skipped.
             if let Some(meta) = metadata {
                 index.restore_deleted_set(&meta.deleted)?;
+                for id in insight_ids {
+                    index.clear_deleted_mark(ExperienceId::from_bytes(*id.as_bytes()))?;
+                }
             }
 
             insight_vectors.insert(collective.id, index);
@@ -5725,6 +5746,188 @@ mod synced_index_repair_tests {
                 .any(|(hit, _)| hit.id == id),
             "a stale sidecar must not hide the acknowledged insight"
         );
+    }
+
+    #[test]
+    fn stale_sidecar_of_populated_collective_cannot_hide_resynced_experience() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-experience-sidecar").unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        let record = db.get_experience(id).unwrap().unwrap();
+        db.record_experience(exp_in(cid)).unwrap(); // Keep the collective populated.
+        db.delete_experience(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_experience(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::ExperienceCreated(record.into()),
+        );
+        assert!(db
+            .search_similar(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.experience.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_experience(id).unwrap().is_some());
+        assert!(
+            db.search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.experience.id == id),
+            "a stale sidecar must not hide the acknowledged experience"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_of_populated_collective_cannot_hide_resynced_insight() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-insight-sidecar").unwrap();
+        let source = db.record_experience(exp_in(cid)).unwrap();
+        let id = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "insight with an embedding".to_string(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        let record = db.get_insight(id).unwrap().unwrap();
+        db.store_insight(NewDerivedInsight {
+            collective_id: cid,
+            content: "surviving insight".to_string(),
+            embedding: Some(vec![0.2; 384]),
+            source_experience_ids: vec![source],
+            insight_type: crate::insight::InsightType::Pattern,
+            confidence: 0.9,
+            domain: vec![],
+        })
+        .unwrap();
+        db.delete_insight(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_insight(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::InsightCreated(record),
+        );
+        assert!(db
+            .get_insights(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|(hit, _)| hit.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(
+            db.get_insights(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|(hit, _)| hit.id == id),
+            "a stale sidecar must not hide the acknowledged insight"
+        );
+    }
+
+    #[test]
+    fn empty_sidecars_preserved_on_read_only_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("read-only").unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        db.delete_experience(id).unwrap();
+        db.close().unwrap();
+        let sidecars = dir.path().join("test.db.hnsw");
+        let exp_meta = sidecars.join(format!("{cid}.hnsw.meta"));
+        let insight_meta = sidecars.join(format!("{cid}_insights.hnsw.meta"));
+        std::fs::copy(&exp_meta, &insight_meta).unwrap();
+        let before = std::fs::read(&exp_meta).unwrap();
+        let db = PulseDB::open(
+            &path,
+            Config {
+                read_only: true,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&exp_meta).unwrap(), before);
+        assert_eq!(std::fs::read(&insight_meta).unwrap(), before);
+        drop(db);
+    }
+
+    #[test]
+    fn empty_sidecar_cleanup_failure_does_not_prevent_writable_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("cleanup-failure").unwrap();
+        db.close().unwrap();
+        let sidecars = dir.path().join("test.db.hnsw");
+        std::fs::create_dir_all(&sidecars).unwrap();
+        // A directory at each metadata path makes remove_file fail on all OSes.
+        for name in [cid.to_string(), format!("{cid}_insights")] {
+            std::fs::create_dir(sidecars.join(format!("{name}.hnsw.meta"))).unwrap();
+        }
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        assert!(db
+            .search_similar(cid, &vec![0.1; 384], 1)
+            .unwrap()
+            .iter()
+            .any(|h| h.experience.id == id));
+    }
+
+    #[test]
+    fn populated_sidecar_invalid_deleted_uuid_remains_an_error() {
+        for insight in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            let cid = db.create_collective("corrupt-mark").unwrap();
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            db.store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "insight".to_string(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+            db.close().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            let meta_path = dir
+                .path()
+                .join("test.db.hnsw")
+                .join(format!("{name}.hnsw.meta"));
+            let mut meta: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            meta["deleted"] = serde_json::json!(["not-a-uuid"]);
+            std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            let error = PulseDB::open(&path, Config::default())
+                .err()
+                .expect("invalid mark must fail open");
+            assert!(error.to_string().contains("Invalid UUID in deleted set"));
+        }
     }
 
     /// C6: a stored record with no stored embedding is a store-consistency
