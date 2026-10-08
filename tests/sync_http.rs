@@ -791,11 +791,9 @@ async fn test_http_reinforcement_gcounter_converges_exact_total() {
     let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
 
     // Seed the client with the same record through the apply path, collective
-    // first. The order is load-bearing since #96's residual was closed: a
-    // create is refused before the write when its collective has no index, so
-    // seeding the experience alone would be refused rather than stored
-    // unindexed — the fixture has to build the index a synced collective
-    // builds. Both applies run under the guard, as a synced change would.
+    // first. The collective's durable dimension is needed to validate the
+    // experience before saving it; applying the experience then builds the
+    // lazy index. Both applies run under the guard, as a synced change would.
     let collective = server.db.get_collective(cid).unwrap().unwrap();
     let guard = SyncApplyGuard::enter();
     db_client.apply_synced_collective(collective).unwrap();

@@ -1004,7 +1004,7 @@ fn test_apply_synced_collective_creates_indexes() {
         .unwrap();
     assert_eq!(retrieved.name, "synced-collective");
 
-    // Verify we can record experiences in the synced collective (HNSW index exists)
+    // The first indexed write builds the synced collective's derived index.
     let exp_id = db.record_experience(minimal_exp(collective.id)).unwrap();
     assert!(db.get_experience(exp_id).unwrap().is_some());
 }

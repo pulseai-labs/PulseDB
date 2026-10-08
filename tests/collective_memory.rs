@@ -9,9 +9,9 @@
 //! file named by `PULSEDB_MEM_OUT` as it arrives, and then prints one
 //! `VERDICT-INPUT {json}` line per phase.
 //!
-//! The harness measures; it does not judge. Whether these numbers falsify the
-//! HNSW pre-reservation hypothesis is read at the round-1 barrier from the
-//! Windows CI artifacts, not decided here.
+//! The grid measures without a bound. `collective_memory_bound` also reuses
+//! fresh children to enforce the E/R memory limits at default tuning, with
+//! one experience and one insight per populated collective.
 //!
 //! Attribution discipline: `alloc_requested_delta` comes from the global
 //! allocator, `os_metric_delta` from the OS. A gap between them is *outside the
@@ -30,7 +30,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pulsedb::{Config, HnswConfig, PulseDB};
+use pulsedb::{Config, HnswConfig, InsightType, NewDerivedInsight, NewExperience, PulseDB};
 use serde_json::{json, Value};
 
 // ============================================================================
@@ -482,6 +482,83 @@ const POINT_TEST_NAME: &str = "collective_memory_point";
 const COLLECTIVE_MEMORY_TAG: &str = "COLLECTIVE_MEMORY";
 const VERDICT_INPUT_TAG: &str = "VERDICT-INPUT";
 
+/// Builds only complete bound points; a partially populated collective never
+/// counts as done. Both phases reuse the same creation and ceiling checks.
+fn create_bound_collectives(store: &PulseDB, point: &str) -> (usize, bool) {
+    let mut done = 0;
+    for i in 0..25 {
+        let cid = store
+            .create_collective(&format!("bound-{i}"))
+            .expect("create collective");
+        if os_ceiling_hit_at_current() {
+            return (done, true);
+        }
+        if point == "R" {
+            let embedding: Vec<f32> = (0..384).map(|j| ((j + 1) as f32 * 0.01).sin()).collect();
+            let source = store
+                .record_experience(NewExperience {
+                    collective_id: cid,
+                    content: "bound experience".into(),
+                    embedding: Some(embedding.clone()),
+                    ..Default::default()
+                })
+                .expect("record bound experience");
+            if os_ceiling_hit_at_current() {
+                return (done, true);
+            }
+            store
+                .store_insight(NewDerivedInsight {
+                    collective_id: cid,
+                    content: "bound insight".into(),
+                    embedding: Some(embedding),
+                    source_experience_ids: vec![source],
+                    insight_type: InsightType::Pattern,
+                    confidence: 0.8,
+                    domain: vec![],
+                })
+                .expect("record bound insight");
+            if os_ceiling_hit_at_current() {
+                return (done, true);
+            }
+        }
+        done += 1;
+    }
+    (done, false)
+}
+
+fn measure_bound(point: &str, phase: Phase) -> Value {
+    assert!(matches!(point, "E" | "R"));
+    let dir = tempfile::tempdir().expect("bound tempdir");
+    let path = dir.path().join("bound.db");
+    let store = PulseDB::open(&path, Config::default()).expect("open bound store");
+    let (before, after, done, aborted) = match phase {
+        Phase::Create => {
+            let before = snapshot();
+            let (done, aborted) = create_bound_collectives(&store, point);
+            let after = snapshot();
+            store.close().expect("close bound store");
+            (before, after, done, aborted)
+        }
+        Phase::Reopen => {
+            let (done, build_aborted) = create_bound_collectives(&store, point);
+            store.close().expect("close bound store");
+            let before = snapshot();
+            if build_aborted {
+                (before, before, done, true)
+            } else {
+                let reopened = PulseDB::open(&path, Config::default()).expect("reopen bound store");
+                let after = snapshot();
+                let aborted = os_ceiling_hit_at(after.os);
+                reopened.close().expect("close reopened bound store");
+                (before, after, done, aborted)
+            }
+        }
+    };
+    let mut payload = point_line(10_000, 25, done, phase, before, after, aborted);
+    payload["point"] = json!(point);
+    payload
+}
+
 /// The payload of a `TAG {json}` line, if `line` carries one.
 ///
 /// The tag is located anywhere in the line, not only at its start: libtest's
@@ -509,16 +586,20 @@ fn collective_memory_point() {
     };
 
     let fields: Vec<&str> = point.split(',').collect();
-    assert_eq!(
-        fields.len(),
-        3,
-        "PULSEDB_MEM_POINT must be <max_elements>,<collectives>,<phase>, got {point:?}"
+    assert!(
+        fields.len() == 3 || fields.len() == 4,
+        "PULSEDB_MEM_POINT must be <max_elements>,<collectives>,<phase>[,E|R], got {point:?}"
     );
     let max_elements: usize = fields[0].parse().expect("max_elements");
     let collectives: usize = fields[1].parse().expect("collectives");
     let phase = Phase::parse(fields[2]).unwrap_or_else(|| panic!("unknown phase in {point:?}"));
 
-    let payload = measure(max_elements, collectives, phase);
+    let payload = if fields.len() == 4 {
+        assert_eq!((max_elements, collectives), (10_000, 25));
+        measure_bound(fields[3], phase)
+    } else {
+        measure(max_elements, collectives, phase)
+    };
     // The leading newline keeps the tag at the start of a real line: without it
     // libtest's `--nocapture` progress prefix would share the line.
     println!("\n{COLLECTIVE_MEMORY_TAG} {payload}");
@@ -622,6 +703,35 @@ fn collective_memory_grid() {
     }
 }
 
+/// Release r1 criterion 8: default tuning, both kinds of derived indexes.
+#[test]
+#[ignore]
+fn collective_memory_bound() {
+    println!();
+    let exe = std::env::current_exe().expect("current test executable");
+    let mut sink = artifact_sink();
+    for point in ["E", "R"] {
+        let bound = if point == "E" { 1_048_576. } else { 4_194_304. };
+        for phase in Phase::ALL {
+            let payload = run_child(&exe, &format!("10000,25,{},{}", phase.as_str(), point));
+            let line = format!("COLLECTIVE_MEMORY_BOUND {payload}");
+            println!("{line}");
+            append(&mut sink, &line);
+            assert_eq!(payload["point"], point);
+            assert_eq!(payload["aborted"], false, "aborted bound point: {payload}");
+            let done = payload["collectives_done"]
+                .as_u64()
+                .expect("completed count");
+            assert_eq!(done, 25, "incomplete bound point: {payload}");
+            for metric in ["alloc_requested_delta", "os_metric_delta"] {
+                let per_collective = payload[metric].as_f64().expect("metric") / done as f64;
+                assert!(per_collective <= bound,
+                    "point {point} {} {metric}: {per_collective} bytes per completed collective exceeds {bound}: {payload}", phase.as_str());
+            }
+        }
+    }
+}
+
 /// The append-on-arrival sink named by `PULSEDB_MEM_OUT` (audit C4), so a killed
 /// run keeps what it measured. Unset — as in the local AC runs — prints only.
 fn artifact_sink() -> Option<std::fs::File> {
@@ -674,14 +784,16 @@ fn per_collective(
 /// One `VERDICT-INPUT` line per phase: the inputs to the verdict, not the
 /// verdict. The round-1 barrier reads them beside the Windows artifacts.
 fn verdict_input(phase: Phase, measured: &[Value]) -> Value {
-    // `null` when either arm is missing or the narrow arm is zero: an undefined
-    // ratio must not read as 0.
+    // Near-zero (rounded to zero) or negative OS deltas are not meaningful
+    // reservation ratios. Undefined figures must not read as measured zero.
     let ratio = |metric: &str| -> Value {
         match (
             per_collective(measured, phase, WIDE_MAX_ELEMENTS, metric),
             per_collective(measured, phase, NARROW_MAX_ELEMENTS, metric),
         ) {
-            (Some(wide), Some(narrow)) if narrow != 0.0 => json!(round3(wide / narrow)),
+            (Some(wide), Some(narrow)) if wide > 0.0 && narrow > 0.0 => {
+                json!(round3(wide / narrow))
+            }
             _ => Value::Null,
         }
     };
@@ -718,6 +830,25 @@ fn verdict_input(phase: Phase, measured: &[Value]) -> Value {
 
 fn round3(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
+}
+
+#[test]
+fn memory_ratios_are_null_for_nonpositive_arms() {
+    for (wide, narrow) in [(0, 100), (100, 0), (-100, 100), (100, -100)] {
+        let measured = vec![
+            json!({"phase":"create", "max_elements":10000, "collectives":COMMON_COUNT,
+                "collectives_done":COMMON_COUNT, "alloc_requested_delta":wide, "os_metric_delta":wide}),
+            json!({"phase":"create", "max_elements":100, "collectives":COMMON_COUNT,
+                "collectives_done":COMMON_COUNT, "alloc_requested_delta":narrow, "os_metric_delta":narrow}),
+        ];
+        let verdict = verdict_input(Phase::Create, &measured);
+        for metric in ["alloc_requested_delta", "os_metric_delta"] {
+            assert!(
+                verdict["ratio"][metric].is_null(),
+                "undefined ratio: {verdict}"
+            );
+        }
+    }
 }
 
 // ============================================================================

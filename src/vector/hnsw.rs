@@ -33,6 +33,39 @@ use super::VectorIndex;
 /// reliable (100% recall) and faster (no graph overhead) at this scale.
 const BRUTE_FORCE_THRESHOLD: usize = 128;
 
+/// Compensates hnsw_rs 0.3.4's missing second exp() at hnsw.rs line 453
+/// (https://github.com/jean-pierreBoth/hnswlib-rs/issues/41). Remove when fixed
+/// upstream. This gives a total reservation of about `max_elements` slots;
+/// the skew between layers remains, and layer zero grows by ordinary Vec growth.
+fn allocation_hint(config: &HnswConfig) -> usize {
+    let s = 1. / (config.max_nb_connection as f64).ln();
+    let fractions: Vec<f64> = (0..config.max_layer.min(16))
+        .map(|i| (-(i as f64) / s).exp() - (-((i + 1) as f64) / s))
+        .collect();
+    let factor: f64 = fractions.iter().sum();
+    if factor.is_nan() || factor < 1. {
+        return config.max_elements;
+    }
+    let reservation = |hint: usize| {
+        fractions.iter().fold(0usize, |total, frac| {
+            total.saturating_add((frac * hint as f64).round() as usize)
+        })
+    };
+    // Search the rounded sum, rather than rounding N/factor: the latter can
+    // under-reserve or skip the smallest hint at rounding boundaries.
+    let mut low = 1;
+    let mut high = config.max_elements.max(1);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if reservation(mid) >= config.max_elements {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
+}
+
 /// Newtype wrapper that bridges `&dyn Fn(&usize) -> bool` to `FilterT`.
 ///
 /// Rust's blanket impl `impl<F: Fn(&DataId) -> bool> FilterT for F` only
@@ -187,10 +220,14 @@ impl HnswIndex {
     ///
     /// * `dimension` - Expected embedding dimension (validated on insert)
     /// * `config` - HNSW tuning parameters
+    ///
+    /// Compensates hnsw_rs 0.3.4's allocation hint for a total reservation of
+    /// about `max_elements` slots. Layer zero grows independently as points
+    /// arrive; this does not reserve `max_elements` slots in every layer.
     pub fn new(dimension: usize, config: &HnswConfig) -> Self {
         let hnsw = Hnsw::new(
             config.max_nb_connection,
-            config.max_elements,
+            allocation_hint(config),
             config.max_layer,
             config.ef_construction,
             DistCosine,
@@ -861,6 +898,58 @@ fn maybe_fail_graph_insert() {
 mod tests {
     use super::*;
     use crate::config::HnswConfig;
+
+    #[test]
+    fn allocation_hint_reserves_about_max_elements() {
+        // Independent copy of upstream 0.3.4's expression and per-layer rounding.
+        let reservation = |config: &HnswConfig, hint: usize| -> usize {
+            let s = 1. / (config.max_nb_connection as f64).ln();
+            (0..config.max_layer.min(16))
+                .map(|i| {
+                    let frac = (-(i as f64) / s).exp() - (-((i + 1) as f64) / s);
+                    (frac * hint as f64).round() as usize
+                })
+                .sum()
+        };
+        assert!(allocation_hint(&HnswConfig::default()) <= 100);
+        for max_nb_connection in [2, 16, 32] {
+            for max_layer in [1, 8, 16, 32] {
+                for max_elements in [1, 100, 10_000, 1_000_000] {
+                    let config = HnswConfig {
+                        max_nb_connection,
+                        max_layer,
+                        max_elements,
+                        ..HnswConfig::default()
+                    };
+                    let hint = allocation_hint(&config);
+                    let total = reservation(&config, hint);
+                    let step = total - reservation(&config, hint.saturating_sub(1));
+                    assert!(hint >= 1);
+                    assert!(total >= max_elements, "{config:?}: {hint} reserves {total}");
+                    assert!(
+                        total <= max_elements + step,
+                        "{config:?}: excess reservation {total}"
+                    );
+                    if hint > 1 {
+                        assert!(reservation(&config, hint - 1) < max_elements);
+                    }
+                }
+            }
+        }
+        let no_layers = HnswConfig {
+            max_layer: 0,
+            ..HnswConfig::default()
+        };
+        assert_eq!(allocation_hint(&no_layers), no_layers.max_elements);
+        let invalid_factor = HnswConfig {
+            max_nb_connection: 0,
+            ..HnswConfig::default()
+        };
+        assert_eq!(
+            allocation_hint(&invalid_factor),
+            invalid_factor.max_elements
+        );
+    }
 
     fn test_config() -> HnswConfig {
         HnswConfig {

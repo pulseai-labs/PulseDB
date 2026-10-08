@@ -4873,35 +4873,68 @@ async fn synced_insight_create_repairs_unindexed_row_before_ack() {
     );
 }
 
-/// A create whose collective has no index is REFUSED, not stored-and-skipped.
-///
-/// The `if let Some(index)` arm this replaces stored the record with no vector
-/// at all and then acknowledged it, so the peer compacted past a change search
-/// could never find — and nothing downstream would repair it either, because
-/// the applier's create arm reads the row's existence as a finished create.
-/// Before lazy index creation lands, an absent index is an error by design
-/// (A2): the record is not written, and the change stays unacknowledged so the
-/// next attempt offers it again.
+/// A valid create builds the absent derived index before acknowledgement.
 #[tokio::test]
-async fn synced_create_into_collective_without_index_is_refused_and_not_acknowledged() {
+async fn synced_collective_creates_no_index() {
+    let mut pair = setup_sync_pair();
+    let cid = pair
+        .db_a
+        .create_collective("synced-lazy-collective")
+        .unwrap();
+    pair.manager_b.initial_sync(None).await.unwrap();
+    assert!(pair.db_b.get_collective(cid).unwrap().is_some());
+    assert_eq!(
+        pair.db_b
+            .with_vector_index(cid, |index| Ok(index.active_count()))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        pair.db_b
+            .with_insight_vector_index(cid, |index| Ok(index.active_count()))
+            .unwrap(),
+        None
+    );
+    let id = pair.db_a.record_experience(minimal_exp(cid)).unwrap();
+    pair.manager_b.initial_sync(None).await.unwrap();
+    assert_eq!(
+        pair.db_b
+            .with_vector_index(cid, |index| Ok(index.active_count()))
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        pair.db_b
+            .with_insight_vector_index(cid, |index| Ok(index.active_count()))
+            .unwrap(),
+        None
+    );
+    assert!(pair
+        .db_b
+        .search_similar(cid, &vec![0.1; 384], 8)
+        .unwrap()
+        .iter()
+        .any(|hit| hit.experience.id == id));
+}
+
+/// A valid create builds the absent derived index before acknowledgement.
+#[tokio::test]
+async fn synced_create_into_collective_without_index_creates_it_and_is_searchable() {
     let mut pair = setup_sync_pair();
 
     // A: the collective, and an experience recorded in it.
-    let cid = pair
-        .db_a
-        .create_collective("refused-without-index")
-        .unwrap();
+    let cid = pair.db_a.create_collective("lazy-without-index").unwrap();
     let exp_id = pair.db_a.record_experience(minimal_exp(cid)).unwrap();
 
     // B: the collective written straight into its store. redb knows it; no
-    // index was ever built for it, which is the state the refusal exists for.
+    // index was ever built for it: the ordinary lazy first-write state.
     let collective = pair.db_a.get_collective(cid).unwrap().unwrap();
     pair.db_b
         .storage_for_test()
         .save_collective(&collective)
         .unwrap();
 
-    // The create's own WAL sequence, so "not past the change" is exact rather
+    // The create's own WAL sequence, so acknowledgement is exact rather
     // than a guess about how many events A happened to record.
     let create_sequence = pair
         .db_a
@@ -4913,28 +4946,33 @@ async fn synced_create_into_collective_without_index_is_refused_and_not_acknowle
         .map(|(sequence, _)| sequence)
         .expect("A's WAL must hold the create event");
 
-    let error = pair
-        .manager_b
+    assert_eq!(
+        pair.db_b
+            .with_vector_index(cid, |index| Ok(index.active_count()))
+            .unwrap(),
+        None
+    );
+    pair.manager_b
         .initial_sync(None)
         .await
-        .expect_err("a create that cannot be indexed is not a completed catch-up");
-    assert!(
-        error.is_catch_up_incomplete(),
-        "the refusal must surface as the typed catch-up error, got: {error}"
-    );
+        .expect("valid first indexed write must complete catch-up");
 
     assert!(
-        pair.db_b.get_experience(exp_id).unwrap().is_none(),
-        "the refusal happens BEFORE the write: no record, no secondary index \
-         entry, no WAL event"
+        pair.db_b.get_experience(exp_id).unwrap().is_some(),
+        "the acknowledged create must be stored"
     );
+    assert!(pair
+        .db_b
+        .search_similar(cid, &vec![0.1; 384], 8)
+        .unwrap()
+        .iter()
+        .any(|hit| hit.experience.id == exp_id));
 
     let cursors = pair.db_b.storage_for_test().list_sync_cursors().unwrap();
     assert_eq!(cursors.len(), 1, "B must be on record for exactly one peer");
     assert!(
-        cursors[0].pull_sequence < create_sequence,
-        "the refused change must stay ahead of the pull position ({} vs {}) so \
-         the next attempt fetches it again",
+        cursors[0].pull_sequence >= create_sequence,
+        "the indexed create must be acknowledged ({} vs {})",
         cursors[0].pull_sequence,
         create_sequence
     );

@@ -137,7 +137,7 @@ jobs:
         # that cost moves with HnswConfig::max_elements. Four legs only — the two
         # OSes the PR #88 commit blow-up has to be compared on, each in the
         # feature set that failed (sync-http) and the baseline (default).
-        # No bound yet: w2 adds the failing threshold this artifact feeds.
+        # The grid measures; the E/R bound fails the step on a breach.
         if: >-
           (matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest')
           && (matrix.features == '' || matrix.features == '--features sync-http')
@@ -146,6 +146,7 @@ jobs:
           PULSEDB_MEM_OUT: collective-memory-${{ matrix.os }}-${{ matrix.features == '--features sync-http' && 'sync-http' || 'default' }}.jsonl
         run: |
           cargo test ${{ matrix.features }} --test collective_memory -- --ignored --nocapture --test-threads=1 collective_memory_grid
+          cargo test ${{ matrix.features }} --test collective_memory -- --ignored --nocapture --test-threads=1 collective_memory_bound
           echo "--- ${PULSEDB_MEM_OUT} ---"
           cat "${PULSEDB_MEM_OUT}"
 
