@@ -890,6 +890,11 @@ impl PulseDB {
             }
 
             if embeddings.is_empty() {
+                // No live embeddings remain; stale deleted marks must not
+                // survive a later synced re-create and crash before close.
+                if let Some(dir) = &hnsw_dir {
+                    HnswIndex::remove_files(dir, &collective.id.to_string())?;
+                }
                 continue;
             }
 
@@ -957,6 +962,10 @@ impl PulseDB {
             }
 
             if embeddings.is_empty() {
+                // Insight sidecars carry the same deleted-mark hazard.
+                if let Some(dir) = &hnsw_dir {
+                    HnswIndex::remove_files(dir, &format!("{}_insights", collective.id))?;
+                }
                 continue;
             }
 
@@ -5598,6 +5607,124 @@ mod synced_index_repair_tests {
             embedding: Some(vec![0.1f32; 384]),
             ..Default::default()
         }
+    }
+
+    // Omitting sidecar cleanup on the empty-open path must fail these tests:
+    // a stale deleted mark would hide an acknowledged re-create after a crash.
+    fn apply_recreated(
+        db: Arc<PulseDB>,
+        cid: CollectiveId,
+        payload: crate::sync::types::SyncPayload,
+    ) {
+        use crate::sync::applier::RemoteChangeApplier;
+        use crate::sync::config::SyncConfig;
+        use crate::sync::types::{InstanceId, SyncChange, SyncEntityType, SyncPayload};
+
+        let entity_type = match &payload {
+            SyncPayload::ExperienceCreated(_) => SyncEntityType::Experience,
+            SyncPayload::InsightCreated(_) => SyncEntityType::Insight,
+            _ => unreachable!(),
+        };
+        let result = RemoteChangeApplier::new(db, SyncConfig::default())
+            .apply_batch(vec![SyncChange {
+                sequence: 1,
+                source_instance: InstanceId::new(),
+                collective_id: cid,
+                entity_type,
+                payload,
+                timestamp: Timestamp::now(),
+            }])
+            .unwrap();
+        assert_eq!(result.applied, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            result.safe_through,
+            Some(1),
+            "the re-create is acknowledged"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_of_emptied_collective_cannot_hide_resynced_experience() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-experience-sidecar").unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        let record = db.get_experience(id).unwrap().unwrap();
+        db.delete_experience(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_experience(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::ExperienceCreated(record.into()),
+        );
+        assert!(db
+            .search_similar(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.experience.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_experience(id).unwrap().is_some());
+        assert!(
+            db.search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.experience.id == id),
+            "a stale sidecar must not hide the acknowledged experience"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_of_emptied_collective_cannot_hide_resynced_insight() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-insight-sidecar").unwrap();
+        let source = db.record_experience(exp_in(cid)).unwrap();
+        let id = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "insight with an embedding".to_string(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        let record = db.get_insight(id).unwrap().unwrap();
+        db.delete_insight(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_insight(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::InsightCreated(record),
+        );
+        assert!(db
+            .get_insights(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|(hit, _)| hit.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(
+            db.get_insights(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|(hit, _)| hit.id == id),
+            "a stale sidecar must not hide the acknowledged insight"
+        );
     }
 
     /// C6: a stored record with no stored embedding is a store-consistency
