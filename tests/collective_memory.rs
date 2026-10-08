@@ -723,13 +723,47 @@ fn collective_memory_bound() {
                 .as_u64()
                 .expect("completed count");
             assert_eq!(done, 25, "incomplete bound point: {payload}");
-            for metric in ["alloc_requested_delta", "os_metric_delta"] {
-                let per_collective = payload[metric].as_f64().expect("metric") / done as f64;
-                assert!(per_collective <= bound,
-                    "point {point} {} {metric}: {per_collective} bytes per completed collective exceeds {bound}: {payload}", phase.as_str());
-            }
+            assert_memory_bound(&payload, done, bound);
         }
     }
+}
+
+fn assert_memory_bound(payload: &Value, done: u64, bound: f64) {
+    // Requested allocation is hard on every platform. PrivateUsage is also
+    // hard on Windows; Linux VmData remains printed but informational.
+    for metric in ["alloc_requested_delta", "os_metric_delta"]
+        .into_iter()
+        .filter(|metric| *metric != "os_metric_delta" || cfg!(windows))
+    {
+        let per_collective = payload[metric].as_f64().expect("metric") / done as f64;
+        assert!(
+            per_collective <= bound,
+            "{metric}: {per_collective} bytes per completed collective exceeds {bound}: {payload}"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn memory_bound_linux_vmdata_is_informational() {
+    let payload = json!({"alloc_requested_delta": 25 * 1024, "os_metric_delta": 25 * 8_388_608u64,
+        "os_metric": "VmData_bytes", "point": "E", "phase": "create"});
+    assert_memory_bound(&payload, 25, 1_048_576.);
+}
+
+#[test]
+fn memory_bound_requested_bytes_remain_hard() {
+    let payload = json!({"alloc_requested_delta": 25 * 8_388_608u64, "os_metric_delta": 0,
+        "point": "E", "phase": "create"});
+    assert!(std::panic::catch_unwind(|| assert_memory_bound(&payload, 25, 1_048_576.)).is_err());
+}
+
+#[test]
+#[cfg(windows)]
+fn memory_bound_windows_private_usage_remains_hard() {
+    let payload = json!({"alloc_requested_delta": 25 * 1024, "os_metric_delta": 25 * 8_388_608u64,
+        "os_metric": "PrivateUsage_bytes", "point": "E", "phase": "create"});
+    assert!(std::panic::catch_unwind(|| assert_memory_bound(&payload, 25, 1_048_576.)).is_err());
 }
 
 /// The append-on-arrival sink named by `PULSEDB_MEM_OUT` (audit C4), so a killed
