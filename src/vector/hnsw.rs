@@ -130,10 +130,8 @@ struct IndexState {
     /// Set of soft-deleted internal IDs (excluded from search).
     ///
     /// Holds live mappings, and — transiently — the internal id of an insert
-    /// that is still in flight when its id is deleted. The second case is why
-    /// the live count below is a `saturating_sub` rather than a subtraction:
-    /// between the delete and the publish, this set can name one more id than
-    /// `id_to_internal` does.
+    /// that is still in flight when its id is deleted. Live counts subtract
+    /// only deleted IDs whose mappings have actually been published.
     deleted: HashSet<usize>,
 
     /// Next internal ID to assign (monotonically increasing).
@@ -149,6 +147,15 @@ struct IndexState {
 }
 
 impl IndexState {
+    fn active_count(&self) -> usize {
+        let deleted_published = self
+            .deleted
+            .iter()
+            .filter(|&&id| self.internal_to_id.get(id).is_some_and(Option::is_some))
+            .count();
+        self.id_to_internal.len() - deleted_published
+    }
+
     /// Grows `internal_to_id` until `internal_id` is addressable.
     ///
     /// Ids are handed out in increasing order, so growth is the common case;
@@ -449,14 +456,8 @@ impl HnswIndex {
             .read()
             .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
 
-        // Live mappings, not `next_id`: an abandoned claim leaves a hole in the
-        // id space, and counting it would inflate the budget below. Saturating,
-        // because a delete inside a claim window can name one more internal id
-        // than `id_to_internal` holds until that insert publishes.
-        let active_count = state
-            .id_to_internal
-            .len()
-            .saturating_sub(state.deleted.len());
+        // Pending/raw graph IDs are not part of the published search budget.
+        let active_count = state.active_count();
         if active_count == 0 {
             return Ok(vec![]);
         }
@@ -467,6 +468,7 @@ impl HnswIndex {
         let allowed_internal: Option<HashSet<usize>> = allowed.map(|ids| {
             ids.iter()
                 .filter_map(|exp_id| state.id_to_internal.get(exp_id).copied())
+                .filter(|internal| !state.deleted.contains(internal))
                 .collect()
         });
 
@@ -518,19 +520,18 @@ impl HnswIndex {
         let effective_ef = ef_search.max(effective_k);
         let deleted_ref = &state.deleted;
 
-        // Combined predicate: not-deleted AND (allowed is None OR in allowed set).
-        let needs_filter = !state.deleted.is_empty() || allowed_internal.is_some();
-        let results = if needs_filter {
-            let allowed_ref = allowed_internal.as_ref();
-            let filter_fn = move |id: &usize| -> bool {
-                !deleted_ref.contains(id)
-                    && allowed_ref.is_none_or(|internal| internal.contains(id))
-            };
-            self.hnsw
-                .search_filter(query, effective_k, effective_ef, Some(&filter_fn))
-        } else {
-            self.hnsw.search(query, effective_k, effective_ef)
+        // Mapping-facing search always excludes unpublished/raw points before
+        // they can consume k. The raw-ID VectorIndex search APIs stay unchanged.
+        let published = &state.internal_to_id;
+        let allowed_ref = allowed_internal.as_ref();
+        let filter_fn = move |id: &usize| -> bool {
+            published.get(*id).is_some_and(Option::is_some)
+                && !deleted_ref.contains(id)
+                && allowed_ref.is_none_or(|internal| internal.contains(id))
         };
+        let results = self
+            .hnsw
+            .search_filter(query, effective_k, effective_ef, Some(&filter_fn));
 
         // Map internal IDs back to ExperienceIds
         let mapped: Vec<(ExperienceId, f32)> = results
@@ -604,14 +605,11 @@ impl HnswIndex {
 
     /// Returns the number of active (non-deleted) vectors.
     ///
-    /// Saturating for the same reason as the search budget: a delete that lands
-    /// inside a claim window can name an internal id that is not mapped until
-    /// that insert publishes.
+    /// Only published mappings count; a deleted pending or raw graph ID does
+    /// not reduce the count of unrelated searchable experiences.
     pub fn active_count(&self) -> usize {
         let state = self.state.read().ok();
-        state.map_or(0, |s| {
-            s.id_to_internal.len().saturating_sub(s.deleted.len())
-        })
+        state.map_or(0, |s| s.active_count())
     }
 
     /// Returns the total number of vectors (including deleted).
@@ -1352,6 +1350,79 @@ mod tests {
             hits.iter().any(|(hit, _)| *hit == exp_id),
             "the retry must make the id findable, not merely present"
         );
+    }
+
+    #[test]
+    fn pending_delete_does_not_reduce_published_search_budget() {
+        let index = HnswIndex::new(4, &test_config());
+        let live = ExperienceId::new();
+        index
+            .insert_experience(live, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let pending = ExperienceId::new();
+        index.claim_for_test(pending);
+        index.delete_experience(pending).unwrap();
+        assert_eq!(
+            index.active_count(),
+            1,
+            "a deleted pending claim is not a deleted published point"
+        );
+        let hits = index
+            .search_experiences(&[1.0, 0.0, 0.0, 0.0], 1, 50)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, live);
+        let allowed = HashSet::from([live, pending]);
+        assert_eq!(
+            index
+                .search_experiences_with_allowed(&[1.0, 0.0, 0.0, 0.0], 1, 50, Some(&allowed))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unmapped_graph_points_cannot_consume_mapped_top_k() {
+        let index = HnswIndex::new(4, &test_config());
+        let mut ids = Vec::new();
+        for i in 0..(BRUTE_FORCE_THRESHOLD + 16) {
+            let id = ExperienceId::new();
+            index
+                .insert_experience(id, &[0.1, 1.0, i as f32 * 0.001, 0.0])
+                .unwrap();
+            ids.push(id);
+        }
+        let pending = ExperienceId::new();
+        let internal = index.claim_for_test(pending);
+        let query = [1.0, 0.0, 0.0, 0.0];
+        // Exactly the graph-insert-before-mapping-publication window.
+        index.hnsw.insert((&query, internal));
+        let raw = VectorIndex::search(&index, &query, 1, 200).unwrap();
+        assert_eq!(
+            raw[0].0, internal,
+            "raw-ID searches must still see raw graph points"
+        );
+        let mapped = index.search_experiences(&query, 1, 200).unwrap();
+        assert_eq!(
+            mapped.len(),
+            1,
+            "an unmapped closest point must not consume mapped k=1"
+        );
+        assert!(ids.contains(&mapped[0].0));
+        assert_eq!(index.search_experiences(&query, 4, 200).unwrap().len(), 4);
+        index.delete_experience(ids[0]).unwrap();
+        let allowed = HashSet::from([ids[0], ids[1], ids[2], pending]);
+        let hits = index
+            .search_experiences_with_allowed(&query, 4, 200, Some(&allowed))
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "budget counts only allowed, published, undeleted IDs"
+        );
+        assert!(hits.iter().all(|(id, _)| *id == ids[1] || *id == ids[2]));
+        assert_eq!(index.active_count(), ids.len() - 1);
     }
 
     /// A delete that lands while an insert for the same id is in flight must
