@@ -403,13 +403,13 @@ impl PulseDB {
         config.validate().map_err(PulseDBError::from)?;
 
         let storage = open_storage(&path, config)?;
-        let vectors = Self::load_all_indexes(&*storage, config)?;
+        let (vectors, collective_count) = Self::load_all_indexes(&*storage, config)?;
         let insight_vectors = Self::load_all_insight_indexes(&*storage, config)?;
 
         info!(
             dimension = config.embedding_dimension.size(),
             sync_mode = ?config.sync_mode,
-            collectives = storage.list_collectives()?.len(),
+            collectives = collective_count,
             experience_indexes = vectors.len(),
             insight_indexes = insight_vectors.len(),
             "PulseDB opened successfully"
@@ -865,7 +865,7 @@ impl PulseDB {
     fn load_all_indexes(
         storage: &dyn StorageEngine,
         config: &Config,
-    ) -> Result<HashMap<CollectiveId, HnswIndex>> {
+    ) -> Result<(HashMap<CollectiveId, HnswIndex>, usize)> {
         let collectives = storage.list_collectives()?;
         let mut vectors = HashMap::with_capacity(collectives.len());
 
@@ -920,7 +920,7 @@ impl PulseDB {
             vectors.insert(collective.id, index);
         }
 
-        Ok(vectors)
+        Ok((vectors, collectives.len()))
     }
 
     /// Loads or rebuilds insight HNSW indexes for all existing collectives.
