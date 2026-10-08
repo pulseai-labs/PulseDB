@@ -432,7 +432,8 @@ impl HnswIndex {
     /// entirely. This bounds the work done by the vector index, which is the
     /// load-bearing requirement of VS-4.3.2: a search for `k` results among a
     /// tagged subset returns exactly `k` tagged results, not `k′ < k` after a
-    /// post-recall truncate.
+    /// post-recall truncate. If ANN cannot fill that budget because of graph
+    /// fragmentation, an exact scan of eligible points completes the search.
     ///
     /// When `allowed` is `None`, behavior is identical to
     /// [`search_experiences`](Self::search_experiences).
@@ -483,70 +484,73 @@ impl HnswIndex {
         }
         let effective_k = k.min(searchable);
 
-        if active_count <= BRUTE_FORCE_THRESHOLD {
-            // Linear scan: iterate all stored vectors and compute exact distances.
-            // Guarantees 100% recall for small collections where HNSW's layer
-            // fragmentation causes missed results.
-            let dist_fn = DistCosine;
-            let mut all_distances: Vec<(ExperienceId, f32)> = Vec::with_capacity(searchable);
+        if active_count > BRUTE_FORCE_THRESHOLD {
+            // HNSW graph search for larger collections.
+            let effective_ef = ef_search.max(effective_k);
+            let deleted_ref = &state.deleted;
 
-            for point in self.hnsw.get_point_indexation().into_iter() {
-                let origin_id = point.get_origin_id();
-                if state.deleted.contains(&origin_id) {
-                    continue;
-                }
-                // Skip non-allowed points when an allowed set is provided.
-                if let Some(ref internal) = allowed_internal {
-                    if !internal.contains(&origin_id) {
-                        continue;
-                    }
-                }
-                let distance = dist_fn.eval(query, point.get_v());
-                // A point whose mapping is not published (an insert still in
-                // flight, or one that never landed) is skipped, never panicked
-                // on: the graph can hold a point this index cannot name yet.
-                if let Some(exp_id) = state.internal_to_id.get(origin_id).copied().flatten() {
-                    all_distances.push((exp_id, distance));
-                }
+            // Mapping-facing search always excludes unpublished/raw points before
+            // they can consume k. The raw-ID VectorIndex search APIs stay unchanged.
+            let published = &state.internal_to_id;
+            let allowed_ref = allowed_internal.as_ref();
+            let filter_fn = move |id: &usize| -> bool {
+                published.get(*id).is_some_and(Option::is_some)
+                    && !deleted_ref.contains(id)
+                    && allowed_ref.is_none_or(|internal| internal.contains(id))
+            };
+            let results =
+                self.hnsw
+                    .search_filter(query, effective_k, effective_ef, Some(&filter_fn));
+
+            // Map internal IDs back to ExperienceIds
+            let mapped: Vec<(ExperienceId, f32)> = results
+                .into_iter()
+                .filter_map(|n| {
+                    state
+                        .internal_to_id
+                        .get(n.d_id)
+                        .copied()
+                        .flatten()
+                        .map(|exp_id| (exp_id, n.distance))
+                })
+                .collect();
+
+            if mapped.len() == effective_k {
+                return Ok(mapped);
             }
-
-            all_distances
-                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            all_distances.truncate(effective_k);
-            return Ok(all_distances);
         }
 
-        // HNSW graph search for larger collections.
-        let effective_ef = ef_search.max(effective_k);
-        let deleted_ref = &state.deleted;
+        // Small collections use exact search. Larger collections reach this
+        // fallback only when filtered ANN underfills the published budget:
+        // random graph fragmentation can make live points unreachable from
+        // its pivot even with ef greater than the whole collection. Preserve
+        // full k without admitting unpublished, deleted, or disallowed points.
+        let dist_fn = DistCosine;
+        let mut all_distances: Vec<(ExperienceId, f32)> = Vec::with_capacity(searchable);
 
-        // Mapping-facing search always excludes unpublished/raw points before
-        // they can consume k. The raw-ID VectorIndex search APIs stay unchanged.
-        let published = &state.internal_to_id;
-        let allowed_ref = allowed_internal.as_ref();
-        let filter_fn = move |id: &usize| -> bool {
-            published.get(*id).is_some_and(Option::is_some)
-                && !deleted_ref.contains(id)
-                && allowed_ref.is_none_or(|internal| internal.contains(id))
-        };
-        let results = self
-            .hnsw
-            .search_filter(query, effective_k, effective_ef, Some(&filter_fn));
+        for point in self.hnsw.get_point_indexation().into_iter() {
+            let origin_id = point.get_origin_id();
+            if state.deleted.contains(&origin_id) {
+                continue;
+            }
+            // Skip non-allowed points when an allowed set is provided.
+            if let Some(ref internal) = allowed_internal {
+                if !internal.contains(&origin_id) {
+                    continue;
+                }
+            }
+            let distance = dist_fn.eval(query, point.get_v());
+            // A point whose mapping is not published (an insert still in
+            // flight, or one that never landed) is skipped, never panicked
+            // on: the graph can hold a point this index cannot name yet.
+            if let Some(exp_id) = state.internal_to_id.get(origin_id).copied().flatten() {
+                all_distances.push((exp_id, distance));
+            }
+        }
 
-        // Map internal IDs back to ExperienceIds
-        let mapped: Vec<(ExperienceId, f32)> = results
-            .into_iter()
-            .filter_map(|n| {
-                state
-                    .internal_to_id
-                    .get(n.d_id)
-                    .copied()
-                    .flatten()
-                    .map(|exp_id| (exp_id, n.distance))
-            })
-            .collect();
-
-        Ok(mapped)
+        all_distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        all_distances.truncate(effective_k);
+        Ok(all_distances)
     }
 
     /// Returns true if the given experience is in the index (and not deleted).
@@ -1384,12 +1388,21 @@ mod tests {
 
     #[test]
     fn unmapped_graph_points_cannot_consume_mapped_top_k() {
-        let index = HnswIndex::new(4, &test_config());
+        // All 145 points fit in each one-layer neighborhood, avoiding random
+        // layer/neighbor pruning. The unpublished point is separated from all
+        // mapped points by cosine distance 1, so raw k=1 has a unique answer.
+        let config = HnswConfig {
+            max_nb_connection: 200,
+            max_layer: 1,
+            ef_construction: 200,
+            ..test_config()
+        };
+        let index = HnswIndex::new(4, &config);
         let mut ids = Vec::new();
         for i in 0..(BRUTE_FORCE_THRESHOLD + 16) {
             let id = ExperienceId::new();
             index
-                .insert_experience(id, &[0.1, 1.0, i as f32 * 0.001, 0.0])
+                .insert_experience(id, &[0.0, 1.0, i as f32 / 144.0, 0.0])
                 .unwrap();
             ids.push(id);
         }
@@ -1411,7 +1424,20 @@ mod tests {
         );
         assert!(ids.contains(&mapped[0].0));
         assert_eq!(index.search_experiences(&query, 4, 200).unwrap().len(), 4);
+        let full = index.search_experiences(&query, ids.len(), 200).unwrap();
+        assert_eq!(full.len(), ids.len());
+        assert_eq!(
+            full.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
+            ids.iter().copied().collect()
+        );
         index.delete_experience(ids[0]).unwrap();
+        assert_eq!(
+            index
+                .search_experiences(&query, ids.len(), 200)
+                .unwrap()
+                .len(),
+            ids.len() - 1
+        );
         let allowed = HashSet::from([ids[0], ids[1], ids[2], pending]);
         let hits = index
             .search_experiences_with_allowed(&query, 4, 200, Some(&allowed))
@@ -1423,6 +1449,42 @@ mod tests {
         );
         assert!(hits.iter().all(|(id, _)| *id == ids[1] || *id == ids[2]));
         assert_eq!(index.active_count(), ids.len() - 1);
+    }
+
+    #[test]
+    fn fragmented_graph_does_not_underfill_published_search_budget() {
+        // One layer fixes the entry point; four bottom-layer connections keep
+        // the five identical early points isolated from the later far cluster.
+        let config = HnswConfig {
+            max_nb_connection: 2,
+            max_layer: 1,
+            ..test_config()
+        };
+        let index = HnswIndex::new(4, &config);
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let mut ids = Vec::new();
+        for i in 0..(BRUTE_FORCE_THRESHOLD + 16) {
+            let id = ExperienceId::new();
+            let vector = if i < 5 {
+                query
+            } else {
+                [0.0, 1.0, i as f32 * 0.001, 0.0]
+            };
+            index.insert_experience(id, &vector).unwrap();
+            ids.push(id);
+        }
+        let raw = VectorIndex::search(&index, &query, 8, 200).unwrap();
+        assert_eq!(raw.len(), 5, "fixture must exercise a real ANN shortfall");
+        assert_eq!(index.search_experiences(&query, 8, 200).unwrap().len(), 8);
+        index.delete_experience(ids[0]).unwrap();
+        let allowed = HashSet::from([ids[0], ids[1], ids[2], ids[130], ids[131]]);
+        let hits = index
+            .search_experiences_with_allowed(&query, 8, 200, Some(&allowed))
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+        assert!(hits
+            .iter()
+            .all(|(id, _)| allowed.contains(id) && *id != ids[0]));
     }
 
     /// A delete that lands while an insert for the same id is in flight must
