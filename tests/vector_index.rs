@@ -4,7 +4,10 @@
 //! creation, population via record_experience, soft-delete, persistence
 //! across reopen, and rebuild from redb embeddings.
 
-use pulsedb::{CollectiveId, Config, NewExperience, PulseDB};
+use pulsedb::{
+    CollectiveId, Config, ExperienceId, InsightType, NewDerivedInsight, NewExperience, PulseDB,
+};
+use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 
 /// Default embedding dimension for tests (D384).
@@ -36,18 +39,45 @@ fn open_db_with_collective() -> (PulseDB, CollectiveId, tempfile::TempDir) {
 }
 
 // ============================================================================
-// Index Created with Collective
+// Index Created on First Indexed Write
 // ============================================================================
 
 #[test]
-fn test_hnsw_index_created_with_collective() {
+fn collective_has_no_index_until_first_indexed_write() {
     let (db, cid, _dir) = open_db_with_collective();
 
-    // The index should exist but be empty
-    let result = db
-        .with_vector_index(cid, |idx| Ok(idx.active_count()))
+    assert_eq!(
+        db.with_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        None
+    );
+    assert!(db
+        .search_similar(cid, &make_embedding(0), 8)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.with_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        None
+    );
+    let id = db
+        .record_experience(NewExperience {
+            collective_id: cid,
+            content: "first indexed write".into(),
+            embedding: Some(make_embedding(0)),
+            ..Default::default()
+        })
         .unwrap();
-    assert_eq!(result, Some(0));
+    assert_eq!(
+        db.with_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        Some(1)
+    );
+    assert!(db
+        .search_similar(cid, &make_embedding(0), 8)
+        .unwrap()
+        .iter()
+        .any(|hit| hit.experience.id == id));
 
     db.close().unwrap();
 }
@@ -55,6 +85,236 @@ fn test_hnsw_index_created_with_collective() {
 // ============================================================================
 // Index Populated on record_experience
 // ============================================================================
+
+#[test]
+fn reopen_builds_no_index_for_empty_collective() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("selective.db");
+    let db = PulseDB::open(&path, Config::default()).unwrap();
+    let a = db.create_collective("empty-a").unwrap();
+    let b = db.create_collective_with_owner("empty-b", "owner").unwrap();
+    let c = db.create_collective("populated").unwrap();
+    let id = db
+        .record_experience(NewExperience {
+            collective_id: c,
+            content: "stored vector".into(),
+            embedding: Some(make_embedding(0)),
+            ..Default::default()
+        })
+        .unwrap();
+    db.close().unwrap();
+    let db = PulseDB::open(&path, Config::default()).unwrap();
+    for cid in [a, b] {
+        assert_eq!(
+            db.with_vector_index(cid, |idx| Ok(idx.active_count()))
+                .unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        db.with_vector_index(c, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        Some(1)
+    );
+    assert!(db
+        .search_similar(c, &make_embedding(0), 8)
+        .unwrap()
+        .iter()
+        .any(|hit| hit.experience.id == id));
+    db.close().unwrap();
+}
+
+#[test]
+fn concurrent_first_writes_create_one_index() {
+    let (db, cid, _dir) = open_db_with_collective();
+    assert_eq!(
+        db.with_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        None
+    );
+    let db = Arc::new(db);
+    let barrier = Arc::new(Barrier::new(8));
+    let writers: Vec<_> = (0..8)
+        .map(|i| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.record_experience(NewExperience {
+                    collective_id: cid,
+                    content: format!("concurrent {i}"),
+                    embedding: Some(make_embedding(i)),
+                    ..Default::default()
+                })
+                .unwrap()
+            })
+        })
+        .collect();
+    let ids: Vec<_> = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect();
+    assert_eq!(
+        db.with_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        Some(8)
+    );
+    for (i, id) in ids.iter().enumerate() {
+        assert!(db
+            .search_similar(cid, &make_embedding(i as u64), 8)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.experience.id == *id));
+    }
+    Arc::try_unwrap(db).unwrap().close().unwrap();
+}
+
+#[test]
+fn insight_index_absent_until_first_insight() {
+    let (db, cid, _dir) = open_db_with_collective();
+    assert_eq!(
+        db.with_insight_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        None
+    );
+    assert!(db
+        .get_insights(cid, &make_embedding(0), 8)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.with_insight_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        None
+    );
+    let source = db
+        .record_experience(NewExperience {
+            collective_id: cid,
+            content: "insight source".into(),
+            embedding: Some(make_embedding(0)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        db.with_insight_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        None
+    );
+    let id = db.store_insight(new_insight(cid, source, 0)).unwrap();
+    assert_eq!(
+        db.with_insight_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        Some(1)
+    );
+    assert!(db
+        .get_insights(cid, &make_embedding(0), 8)
+        .unwrap()
+        .iter()
+        .any(|(hit, _)| hit.id == id));
+    db.close().unwrap();
+}
+
+fn new_insight(cid: CollectiveId, source: ExperienceId, seed: u64) -> NewDerivedInsight {
+    NewDerivedInsight {
+        collective_id: cid,
+        content: format!("insight {seed}"),
+        embedding: Some(make_embedding(seed)),
+        source_experience_ids: vec![source],
+        insight_type: InsightType::Pattern,
+        confidence: 0.8,
+        domain: vec![],
+    }
+}
+
+#[test]
+fn reopen_builds_no_insight_index_for_empty_collective() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("selective-insights.db");
+    let db = PulseDB::open(&path, Config::default()).unwrap();
+    let a = db.create_collective("empty-a").unwrap();
+    let b = db.create_collective("experience-only").unwrap();
+    let c = db.create_collective("insight-populated").unwrap();
+    for cid in [b, c] {
+        let source = db
+            .record_experience(NewExperience {
+                collective_id: cid,
+                content: "source".into(),
+                embedding: Some(make_embedding(0)),
+                ..Default::default()
+            })
+            .unwrap();
+        if cid == c {
+            db.store_insight(new_insight(cid, source, 0)).unwrap();
+        }
+    }
+    let id = db.get_insights(c, &make_embedding(0), 8).unwrap()[0].0.id;
+    db.close().unwrap();
+    let db = PulseDB::open(&path, Config::default()).unwrap();
+    for cid in [a, b] {
+        assert_eq!(
+            db.with_insight_vector_index(cid, |idx| Ok(idx.active_count()))
+                .unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        db.with_insight_vector_index(c, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        Some(1)
+    );
+    assert!(db
+        .get_insights(c, &make_embedding(0), 8)
+        .unwrap()
+        .iter()
+        .any(|(hit, _)| hit.id == id));
+    db.close().unwrap();
+}
+
+#[test]
+fn concurrent_first_insights_create_one_index() {
+    let (db, cid, _dir) = open_db_with_collective();
+    let source = db
+        .record_experience(NewExperience {
+            collective_id: cid,
+            content: "shared source".into(),
+            embedding: Some(make_embedding(0)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        db.with_insight_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        None
+    );
+    let db = Arc::new(db);
+    let barrier = Arc::new(Barrier::new(8));
+    let writers: Vec<_> = (0..8)
+        .map(|i| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.store_insight(new_insight(cid, source, i)).unwrap()
+            })
+        })
+        .collect();
+    let ids: Vec<_> = writers
+        .into_iter()
+        .map(|writer| writer.join().unwrap())
+        .collect();
+    assert_eq!(
+        db.with_insight_vector_index(cid, |idx| Ok(idx.active_count()))
+            .unwrap(),
+        Some(8)
+    );
+    for (i, id) in ids.iter().enumerate() {
+        assert!(db
+            .get_insights(cid, &make_embedding(i as u64), 8)
+            .unwrap()
+            .iter()
+            .any(|(hit, _)| hit.id == *id));
+    }
+    Arc::try_unwrap(db).unwrap().close().unwrap();
+}
 
 #[test]
 fn test_hnsw_index_populated_on_record() {

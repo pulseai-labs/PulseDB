@@ -409,7 +409,9 @@ impl PulseDB {
         info!(
             dimension = config.embedding_dimension.size(),
             sync_mode = ?config.sync_mode,
-            collectives = vectors.len(),
+            collectives = storage.list_collectives()?.len(),
+            experience_indexes = vectors.len(),
+            insight_indexes = insight_vectors.len(),
             "PulseDB opened successfully"
         );
 
@@ -887,6 +889,10 @@ impl PulseDB {
                 }
             }
 
+            if embeddings.is_empty() {
+                continue;
+            }
+
             // Try loading metadata (for deleted set and ID mappings)
             let metadata = hnsw_dir
                 .as_ref()
@@ -894,9 +900,7 @@ impl PulseDB {
                 .flatten();
 
             // Rebuild the HNSW graph from embeddings
-            let index = if embeddings.is_empty() {
-                HnswIndex::new(dimension, &config.hnsw)
-            } else {
+            let index = {
                 let start = std::time::Instant::now();
                 let idx = HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
                 info!(
@@ -952,6 +956,10 @@ impl PulseDB {
                 }
             }
 
+            if embeddings.is_empty() {
+                continue;
+            }
+
             // Try loading metadata (for deleted set)
             let name = format!("{}_insights", collective.id);
             let metadata = hnsw_dir
@@ -960,9 +968,7 @@ impl PulseDB {
                 .flatten();
 
             // Rebuild HNSW graph from embeddings
-            let index = if embeddings.is_empty() {
-                HnswIndex::new(dimension, &config.hnsw)
-            } else {
+            let index = {
                 let start = std::time::Instant::now();
                 let idx = HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
                 info!(
@@ -1004,6 +1010,97 @@ impl PulseDB {
             Some(index) => Ok(Some(f(index)?)),
             None => Ok(None),
         }
+    }
+
+    /// Executes a closure with an existing insight index; never creates one.
+    #[doc(hidden)]
+    pub fn with_insight_vector_index<F, R>(
+        &self,
+        collective_id: CollectiveId,
+        f: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnOnce(&HnswIndex) -> Result<R>,
+    {
+        let indexes = self
+            .insight_vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        match indexes.get(&collective_id) {
+            Some(index) => Ok(Some(f(index)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Runs an indexed write after its storage transaction has committed.
+    /// Never call while the insight map is locked. The only storage access
+    /// under the write guard is the collective existence/dimension read.
+    fn with_or_create_vector_index<F, R>(&self, collective_id: CollectiveId, f: F) -> Result<R>
+    where
+        F: FnOnce(&HnswIndex) -> Result<R>,
+    {
+        {
+            let vectors = self
+                .vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+            if let Some(index) = vectors.get(&collective_id) {
+                return f(index);
+            }
+        }
+        let mut vectors = self
+            .vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = vectors.entry(collective_id) {
+            let collective = self
+                .storage
+                .get_collective(collective_id)?
+                .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+            entry.insert(HnswIndex::new(
+                collective.embedding_dimension as usize,
+                &self.config.hnsw,
+            ));
+            tracing::debug!(collective = %collective_id, index_kind = "experience", "Created HNSW index on first indexed write");
+        }
+        f(&vectors[&collective_id])
+    }
+
+    /// Insight counterpart of `with_or_create_vector_index`.
+    /// Never call while the experience map is locked or a storage write is open.
+    fn with_or_create_insight_vector_index<F, R>(
+        &self,
+        collective_id: CollectiveId,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&HnswIndex) -> Result<R>,
+    {
+        {
+            let indexes = self
+                .insight_vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+            if let Some(index) = indexes.get(&collective_id) {
+                return f(index);
+            }
+        }
+        let mut indexes = self
+            .insight_vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = indexes.entry(collective_id) {
+            let collective = self
+                .storage
+                .get_collective(collective_id)?
+                .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+            entry.insert(HnswIndex::new(
+                collective.embedding_dimension as usize,
+                &self.config.hnsw,
+            ));
+            tracing::debug!(collective = %collective_id, index_kind = "insight", "Created HNSW index on first indexed write");
+        }
+        f(&indexes[&collective_id])
     }
 
     // =========================================================================
@@ -1075,18 +1172,6 @@ impl PulseDB {
         // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
 
-        // Create empty HNSW indexes for this collective
-        let exp_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        let insight_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        self.vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, exp_index);
-        self.insight_vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
-            .insert(id, insight_index);
-
         info!(id = %id, name = %name, "Collective created");
         Ok(id)
     }
@@ -1122,18 +1207,6 @@ impl PulseDB {
 
         // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
-
-        // Create empty HNSW indexes for this collective
-        let exp_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        let insight_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        self.vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, exp_index);
-        self.insight_vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
-            .insert(id, insight_index);
 
         info!(id = %id, name = %name, owner = %owner_id, "Collective created with owner");
         Ok(id)
@@ -1377,13 +1450,9 @@ impl PulseDB {
         self.storage.save_experience(&experience)?;
 
         // Insert into HNSW index (derived structure)
-        let vectors = self
-            .vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-        if let Some(index) = vectors.get(&collective_id) {
-            index.insert_experience(id, &embedding_for_hnsw)?;
-        }
+        self.with_or_create_vector_index(collective_id, |index| {
+            index.insert_experience(id, &embedding_for_hnsw)
+        })?;
 
         // Emit watch event after both storage and HNSW succeed
         self.watch.emit(
@@ -2591,13 +2660,9 @@ impl PulseDB {
 
         // Insert into insight HNSW index (using InsightId→ExperienceId byte conversion)
         let exp_id = ExperienceId::from_bytes(*id.as_bytes());
-        let insight_vectors = self
-            .insight_vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-        if let Some(index) = insight_vectors.get(&insight.collective_id) {
-            index.insert_experience(exp_id, &embedding_for_hnsw)?;
-        }
+        self.with_or_create_insight_vector_index(insight.collective_id, |index| {
+            index.insert_experience(exp_id, &embedding_for_hnsw)
+        })?;
 
         info!(id = %id, "Insight stored");
         Ok(id)
@@ -3057,14 +3122,9 @@ impl PulseDB {
         let id = experience.id;
 
         self.storage.save_experience(&experience)?;
-        let vectors = self
-            .vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-        let index = vectors
-            .get(&collective_id)
-            .ok_or_else(|| PulseDBError::vector("HNSW index missing for collective"))?;
-        index.insert_experience(id, &embedding_for_hnsw)?;
+        self.with_or_create_vector_index(collective_id, |index| {
+            index.insert_experience(id, &embedding_for_hnsw)
+        })?;
 
         Ok(id)
     }
@@ -3402,8 +3462,7 @@ impl PulseDB {
     /// # Errors, each of which repeats on every sync
     ///
     /// - the record is absent from redb;
-    /// - the collective has no index in this process (A2: before lazy index
-    ///   creation lands, an absent index is an error by design);
+    /// - the collective has disappeared before its derived index is created;
     /// - the record has no usable stored embedding: a **store-consistency
     ///   violation**, because a record and its embedding commit in one
     ///   transaction, so this state can only mean the store was altered outside
@@ -3447,48 +3506,39 @@ impl PulseDB {
             )));
         };
 
-        let vectors = self
-            .vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-        let index = vectors.get(&collective_id).ok_or_else(|| {
-            PulseDBError::vector(format!(
-                "collective {collective_id} has no vector index, so experience {id} \
-                 cannot be indexed"
-            ))
-        })?;
+        self.with_or_create_vector_index(collective_id, |index| {
+            if index.is_searchable(id) {
+                return Ok(false);
+            }
 
-        if index.is_searchable(id) {
-            return Ok(false);
-        }
+            if !index.clear_deleted_mark(id)? {
+                index.insert_experience(id, &embedding)?;
+            }
 
-        if !index.clear_deleted_mark(id)? {
-            index.insert_experience(id, &embedding)?;
-        }
-
-        // Prove it before reporting it (grill A1: acknowledge only once the id
-        // is searchable). An insert that joins another thread's in-flight claim
-        // returns without adding a point, and a concurrent delete can re-mark
-        // the id between the two steps above — so "we did something" is not the
-        // same as "search can find it now", and this call must not report a
-        // repair it did not achieve. The change stays unacknowledged and the
-        // next sync retries.
-        if !index.is_searchable(id) {
-            return Err(PulseDBError::vector(format!(
-                "experience {id} is not searchable after the repair: its index entry is \
+            // Prove it before reporting it (grill A1: acknowledge only once the id
+            // is searchable). An insert that joins another thread's in-flight claim
+            // returns without adding a point, and a concurrent delete can re-mark
+            // the id between the two steps above — so "we did something" is not the
+            // same as "search can find it now", and this call must not report a
+            // repair it did not achieve. The change stays unacknowledged and the
+            // next sync retries.
+            if !index.is_searchable(id) {
+                return Err(PulseDBError::vector(format!(
+                    "experience {id} is not searchable after the repair: its index entry is \
                  not yet searchable (an insert for this id is still in flight, or the id \
                  was deleted again); the change is not acknowledged and the next sync retries"
-            )));
-        }
+                )));
+            }
 
-        if repairing {
-            tracing::warn!(
-                id = %id,
-                collective_id = %collective_id,
-                "repaired missing index entry from redb"
-            );
-        }
-        Ok(true)
+            if repairing {
+                tracing::warn!(
+                    id = %id,
+                    collective_id = %collective_id,
+                    "repaired missing index entry from redb"
+                );
+            }
+            Ok(true)
+        })
     }
 
     /// Writes the full experience to storage and inserts into HNSW.
@@ -3496,7 +3546,7 @@ impl PulseDB {
     ///
     /// # Ordering, and what it does and does not guarantee (#96)
     ///
-    /// The embedding is checked against the collective's vector index BEFORE
+    /// The embedding is checked against the collective's stored dimension BEFORE
     /// anything is written. That is what closes the case this method was
     /// corrupting the store with: `Experience::embedding` is `#[serde(skip)]`,
     /// so a create crossing a serializing transport arrives with a zero-length
@@ -3515,11 +3565,9 @@ impl PulseDB {
     ///   logged at `error!`; the row is left with no vector, and the next sync
     ///   of the same create repairs it from redb rather than skipping it
     ///   ([`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed)).
-    /// - a collective with no index is **refused before any write** (A2). The
-    ///   `if let Some(index)` skip this replaced stored the record with no
-    ///   vector at all and then acknowledged it, which is the corruption this
-    ///   item exists to stop; before lazy index creation lands there is no
-    ///   index to fall back on, so the change is not acknowledged.
+    /// - a collective with no index gets one on the first indexed write. Its
+    ///   existence is re-checked under the map write guard; if it disappeared
+    ///   after the save, indexing fails and the change is not acknowledged.
     ///
     /// A genuine all-or-nothing apply needs a storage transaction that spans
     /// the record and the vector index (or a create-if-absent storage primitive
@@ -3534,21 +3582,18 @@ impl PulseDB {
         let id = experience.id;
         let embedding = experience.embedding.clone();
 
-        // Reject BEFORE the write: an embedding this index cannot take — or a
-        // collective that has no index to take it — must leave no record, no
-        // secondary index entry and no WAL event behind.
-        {
-            let vectors = self
-                .vectors
-                .read()
-                .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-            let index = vectors.get(&collective_id).ok_or_else(|| {
-                PulseDBError::vector(format!(
-                    "collective {collective_id} has no vector index, so experience {id} \
-                     cannot be indexed and is not stored"
-                ))
-            })?;
-            index.validate_embedding(&embedding)?;
+        // Validate from durable collective metadata before saving or allocating.
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+        let dimension = collective.embedding_dimension as usize;
+        if embedding.len() != dimension {
+            return Err(PulseDBError::vector(format!(
+                "Embedding dimension mismatch: expected {}, got {}",
+                dimension,
+                embedding.len()
+            )));
         }
 
         self.storage.save_experience(&experience)?;
@@ -3743,42 +3788,33 @@ impl PulseDB {
             )));
         }
 
-        let insight_vectors = self
-            .insight_vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-        let index = insight_vectors.get(&collective_id).ok_or_else(|| {
-            PulseDBError::vector(format!(
-                "collective {collective_id} has no insight index, so insight {id} \
-                 cannot be indexed"
-            ))
-        })?;
+        self.with_or_create_insight_vector_index(collective_id, |index| {
+            if index.is_searchable(exp_id) {
+                return Ok(false);
+            }
 
-        if index.is_searchable(exp_id) {
-            return Ok(false);
-        }
+            if !index.clear_deleted_mark(exp_id)? {
+                index.insert_experience(exp_id, &insight.embedding)?;
+            }
 
-        if !index.clear_deleted_mark(exp_id)? {
-            index.insert_experience(exp_id, &insight.embedding)?;
-        }
-
-        // Same proof step as the experience path, and for the same reason.
-        if !index.is_searchable(exp_id) {
-            return Err(PulseDBError::vector(format!(
-                "insight {id} is not searchable after the repair: its index entry is \
+            // Same proof step as the experience path, and for the same reason.
+            if !index.is_searchable(exp_id) {
+                return Err(PulseDBError::vector(format!(
+                    "insight {id} is not searchable after the repair: its index entry is \
                  not yet searchable (an insert for this id is still in flight, or the id \
                  was deleted again); the change is not acknowledged and the next sync retries"
-            )));
-        }
+                )));
+            }
 
-        if repairing {
-            tracing::warn!(
-                id = %id,
-                collective_id = %collective_id,
-                "repaired missing index entry from redb"
-            );
-        }
-        Ok(true)
+            if repairing {
+                tracing::warn!(
+                    id = %id,
+                    collective_id = %collective_id,
+                    "repaired missing index entry from redb"
+                );
+            }
+            Ok(true)
+        })
     }
 
     /// Applies a synced insight from a remote peer.
@@ -3788,9 +3824,9 @@ impl PulseDB {
     ///
     /// Same save-then-index shape, and the same limits, as
     /// [`apply_synced_experience`](Self::apply_synced_experience): the
-    /// embedding is checked against the insight index before anything is
-    /// written, a collective with no insight index is refused before any write,
-    /// and an index step that fails after the save is reported and logged
+    /// embedding is checked against the stored collective dimension before
+    /// anything is written, and an absent insight index is created after the
+    /// save. An index step that fails after the save is reported and logged
     /// rather than undone.
     ///
     /// Unlike `Experience::embedding`, `DerivedInsight::embedding` is stored
@@ -3810,19 +3846,17 @@ impl PulseDB {
         let collective_id = insight.collective_id;
         let embedding = insight.embedding.clone();
 
-        // Reject BEFORE the write — see `apply_synced_experience`.
-        {
-            let insight_vectors = self
-                .insight_vectors
-                .read()
-                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-            let index = insight_vectors.get(&collective_id).ok_or_else(|| {
-                PulseDBError::vector(format!(
-                    "collective {collective_id} has no insight index, so insight {id} \
-                     cannot be indexed and is not stored"
-                ))
-            })?;
-            index.validate_embedding(&embedding)?;
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+        let dimension = collective.embedding_dimension as usize;
+        if embedding.len() != dimension {
+            return Err(PulseDBError::vector(format!(
+                "Embedding dimension mismatch: expected {}, got {}",
+                dimension,
+                embedding.len()
+            )));
         }
 
         self.storage.save_insight(&insight)?;
@@ -3880,27 +3914,14 @@ impl PulseDB {
 
     /// Applies a synced collective from a remote peer.
     ///
-    /// Writes to storage and creates HNSW indexes for the collective.
+    /// Writes to storage; derived indexes are created by the first indexed write.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_collective(&self, collective: Collective) -> Result<()> {
         let id = collective.id;
-        let dimension = collective.embedding_dimension as usize;
 
         self.storage.save_collective(&collective)?;
-
-        // Create HNSW indexes (same as create_collective)
-        let exp_index = crate::vector::HnswIndex::new(dimension, &self.config.hnsw);
-        let insight_index = crate::vector::HnswIndex::new(dimension, &self.config.hnsw);
-        self.vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, exp_index);
-        self.insight_vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
-            .insert(id, insight_index);
 
         debug!(id = %id, "Synced collective applied");
         Ok(())
@@ -5634,9 +5655,8 @@ mod synced_index_repair_tests {
         let source = PulseDB::open(dir_source.path().join("source.db"), Config::default()).unwrap();
         let target = PulseDB::open(dir_target.path().join("target.db"), Config::default()).unwrap();
 
-        // The target holds the collective (so it has an index for it) and the
-        // record, but no index entry for it: the state a failed index insert
-        // leaves behind.
+        // The target holds durable data but no published index entry: the
+        // state a failed index insert leaves behind.
         let cid = source.create_collective("in-flight-claim").unwrap();
         let exp_id = source.record_experience(exp_in(cid)).unwrap();
         let collective = source.get_collective(cid).unwrap().unwrap();
@@ -5644,13 +5664,16 @@ mod synced_index_repair_tests {
         let stored = source.get_experience(exp_id).unwrap().unwrap();
         target.storage_for_test().save_experience(&stored).unwrap();
 
+        target.with_or_create_vector_index(cid, |_| Ok(())).unwrap();
+
         // Another thread's insert for this id is in flight.
         target
             .with_vector_index(cid, |index| {
                 index.claim_for_test(exp_id);
                 Ok(())
             })
-            .unwrap();
+            .unwrap()
+            .expect("the helper must arrange the index before the claim");
 
         let error = target
             .ensure_synced_experience_indexed(exp_id)
