@@ -6038,6 +6038,75 @@ mod synced_index_repair_tests {
         assert!(db.get_insight(id).unwrap().is_none());
     }
 
+    // Open ignores an unparseable sidecar, so a create must not refuse on it.
+    #[test]
+    fn nf08_torn_sidecar_does_not_block_synced_create() {
+        for (insight, torn) in [(false, true), (true, true), (false, false), (true, false)] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            let cid = db.create_collective("torn-sidecar").unwrap();
+            let new_insight = |source| NewDerivedInsight {
+                collective_id: cid,
+                content: "insight".into(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            };
+            let kept = db.record_experience(exp_in(cid)).unwrap();
+            db.store_insight(new_insight(kept)).unwrap(); // Keep both kinds populated.
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            let iid = db.store_insight(new_insight(source)).unwrap();
+            let exp = db.get_experience(source).unwrap().unwrap();
+            let record = db.get_insight(iid).unwrap().unwrap();
+            if insight {
+                db.delete_insight(iid).unwrap();
+            } else {
+                db.delete_experience(source).unwrap();
+            }
+            db.close().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            let meta_path = dir
+                .path()
+                .join("test.db.hnsw")
+                .join(format!("{name}.hnsw.meta"));
+            if torn {
+                let bytes = std::fs::read(&meta_path).unwrap();
+                std::fs::write(&meta_path, &bytes[..bytes.len() / 2]).unwrap();
+                assert!(HnswIndex::load_metadata(meta_path.parent().unwrap(), &name).is_err());
+            }
+
+            let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+            let payload = if insight {
+                assert!(db.get_insight(iid).unwrap().is_none());
+                crate::sync::types::SyncPayload::InsightCreated(record)
+            } else {
+                assert!(db.get_experience(source).unwrap().is_none());
+                crate::sync::types::SyncPayload::ExperienceCreated(exp.into())
+            };
+            apply_recreated(Arc::clone(&db), cid, payload);
+            if insight {
+                assert!(db
+                    .get_insights(cid, &vec![0.1; 384], 5)
+                    .unwrap()
+                    .iter()
+                    .any(|(hit, _)| hit.id == iid));
+            } else {
+                assert!(db
+                    .search_similar(cid, &vec![0.1; 384], 5)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.experience.id == source));
+            }
+        }
+    }
+
     #[test]
     fn stale_mark_corruption_refuses_recreate_before_durable_save() {
         use crate::sync::applier::RemoteChangeApplier;

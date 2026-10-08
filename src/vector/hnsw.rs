@@ -733,8 +733,15 @@ impl HnswIndex {
         name: &str,
         id: ExperienceId,
     ) -> Result<()> {
-        let Some(mut metadata) = Self::load_metadata(dir, name)? else {
-            return Ok(());
+        // Open ignores an unreadable sidecar (`load_metadata(..).ok()`), so it
+        // restores no mark from it; refusing here would only stall sync.
+        let mut metadata = match Self::load_metadata(dir, name) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(%error, name, "Unreadable HNSW sidecar; open ignores it, so no mark to clear");
+                return Ok(());
+            }
         };
         let mut kept = Vec::with_capacity(metadata.deleted.len());
         for mark in &metadata.deleted {
