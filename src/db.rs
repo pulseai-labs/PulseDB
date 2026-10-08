@@ -922,14 +922,10 @@ impl PulseDB {
                 idx
             };
 
-            // Validate persisted marks, then reconcile them with redb's live rows.
-            // A stale mark from before a synced re-create must never hide a
-            // durable embedding, even when sidecar cleanup failed or was skipped.
+            // A mark for a durable row can represent a failed pending delete.
+            // Re-creates invalidate only their own persisted mark before saving.
             if let Some(meta) = metadata {
                 index.restore_deleted_set(&meta.deleted)?;
-                for id in exp_ids {
-                    index.clear_deleted_mark(id)?;
-                }
             }
 
             vectors.insert(collective.id, index);
@@ -1005,14 +1001,9 @@ impl PulseDB {
                 idx
             };
 
-            // Validate persisted marks, then reconcile them with redb's live rows.
-            // A stale mark from before a synced re-create must never hide a
-            // durable embedding, even when sidecar cleanup failed or was skipped.
+            // Preserve pending-delete marks; a re-create clears only its mark.
             if let Some(meta) = metadata {
                 index.restore_deleted_set(&meta.deleted)?;
-                for id in insight_ids {
-                    index.clear_deleted_mark(ExperienceId::from_bytes(*id.as_bytes()))?;
-                }
             }
 
             insight_vectors.insert(collective.id, index);
@@ -3626,6 +3617,20 @@ impl PulseDB {
             )));
         }
 
+        // Clear only this absent row's stale sidecar mark BEFORE committing its
+        // re-create. A failure leaves the row absent and the change unacknowledged;
+        // a crash after the save cannot reapply an old mark. Serialize sidecar
+        // edits with the existing map guard so concurrent re-creates keep each
+        // other's removals. Never clear marks for rows still awaiting deletion.
+        if self.storage.get_experience(id)?.is_none() {
+            if let Some(dir) = self.hnsw_dir() {
+                let _guard = self
+                    .vectors
+                    .write()
+                    .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+                HnswIndex::clear_persisted_deleted_mark(&dir, &collective_id.to_string(), id)?;
+            }
+        }
         self.storage.save_experience(&experience)?;
 
         // Finish through the same make-searchable step the repair path uses, so
@@ -3889,6 +3894,19 @@ impl PulseDB {
             )));
         }
 
+        if self.storage.get_insight(id)?.is_none() {
+            if let Some(dir) = self.hnsw_dir() {
+                let _guard = self
+                    .insight_vectors
+                    .write()
+                    .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+                HnswIndex::clear_persisted_deleted_mark(
+                    &dir,
+                    &format!("{collective_id}_insights"),
+                    ExperienceId::from_bytes(*id.as_bytes()),
+                )?;
+            }
+        }
         self.storage.save_insight(&insight)?;
 
         // Same make-searchable step as the experience path, including the
@@ -5756,7 +5774,9 @@ mod synced_index_repair_tests {
         let cid = db.create_collective("stale-experience-sidecar").unwrap();
         let id = db.record_experience(exp_in(cid)).unwrap();
         let record = db.get_experience(id).unwrap().unwrap();
-        db.record_experience(exp_in(cid)).unwrap(); // Keep the collective populated.
+        let pending = db.record_experience(exp_in(cid)).unwrap();
+        crate::storage::redb::fail_next_delete_for_test("experience");
+        assert!(db.apply_synced_experience_delete(pending).is_err());
         db.delete_experience(id).unwrap();
         db.close().unwrap(); // Persist the deleted mark for X.
 
@@ -5776,6 +5796,14 @@ mod synced_index_repair_tests {
 
         let db = PulseDB::open(&path, Config::default()).unwrap();
         assert!(db.get_experience(id).unwrap().is_some());
+        assert!(db.get_experience(pending).unwrap().is_some());
+        assert!(
+            !db.search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|h| h.experience.id == pending),
+            "re-creating one id must retain another row's pending-delete mark"
+        );
         assert!(
             db.search_similar(cid, &vec![0.1; 384], 5)
                 .unwrap()
@@ -5804,16 +5832,19 @@ mod synced_index_repair_tests {
             })
             .unwrap();
         let record = db.get_insight(id).unwrap().unwrap();
-        db.store_insight(NewDerivedInsight {
-            collective_id: cid,
-            content: "surviving insight".to_string(),
-            embedding: Some(vec![0.2; 384]),
-            source_experience_ids: vec![source],
-            insight_type: crate::insight::InsightType::Pattern,
-            confidence: 0.9,
-            domain: vec![],
-        })
-        .unwrap();
+        let pending = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "surviving insight".to_string(),
+                embedding: Some(vec![0.2; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        crate::storage::redb::fail_next_delete_for_test("insight");
+        assert!(db.apply_synced_insight_delete(pending).is_err());
         db.delete_insight(id).unwrap();
         db.close().unwrap(); // Persist the deleted mark for X.
 
@@ -5833,6 +5864,14 @@ mod synced_index_repair_tests {
 
         let db = PulseDB::open(&path, Config::default()).unwrap();
         assert!(db.get_insight(id).unwrap().is_some());
+        assert!(db.get_insight(pending).unwrap().is_some());
+        assert!(
+            !db.get_insights(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|(h, _)| h.id == pending),
+            "re-creating one insight must retain another row's pending-delete mark"
+        );
         assert!(
             db.get_insights(cid, &vec![0.1; 384], 5)
                 .unwrap()
@@ -5923,10 +5962,163 @@ mod synced_index_repair_tests {
                 serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
             meta["deleted"] = serde_json::json!(["not-a-uuid"]);
             std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
-            let error = PulseDB::open(&path, Config::default())
-                .err()
-                .expect("invalid mark must fail open");
+            let error =
+                PulseDB::open(&path, Config::default()).expect_err("invalid mark must fail open");
             assert!(error.to_string().contains("Invalid UUID in deleted set"));
+        }
+    }
+
+    #[test]
+    fn nf02_pending_experience_delete_stays_excluded_after_reopen() {
+        for boundary in ["relations", "experience"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            let cid = db.create_collective("pending-experience-delete").unwrap();
+            let id = db.record_experience(exp_in(cid)).unwrap();
+            crate::storage::redb::fail_next_delete_for_test(boundary);
+            let error = db.apply_synced_experience_delete(id).unwrap_err();
+            assert!(error.to_string().contains("injected"));
+            assert!(db.get_experience(id).unwrap().is_some());
+            assert!(db
+                .search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .is_empty());
+            db.with_vector_index(cid, |index| {
+                index.save_to_dir(&db.hnsw_dir().unwrap(), &cid.to_string())
+            })
+            .unwrap()
+            .unwrap();
+            drop(db); // Crash-shaped: keep the persisted mark without close().
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            assert!(db.get_experience(id).unwrap().is_some());
+            assert!(db.search_similar(cid, &vec![0.1; 384], 5).unwrap().is_empty(),
+                "a durable experience still awaiting {boundary} deletion must stay excluded after reopen");
+            db.apply_synced_experience_delete(id).unwrap();
+            assert!(db.get_experience(id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn nf02_pending_insight_delete_stays_excluded_after_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("pending-insight-delete").unwrap();
+        let source = db.record_experience(exp_in(cid)).unwrap();
+        let id = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "pending insight".into(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        crate::storage::redb::fail_next_delete_for_test("insight");
+        let error = db.apply_synced_insight_delete(id).unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(db.get_insights(cid, &vec![0.1; 384], 5).unwrap().is_empty());
+        db.with_insight_vector_index(cid, |index| {
+            index.save_to_dir(&db.hnsw_dir().unwrap(), &format!("{cid}_insights"))
+        })
+        .unwrap()
+        .unwrap();
+        drop(db); // Crash-shaped after the failed row deletion.
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(
+            db.get_insights(cid, &vec![0.1; 384], 5).unwrap().is_empty(),
+            "a durable insight still awaiting deletion must stay excluded after reopen"
+        );
+        db.apply_synced_insight_delete(id).unwrap();
+        assert!(db.get_insight(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_mark_corruption_refuses_recreate_before_durable_save() {
+        use crate::sync::applier::RemoteChangeApplier;
+        use crate::sync::config::SyncConfig;
+        use crate::sync::types::{InstanceId, SyncChange, SyncEntityType, SyncPayload};
+        for insight in [false, true] {
+            let dir = tempdir().unwrap();
+            let db =
+                Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap());
+            let cid = db.create_collective("corrupt-recreate-mark").unwrap();
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            let exp = db.get_experience(source).unwrap().unwrap();
+            let iid = db
+                .store_insight(NewDerivedInsight {
+                    collective_id: cid,
+                    content: "insight".into(),
+                    embedding: Some(vec![0.1; 384]),
+                    source_experience_ids: vec![source],
+                    insight_type: crate::insight::InsightType::Pattern,
+                    confidence: 0.9,
+                    domain: vec![],
+                })
+                .unwrap();
+            let record = db.get_insight(iid).unwrap().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            let sidecars = db.hnsw_dir().unwrap();
+            if insight {
+                db.with_insight_vector_index(cid, |index| index.save_to_dir(&sidecars, &name))
+                    .unwrap()
+                    .unwrap();
+                db.delete_insight(iid).unwrap();
+            } else {
+                db.with_vector_index(cid, |index| index.save_to_dir(&sidecars, &name))
+                    .unwrap()
+                    .unwrap();
+                db.delete_experience(source).unwrap();
+            }
+            let meta_path = sidecars.join(format!("{name}.hnsw.meta"));
+            let mut meta: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            meta["deleted"] = serde_json::json!(["invalid-mark"]);
+            std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            let payload = if insight {
+                SyncPayload::InsightCreated(record)
+            } else {
+                SyncPayload::ExperienceCreated(exp.into())
+            };
+            let result = RemoteChangeApplier::new(db.clone(), SyncConfig::default())
+                .apply_batch(vec![SyncChange {
+                    sequence: 1,
+                    source_instance: InstanceId::new(),
+                    collective_id: cid,
+                    entity_type: if insight {
+                        SyncEntityType::Insight
+                    } else {
+                        SyncEntityType::Experience
+                    },
+                    payload,
+                    timestamp: Timestamp::now(),
+                }])
+                .unwrap();
+            assert_eq!(result.failed, 1);
+            assert_eq!(
+                result.safe_through, None,
+                "a failed sidecar repair must not be acknowledged"
+            );
+            if insight {
+                assert!(db.get_insight(iid).unwrap().is_none());
+            } else {
+                assert!(db.get_experience(source).unwrap().is_none());
+            }
+            let still_corrupt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            assert_eq!(
+                still_corrupt["deleted"],
+                serde_json::json!(["invalid-mark"])
+            );
         }
     }
 

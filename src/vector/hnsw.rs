@@ -723,6 +723,56 @@ impl HnswIndex {
         Ok(Some(metadata))
     }
 
+    /// Invalidates one absent row's stale mark before its durable re-create.
+    /// The caller serializes edits to this sidecar. Other pending marks survive.
+    #[cfg(feature = "sync")]
+    pub(crate) fn clear_persisted_deleted_mark(
+        dir: &Path,
+        name: &str,
+        id: ExperienceId,
+    ) -> Result<()> {
+        let Some(mut metadata) = Self::load_metadata(dir, name)? else {
+            return Ok(());
+        };
+        let mut kept = Vec::with_capacity(metadata.deleted.len());
+        for mark in &metadata.deleted {
+            let uuid = uuid::Uuid::parse_str(mark)
+                .map_err(|e| PulseDBError::vector(format!("Invalid UUID in deleted set: {e}")))?;
+            if ExperienceId::from_bytes(*uuid.as_bytes()) != id {
+                kept.push(mark.clone());
+            }
+        }
+        if kept.len() == metadata.deleted.len() {
+            return Ok(());
+        }
+        metadata.deleted = kept;
+        let json = serde_json::to_vec_pretty(&metadata)
+            .map_err(|e| PulseDBError::vector(format!("Failed to serialize HNSW metadata: {e}")))?;
+        let target = dir.join(format!("{name}.hnsw.meta"));
+        let temp = dir.join(format!(".{name}.{}.meta.tmp", uuid::Uuid::now_v7()));
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &target)?;
+            #[cfg(unix)]
+            fs::File::open(dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temp);
+            return Err(PulseDBError::vector(format!(
+                "Failed to clear persisted deleted mark: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Rebuilds an index from a set of embeddings.
     ///
     /// Used during `PulseDB::open()` to reconstruct the HNSW graph
