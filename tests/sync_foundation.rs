@@ -978,7 +978,7 @@ fn apply_synced_experience_writes_nothing_when_the_embedding_cannot_be_indexed()
 }
 
 #[test]
-fn test_apply_synced_collective_creates_indexes() {
+fn test_apply_synced_collective_first_write_builds_index() {
     use pulsedb::sync::guard::SyncApplyGuard;
 
     let (db, _dir) = open_test_db();
