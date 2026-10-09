@@ -1280,8 +1280,8 @@ impl RedbStorage {
         // supported steady-state floor (#95), and it cannot be skipped without
         // weakening the byte-identical rollback image ADR-011 requires (see
         // docs/storage-migration.md). A read-only open never peeks here, so it
-        // never acquires — and never creates — `.migrate.lock` (FR-035: zero
-        // writes).
+        // never acquires — and never creates — `.migrate.lock` (FR-035: no
+        // PulseDB-level write; redb may still rewrite header bytes, #117).
         //
         // The sidecar is ensured from the PRISTINE file, before the first
         // writable open: redb 4.x rewrites the file on every writable
@@ -1388,8 +1388,7 @@ impl RedbStorage {
     /// 2. `Err(UpgradeRequired)` ⇒ a redb-v2 file needing migration:
     ///    - **FR-035 read-only gate** — a read-only open returns
     ///      [`PulseDBError::ReadOnly`] before any migration work (no lock, no
-    ///      backup, no upgrade; redb itself may still rewrite header bytes, #117)
-    ///      *before* anything else.
+    ///      backup, no upgrade; redb itself may still rewrite header bytes, #117).
     ///    - acquire the exclusive migration lock (audit C2) — or take the
     ///      caller's already-held lock, passed down (`held`), and never
     ///      re-acquire it;
@@ -1810,6 +1809,8 @@ impl RedbStorage {
         // (`open`'s peek path), the sidecar was validated and durably published
         // from the PRISTINE file before any writable handle existed — the only
         // work left here is the defensive case of a sidecar that vanished.
+        // Exception: if the re-peek under the lock failed (`sidecar_ensured ==
+        // false`), the ensure did not run, so it runs here as on the no-lock path.
         //
         // When the caller holds NO lock, the read-only peek could not run (B4: a
         // redb-v2 file, a crashed session, a locked file, an unreadable header).
