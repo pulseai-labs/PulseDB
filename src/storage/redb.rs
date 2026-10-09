@@ -1387,8 +1387,9 @@ impl RedbStorage {
     /// 1. Try `redb 4.1` `create(path)`. `Ok` ⇒ already v3, return the handle.
     /// 2. `Err(UpgradeRequired)` ⇒ a redb-v2 file needing migration:
     ///    - **FR-035 read-only gate** — a read-only open returns
-    ///      [`PulseDBError::ReadOnly`] with **zero writes** (no lock, no backup, no
-    ///      upgrade) *before* anything else.
+    ///      [`PulseDBError::ReadOnly`] before any migration work (no lock, no
+    ///      backup, no upgrade; redb itself may still rewrite header bytes, #117)
+    ///      *before* anything else.
     ///    - acquire the exclusive migration lock (audit C2) — or take the
     ///      caller's already-held lock, passed down (`held`), and never
     ///      re-acquire it;
@@ -1410,7 +1411,7 @@ impl RedbStorage {
             })) => {
                 // FR-035 / audit C6: a read-only open of an un-migrated (redb-v2)
                 // store returns ReadOnly BEFORE any write — no lock, no backup, no
-                // upgrade. A read-only open performs ZERO writes.
+                // upgrade. (redb itself may still rewrite header bytes on open, #117.)
                 if config.read_only {
                     debug!(
                         redb_format = found,

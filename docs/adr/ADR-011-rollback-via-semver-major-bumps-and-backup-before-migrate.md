@@ -52,8 +52,11 @@ mechanics are unchanged.
   path and held through the schema-migration commit (or released on error). A
   second opener waits — no timeout, since a multi-minute migration must not
   fail its waiters, with a `warn!` carrying the lock path every 30 s — and
-  after the first commit finds the store already migrated. Read-only opens take
-  no lock and create no `.migrate.lock`: they perform zero writes (FR-035).
+  then, while the first process still holds the store, gets the typed,
+  retryable `DatabaseLocked` (ADR-003) — it runs no migration and leaves the
+  sidecar untouched. Read-only opens take no lock and create no `.migrate.lock`
+  and make no PulseDB-level write (FR-035); redb itself may still rewrite
+  header bytes on open (#117).
 - **Invalid sidecars are quarantined, never deleted.** An existing sidecar that
   fails whole-image validation is renamed to
   `.pre-vN.bak.invalid-<unix-seconds>` (`-<n>` if that name is taken), logged

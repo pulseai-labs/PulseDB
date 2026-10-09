@@ -10,7 +10,7 @@
 > pre-migration sidecar must be published before the writable open rewrites the allocator pages.
 > A current-schema (v5) store therefore pays that peek on every writable open, then opens the file
 > again to serve traffic (about 2.8 ms median for the storage open on the reference machine, 1k and
-> 10k × 384-d stores alike; the peek is 27–32 µs median, p95 ≤ 40 µs, of that). **That peek is the
+> 10k × 384-d stores alike; the peek is 27–32 µs median, p95 ≈ 40 µs, of that). **That peek is the
 > supported floor** for the steady-state open: it is O(1) in store size, ≤ 0.04 % of the NFR-001 open
 > budget (< 100 ms) — which the release-mode test `current_schema_store_opens_within_nfr001_budget`
 > asserts — and it cannot be removed without weakening ADR-011's byte-identical rollback image.
@@ -127,6 +127,9 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    `<db>.pre-v5.bak.invalid-<unix-seconds>` (`-<n>` if taken) — logged at `warn` with both paths,
    never deleted — and a fresh image is published. (The same rules cover `.pre-v4.bak` for redb-v3
    schema-3 stores; redb-v2 stores keep `.pre-substrate.bak` as their pristine copy.)
+   A crash between the staged copy and the publish leaves a store-sized
+   `<db>.pre-vN.bak.<pid>.<nonce>.sidecar.tmp`. Nothing removes it; it is safe to delete when no
+   migration is running.
 2. **Cursor reset (single write transaction).** Every `sync_cursors` row is rewritten as
    `{ instance_id, push_sequence: 0, pull_sequence: 0 }`. The legacy `last_sequence` is **not** used
    to seed either side — it may hold a local *or* a remote sequence, and seeding from it could skip
@@ -149,10 +152,11 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
 - **Events compacted before the upgrade are not recoverable.** If a pre-0.8.0 compaction already
   deleted unpushed events (the #9 failure), the migration cannot restore them; the resync covers only
   what is still in the WAL.
-- **A second opener waits, then finds the store migrated.** Other writable openers block on the
+- **A second opener waits, then gets `DatabaseLocked`.** Other writable openers block on the
   migration lock with no timeout — a multi-minute migration must not fail its waiters — and a `warn!`
-  carrying the lock path is logged every 30 s while blocked. After the first migration commits, a
-  waiter re-checks the schema under the lock and proceeds against the already-migrated store. A
+  carrying the lock path is logged every 30 s while blocked. The first process keeps its writable redb handle after
+  `open` returns, so the waiter then gets the typed, retryable `DatabaseLocked` (ADR-003: one writable
+  process) while that process holds the store. The waiter runs no migration and leaves the sidecar untouched. A
   read-only open takes no lock and creates no `.migrate.lock` file.
 - **Rollback** (ADR-011): reinstall 0.7.x and restore `<db>.pre-v5.bak` over the store. A 0.7.x
   binary refuses a schema-5 store with `SchemaVersionMismatch`, so a downgrade without the restore
