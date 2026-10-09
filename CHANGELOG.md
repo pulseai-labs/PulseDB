@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A destructive schema migration now runs only under ownership and a durable, validated rollback image (#89, #25).** Upgrading a 0.7.x store previously copied `.pre-v5.bak` with no lock covering the copy, no fsync, and `AlreadyExists` taken as proof of a complete sidecar — a second opener could migrate the store under a half-written image (#89), and a whole-image tear could pass the `schema_version`-only check. The migration lock (`.migrate.lock`) is now acquired before any writable redb handle and held through the schema-migration commit: a second opener waits (no timeout; `warn!` carrying the lock path every 30 s) and then finds the store already migrated. The sidecar is staged at a process-unique sibling temp, `fsync`ed, validated as a whole image (read-only: `schema_version` read back, then every listed table and multimap traversed and every entry read), and published by a create-if-absent hard link that never replaces an existing image. A failure on any step — fsync, validation, quarantine rename, link — refuses the migration with a typed error and leaves the store at its pre-migration schema. A pre-existing sidecar that fails validation, for example one left truncated by an earlier crash, is **quarantined** as `.pre-v5.bak.invalid-<unix-seconds>` (never deleted, `warn!` with both paths) and replaced by a fresh image on the next upgrading open. See [docs/storage-migration.md](docs/storage-migration.md#schema-v5-080-sync-cursors-reset). A `.pre-v5.bak` published by a 0.8.0 binary is **not re-validated later** — a schema-5 store needs no migration, so no open triggers a check — so check a rollback image (open it read-only with the version you are reinstalling) before restoring it.
+
 ## [0.8.0] - 2026-10-09
 
 ### Added

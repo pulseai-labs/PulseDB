@@ -72,6 +72,7 @@ use redb::{ReadableDatabase, TableDefinition};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 /// The serializer-independent substrate marker at the postcard era: `[b'P', b'S', 2]`.
@@ -559,4 +560,318 @@ fn sigkill_at_premarker_reopens_pristine_and_survives_locks_v0_4_0() {
     let _ = std::fs::remove_file(&stale_lock);
 
     assert_clean_rerun_value_identical(&store, &manifest);
+}
+
+// ---------------------------------------------------------------------------
+// r1.s6.w1 (#89 / #25) — the durable schema-sidecar protocol under concurrency
+// ---------------------------------------------------------------------------
+
+/// Sibling `.pre-v5.bak` path for `store` (mirrors `pre_v5_backup_path`).
+fn pre_v5_bak(store: &Path) -> PathBuf {
+    let mut sidecar = store.to_path_buf();
+    let name = store.file_name().unwrap().to_string_lossy();
+    sidecar.set_file_name(format!("{name}.pre-v5.bak"));
+    sidecar
+}
+
+/// The logical `schema_version` of an on-disk store, read WITHOUT migrating it:
+/// a redb read-only open, the `db_metadata` row, and the postcard decode the
+/// current substrate marker (`[P,S,2]`) implies.
+fn read_schema_version(store: &Path) -> u32 {
+    let db = redb::Database::builder()
+        .open_read_only(store)
+        .expect("read-only open for the schema-version read");
+    let rtx = db.begin_read().unwrap();
+    let table = rtx.open_table(METADATA).unwrap();
+    let bytes = table
+        .get("db_metadata")
+        .unwrap()
+        .expect("db_metadata row present")
+        .value()
+        .to_vec();
+    postcard::from_bytes::<pulsedb::DatabaseMetadata>(&bytes)
+        .expect("postcard db_metadata decode")
+        .schema_version
+}
+
+/// Wait (bounded) for `path` to appear; `true` if it did.
+fn wait_for_file(path: &Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    path.exists()
+}
+
+/// A minimal capturing `tracing::Subscriber` that records the `message` field
+/// of every event seen on the thread it is installed for. Hand-written rather
+/// than pulling in `tracing-subscriber`: the concurrent-upgrade test needs
+/// exactly one fact — whether the second open ran any migration phase of its
+/// own (audit fold 3).
+#[derive(Clone, Default)]
+struct CapturedEvents {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl CapturedEvents {
+    fn messages(&self) -> Vec<String> {
+        self.messages.lock().unwrap().clone()
+    }
+}
+
+struct MessageVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            *self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for CapturedEvents {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = String::new();
+        event.record(&mut MessageVisitor(&mut message));
+        self.messages.lock().unwrap().push(message);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Child entry (only active when re-exec'd with `FI_PAUSE_STORE` set): opens the
+/// store writable and PAUSES inside the schema-sidecar publish at
+/// `MidSchemaBackup`, holding the migration lock. The parent releases it by
+/// writing `FI_PAUSE_RELEASE`. A normal test run executes this as a no-op pass.
+#[test]
+fn zzz_schema_backup_pause_child_entry() {
+    let store = match std::env::var("FI_PAUSE_STORE") {
+        Ok(store) => store,
+        Err(_) => return, // not the re-exec'd child — no-op
+    };
+    pulsedb::fault_injection::arm(Boundary::MidSchemaBackup, Action::Pause);
+    if let Err(error) = PulseDB::open(Path::new(&store), Config::default()) {
+        // The migration must complete once released; a failure here is the
+        // child's finding, reported by its exit status.
+        eprintln!("paused child: migrating open failed: {error:?}");
+        std::process::exit(96);
+    }
+}
+
+/// AC-1 (s6-a1): a raced upgrade serializes on the migration lock. A child
+/// process pauses mid-backup holding the lock; a second open in this process
+/// must WAIT (not return, store still schema 4), then — after the child
+/// finishes — return `Ok` on a schema-5 store, with exactly one migration run
+/// and `.pre-v5.bak` byte-identical to the pristine fixture.
+#[test]
+fn concurrent_upgrade_waits_for_a_durable_sidecar() {
+    let fixture = std::fs::read(fixtures_dir().join("real-v0.7.0.redb")).unwrap();
+    let (tmp, store) = copy_fixture("real-v0.7.0.redb");
+    let marker = tmp.path().join("schema-backup.paused");
+    let release = tmp.path().join("schema-backup.release");
+    let sidecar = pre_v5_bak(&store);
+
+    // The child pauses inside the durable publish, holding the migration lock.
+    // It holds NO redb handle, so the store itself stays readable. Its harness
+    // output is suppressed so that the only `N passed` line in this test's
+    // output is THIS test's — a failing parent must never be masked by the
+    // child's own pass line under the AC's `output contains 1 passed` filter.
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "zzz_schema_backup_pause_child_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FI_PAUSE_STORE", &store)
+        .env("FI_PAUSE_MARKER", &marker)
+        .env("FI_PAUSE_RELEASE", &release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the paused child");
+    assert!(
+        wait_for_file(&marker, std::time::Duration::from_secs(30)),
+        "the child never reached MidSchemaBackup (no pause marker appeared)"
+    );
+
+    // Second opener: must wait for the lock. The capturing subscriber is
+    // installed INSIDE the spawned thread, so the capture observes that open.
+    let captured = CapturedEvents::default();
+    let opener = {
+        let store = store.clone();
+        let captured = captured.clone();
+        std::thread::spawn(move || {
+            tracing::subscriber::with_default(captured, || {
+                // The migration lock is released as the child's `RedbStorage::open`
+                // returns; the child's redb write handle closes a moment LATER, so
+                // a waiter that wakes inside that window gets the typed, retryable
+                // `DatabaseLocked` (redb's DatabaseAlreadyOpen — the documented
+                // concurrent-opener contract). Retry it, bounded.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    match PulseDB::open(&store, Config::default()) {
+                        Ok(db) => return Ok(db),
+                        Err(PulseDBError::Storage(StorageError::DatabaseLocked))
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    assert!(
+        !opener.is_finished(),
+        "the second open returned while the first process was paused mid-backup; \
+         it must wait for the migration lock"
+    );
+    assert_eq!(
+        read_schema_version(&store),
+        4,
+        "while the child is paused the store must still read schema 4"
+    );
+
+    // Release the child; it completes the migration and publishes the sidecar.
+    std::fs::write(&release, b"release").unwrap();
+    let status = child.wait().expect("wait for the paused child");
+    assert!(
+        status.success(),
+        "the released child must complete the migration and exit 0, got {status:?}"
+    );
+
+    // The second opener now proceeds on an already-migrated store.
+    let opened = opener.join().expect("join the second opener");
+    let db = opened.unwrap_or_else(|e| {
+        panic!("the second open must succeed on the migrated store, got {e:?}")
+    });
+    assert_eq!(
+        db.metadata().schema_version,
+        5,
+        "the second open must find the store already at schema 5"
+    );
+    drop(db);
+
+    // Exactly one migration ran (audit fold 3): the sidecar is the CHILD's
+    // pristine copy, and the parent's own open logged no migration phase.
+    let sidecar_bytes =
+        std::fs::read(&sidecar).expect(".pre-v5.bak must exist after the child migrated");
+    assert_eq!(
+        sidecar_bytes, fixture,
+        ".pre-v5.bak must be byte-identical to the pristine fixture (published by the child)"
+    );
+    let messages = captured.messages();
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.contains("Migrated") || m.contains("migration complete")),
+        "the second open must not run a migration; captured events: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("waiting for another process")),
+        "the second open must have waited on the migration lock; captured events: {messages:?}"
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap(),
+        sidecar_bytes,
+        "the second open must not touch the published sidecar"
+    );
+}
+
+/// Child entry (only active when re-exec'd with `FI_SIGKILL_SCHEMA_STORE` set):
+/// SIGKILLs itself inside the schema-sidecar publish at `MidSchemaBackup`.
+/// A normal test run executes this as a no-op pass.
+#[test]
+fn zzz_schema_backup_sigkill_child_entry() {
+    let store = match std::env::var("FI_SIGKILL_SCHEMA_STORE") {
+        Ok(store) => store,
+        Err(_) => return, // not the re-exec'd child — no-op
+    };
+    pulsedb::fault_injection::arm(Boundary::MidSchemaBackup, Action::Sigkill);
+    let _ = PulseDB::open(Path::new(&store), Config::default());
+    // Unreachable: SIGKILL must have fired at MidSchemaBackup.
+    eprintln!("BUG: SIGKILL did not fire at MidSchemaBackup");
+    std::process::exit(97);
+}
+
+/// AC-2: a genuine SIGKILL (no Drop, no unwind) mid-sidecar-publish leaves the
+/// store untouched at schema 4 and NO `.pre-v5.bak` at the final path; a clean
+/// reopen then migrates and publishes a valid, byte-identical sidecar.
+#[cfg(unix)]
+#[test]
+fn sigkill_mid_schema_backup_publishes_no_sidecar_and_reopen_migrates() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = std::fs::read(fixtures_dir().join("real-v0.7.0.redb")).unwrap();
+    let (_tmp, store) = copy_fixture("real-v0.7.0.redb");
+    let sidecar = pre_v5_bak(&store);
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "zzz_schema_backup_sigkill_child_entry",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FI_SIGKILL_SCHEMA_STORE", &store)
+        .status()
+        .expect("spawn the SIGKILL child");
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "the child must be SIGKILL'd (signal 9) at MidSchemaBackup, got {status:?}"
+    );
+
+    // The crash landed after the staged copy but before the publish: the final
+    // sidecar path is ABSENT (any leftover is a temp), and the store is intact
+    // at schema 4 — no destructive step ran.
+    assert!(
+        !sidecar.exists(),
+        "a SIGKILL at MidSchemaBackup must leave NO `.pre-v5.bak` at the final path"
+    );
+    assert_eq!(
+        read_schema_version(&store),
+        4,
+        "the SIGKILL'd store must still read schema 4"
+    );
+
+    // A clean reopen migrates and publishes a valid sidecar, byte-identical to
+    // the pristine fixture. The stale `.migrate.lock` file the dead child left
+    // must not wedge it — the OS released the advisory lock on death.
+    let db = PulseDB::open(&store, Config::default())
+        .unwrap_or_else(|e| panic!("clean reopen after the SIGKILL must migrate: {e:?}"));
+    assert_eq!(
+        db.metadata().schema_version,
+        5,
+        "clean reopen must reach schema 5"
+    );
+    drop(db);
+    assert_eq!(
+        std::fs::read(&sidecar).expect(".pre-v5.bak must be published by the clean reopen"),
+        fixture,
+        ".pre-v5.bak must be byte-identical to the pristine fixture"
+    );
 }

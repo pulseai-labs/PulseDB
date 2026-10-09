@@ -59,8 +59,8 @@
 mod common;
 
 use common::{copy_fixture, fixtures_dir};
-use pulsedb::{CollectiveId, Config, ExperienceId, InsightId, PulseDB, RelationId};
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use pulsedb::{CollectiveId, Config, ExperienceId, InsightId, PulseDB, PulseDBError, RelationId};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -701,4 +701,307 @@ fn real_v0_7_0_opens_without_sync_feature() {
         assert_eq!(db.metadata().schema_version, 5);
     }
     assert_v0_7_0_migrated_to_v5(&store, &manifest);
+}
+
+// ---------------------------------------------------------------------------
+// r1.s6.w1 (#89 / #25) — the durable sidecar protocol: quarantine + restage
+// ---------------------------------------------------------------------------
+
+/// Sibling `.pre-v5.bak` path for `store` (mirrors `pre_v5_backup_path`).
+fn pre_v5_bak(store: &Path) -> PathBuf {
+    store.with_file_name(format!(
+        "{}.pre-v5.bak",
+        store.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+/// Every `<store>.pre-v5.bak.invalid-*` quarantine file beside `store`, sorted.
+fn quarantine_files(store: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}.invalid-",
+        pre_v5_bak(store).file_name().unwrap().to_string_lossy()
+    );
+    let mut found: Vec<PathBuf> = std::fs::read_dir(store.parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().starts_with(&prefix))
+                .unwrap_or(false)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// AC-3: a truncated `.pre-v5.bak` left by an earlier crash is NOT proof. The
+/// upgrading open quarantines it (renamed, never deleted, bytes intact) and
+/// publishes a fresh image byte-identical to the pristine fixture, then
+/// migrates the store.
+#[test]
+fn invalid_existing_sidecar_is_quarantined_and_restaged() {
+    let fixture = std::fs::read(fixtures_dir().join("real-v0.7.0.redb")).unwrap();
+    let (_tmp, store) = copy_fixture("real-v0.7.0.redb");
+    let sidecar = pre_v5_bak(&store);
+
+    // The 0.8.0-era `AlreadyExists` branch preserved a file like this as
+    // genuine proof; it is not even openable as a database.
+    let truncated = &fixture[..fixture.len() / 2];
+    std::fs::write(&sidecar, truncated).unwrap();
+
+    let db = PulseDB::open(&store, Config::default())
+        .unwrap_or_else(|e| panic!("upgrade beside an invalid sidecar must proceed: {e:?}"));
+    assert_eq!(
+        db.metadata().schema_version,
+        5,
+        "the store must migrate to schema 5"
+    );
+    drop(db);
+
+    // The invalid image is QUARANTINED — renamed, never deleted, bytes intact.
+    let quarantined = quarantine_files(&store);
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "exactly one `.pre-v5.bak.invalid-*` quarantine file expected, found {quarantined:?}"
+    );
+    assert_eq!(
+        std::fs::read(&quarantined[0]).unwrap(),
+        truncated,
+        "the quarantined file must hold the invalid image's bytes, unmodified"
+    );
+    // A fresh, byte-identical image replaces it.
+    assert_eq!(
+        std::fs::read(&sidecar).expect("a fresh `.pre-v5.bak` must be published"),
+        fixture,
+        "the restaged `.pre-v5.bak` must be byte-identical to the pristine fixture"
+    );
+}
+
+/// AC-4 (`#[cfg(unix)]`): a source with mode 0o600 yields a 0o600 sidecar —
+/// both on a fresh publish and on the restage that follows a quarantine, where
+/// the invalid image's own mode must NOT leak onto the fresh copy.
+#[cfg(unix)]
+#[test]
+fn durable_sidecar_keeps_source_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Arm 1 — fresh publish from a 0o600 source.
+    let (_tmp_a, store_a) = copy_fixture("real-v0.7.0.redb");
+    std::fs::set_permissions(&store_a, std::fs::Permissions::from_mode(0o600)).unwrap();
+    {
+        let db = PulseDB::open(&store_a, Config::default()).expect("upgrade the 0o600 store");
+        drop(db);
+    }
+    let sidecar_a = pre_v5_bak(&store_a);
+    assert_eq!(
+        std::fs::metadata(&sidecar_a).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the fresh `.pre-v5.bak` must carry the source store's 0o600 mode"
+    );
+
+    // Arm 2 — restage after a quarantine: the invalid image is 0o644, the source
+    // is 0o600, so the fresh image must follow the SOURCE.
+    let fixture = std::fs::read(fixtures_dir().join("real-v0.7.0.redb")).unwrap();
+    let (_tmp_b, store_b) = copy_fixture("real-v0.7.0.redb");
+    std::fs::set_permissions(&store_b, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let sidecar_b = pre_v5_bak(&store_b);
+    std::fs::write(&sidecar_b, &fixture[..fixture.len() / 2]).unwrap();
+    std::fs::set_permissions(&sidecar_b, std::fs::Permissions::from_mode(0o644)).unwrap();
+    {
+        let db = PulseDB::open(&store_b, Config::default())
+            .expect("upgrade beside an invalid 0o644 sidecar");
+        drop(db);
+    }
+    assert_eq!(
+        std::fs::metadata(&sidecar_b).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the restaged `.pre-v5.bak` must carry the SOURCE's 0o600 mode, not the \
+         invalid image's 0o644"
+    );
+}
+
+/// AC-17 (audit fold 1): a read-only open of a not-yet-migrated store refuses
+/// with the typed `ReadOnly` error and performs zero writes — it must not
+/// acquire or create `.migrate.lock`, and it must not claim a sidecar.
+#[test]
+fn read_only_open_creates_no_migration_lock() {
+    let (_tmp, store) = copy_fixture("real-v0.7.0.redb");
+    let lock = PathBuf::from(format!("{}.migrate.lock", store.display()));
+    let sidecar = pre_v5_bak(&store);
+    assert!(
+        !lock.exists(),
+        "precondition: `.migrate.lock` must not exist before the read-only open"
+    );
+
+    let error = match PulseDB::open(&store, Config::read_only()) {
+        Ok(_) => panic!("a read-only open of a schema-4 store must refuse with ReadOnly"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, PulseDBError::ReadOnly),
+        "the refusal must be the typed ReadOnly, got {error:?}"
+    );
+    assert!(
+        !lock.exists(),
+        "a read-only open must not create `.migrate.lock` — creating the lock file is a write"
+    );
+    assert!(
+        !sidecar.exists(),
+        "a read-only open must not claim a sidecar (zero writes)"
+    );
+}
+
+/// Does the image at `path` open read-only and read `schema_version` = 4?
+fn image_reads_schema_version_4(path: &Path) -> bool {
+    let Ok(db) = redb::Database::builder().open_read_only(path) else {
+        return false;
+    };
+    let Ok(read_txn) = db.begin_read() else {
+        return false;
+    };
+    let Ok(table) = read_txn.open_table(METADATA) else {
+        return false;
+    };
+    let Ok(Some(bytes)) = table.get("db_metadata") else {
+        return false;
+    };
+    postcard::from_bytes::<pulsedb::DatabaseMetadata>(bytes.value())
+        .map(|metadata| metadata.schema_version == 4)
+        .unwrap_or(false)
+}
+
+/// The type-agnostic half of the migration's whole-image validation, mirrored
+/// for the AC-18 scan: walk the table directory (`list_tables` +
+/// `list_multimap_tables`) and every page of every listed table via the untyped
+/// table's `len()` + `stats()` (`stats()` parses every page's structure). A
+/// candidate that fails this also fails the migration's own (strictly larger)
+/// validation.
+fn page_walk(path: &Path) -> Result<(), String> {
+    let db = redb::Database::builder()
+        .open_read_only(path)
+        .map_err(|error| error.to_string())?;
+    let read_txn = db.begin_read().map_err(|error| error.to_string())?;
+    for handle in read_txn.list_tables().map_err(|error| error.to_string())? {
+        let table = read_txn
+            .open_untyped_table(handle)
+            .map_err(|error| error.to_string())?;
+        table.len().map_err(|error| error.to_string())?;
+        table.stats().map_err(|error| error.to_string())?;
+    }
+    for handle in read_txn
+        .list_multimap_tables()
+        .map_err(|error| error.to_string())?
+    {
+        let table = read_txn
+            .open_untyped_multimap_table(handle)
+            .map_err(|error| error.to_string())?;
+        table.len().map_err(|error| error.to_string())?;
+        table.stats().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Run `f`, turning a panic into `None`. redb's page accessors `unwrap()` on a
+/// torn page (e.g. `LeafAccessor::total_length` reached by `stats()`), so a
+/// damaged image can make a traversal PANIC rather than return `Err` — both the
+/// migration's validation and this scan must treat that as "not a valid image".
+fn catches_panic<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+}
+
+/// AC-18 damaged-offset choice — deterministic, recorded, and verified before use:
+///
+/// * candidates are the byte offsets `1 + 4096*k` for `k = 1..len/4096`; eight
+///   bytes at each candidate are overwritten with `0xFF` (a decisive tear, not
+///   a subtle flip);
+/// * a candidate QUALIFIES when the damaged image still opens read-only and
+///   reads `schema_version` = 4, AND the whole-image page walk fails on it
+///   (an `Err` or a redb panic both count as failure);
+/// * the FIRST qualifying candidate is used, so the result is a pure function
+///   of the committed fixture's bytes.
+///
+/// If no candidate qualifies, this panics with the design-gap message: redb's
+/// page-level checks could not detect a tear at any page header, and the
+/// validation would need a content-level check instead (spec §4 — report
+/// before implementing the traversal).
+fn torn_image(fixture: &[u8], scratch_dir: &Path) -> (usize, Vec<u8>) {
+    for k in 1..(fixture.len() / 4096) {
+        let offset = 1 + 4096 * k;
+        let mut damaged = fixture.to_vec();
+        let end = (offset + 8).min(damaged.len());
+        for byte in &mut damaged[offset..end] {
+            *byte = 0xFF;
+        }
+        let candidate = scratch_dir.join("ac18-candidate.redb");
+        std::fs::write(&candidate, &damaged).unwrap();
+        let reads_schema_4 =
+            catches_panic(|| image_reads_schema_version_4(&candidate)).unwrap_or(false);
+        let walk_fails = !matches!(catches_panic(|| page_walk(&candidate)), Some(Ok(())));
+        let _ = std::fs::remove_file(&candidate);
+        if reads_schema_4 && walk_fails {
+            eprintln!(
+                "AC-18: deterministic scan chose offset {offset} (8 bytes set to 0xFF); \
+                 metadata still reads schema_version = 4 and the whole-image page walk fails"
+            );
+            return (offset, damaged);
+        }
+    }
+    panic!(
+        "AC-18 DESIGN GAP: no offset in the {}-byte fixture both keeps the metadata \
+         readable (schema_version = 4) and fails the whole-image page walk — stop and \
+         report this before implementing the traversal",
+        fixture.len()
+    );
+}
+
+/// AC-18 (amendment 2026-10-02, Codex P2 on PR #88): a `.pre-v5.bak` torn
+/// inside a NON-metadata table keeps `db_metadata` readable — the 0.8.0-era
+/// check would have accepted it as proof — while the rest of the image is
+/// damaged. The upgrading open must quarantine it and restage from the
+/// pristine source.
+#[test]
+fn torn_sidecar_with_intact_metadata_is_quarantined_and_restaged() {
+    let fixture = std::fs::read(fixtures_dir().join("real-v0.7.0.redb")).unwrap();
+    let (_tmp, store) = copy_fixture("real-v0.7.0.redb");
+    let sidecar = pre_v5_bak(&store);
+
+    let (offset, damaged) = torn_image(&fixture, _tmp.path());
+    std::fs::write(&sidecar, &damaged).unwrap();
+
+    // Precondition, asserted on the PLANTED image: it still opens read-only and
+    // reads schema_version = 4 — which is exactly why the old metadata-only
+    // check would have accepted it, and what the whole-image validation must not.
+    assert!(
+        image_reads_schema_version_4(&sidecar),
+        "the planted image (damage at offset {offset}) must still read schema_version = 4"
+    );
+
+    let db = PulseDB::open(&store, Config::default()).unwrap_or_else(|e| {
+        panic!("upgrade beside a torn-but-metadata-intact sidecar must proceed: {e:?}")
+    });
+    assert_eq!(
+        db.metadata().schema_version,
+        5,
+        "the store must migrate to schema 5"
+    );
+    drop(db);
+
+    let quarantined = quarantine_files(&store);
+    assert_eq!(
+        quarantined.len(),
+        1,
+        "exactly one `.pre-v5.bak.invalid-*` quarantine file expected, found {quarantined:?}"
+    );
+    assert_eq!(
+        std::fs::read(&quarantined[0]).unwrap(),
+        damaged,
+        "the quarantined file must hold the damaged image's bytes"
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).expect("a fresh `.pre-v5.bak` must be published"),
+        fixture,
+        "the restaged `.pre-v5.bak` must be byte-identical to the pristine fixture"
+    );
 }

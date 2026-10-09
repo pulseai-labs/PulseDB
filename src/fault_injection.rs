@@ -3,11 +3,13 @@
 //! Compiled **only** under `--features fault-injection` — never in default or
 //! release builds, so the production migration path is byte-identical when the
 //! feature is off (each call site is a statement-level `#[cfg(...)]` that
-//! disappears entirely). This lets a test ARM a simulated crash at a specific
-//! migration boundary; the migration path calls `maybe_inject` at each of the
-//! five boundaries, which either `panic!`s (in-process — Drop runs, so the redb
-//! write-txn aborts gracefully / MVCC rolls back) or `raise(SIGKILL)`s (the one
-//! subprocess crash-fidelity test — no Drop, forcing redb's file-level recovery).
+//! disappears entirely). This lets a test ARM a simulated crash — or a pause —
+//! at a specific migration boundary; the migration path calls `maybe_inject` at
+//! each of the six boundaries, which either `panic!`s (in-process — Drop runs,
+//! so the redb write-txn aborts gracefully / MVCC rolls back), `raise(SIGKILL)`s
+//! (the subprocess crash-fidelity tests — no Drop, forcing redb's file-level
+//! recovery), or blocks until a test releases it (`Action::Pause`, the
+//! concurrent-upgrade test — r1.s6.w1).
 //!
 //! The armed state is **thread-local**: the migration runs synchronously on the
 //! same thread that calls `PulseDB::open`, so arming on that thread is sufficient
@@ -20,11 +22,15 @@
 
 use std::cell::Cell;
 
-/// The five migration boundaries a test can crash at.
+/// The six migration boundaries a test can crash at.
 ///
-/// Two are **pre-txn** (a crash there is NOT covered by a redb txn abort):
+/// Three are **pre-txn** (a crash there is NOT covered by a redb txn abort):
 /// - [`Boundary::MidBackupPreFsync`] — inside `backup_once`, after the sidecar
 ///   bytes are copied but before the `#53c` fsync makes them durable.
+/// - [`Boundary::MidSchemaBackup`] — inside the durable schema-sidecar publish
+///   (r1.s6.w1, #89/#25), after the staged copy is copied and fsync'd but
+///   before it is validated and published. A crash here leaves no sidecar at
+///   the final path and the store untouched.
 /// - [`Boundary::PostRedbUpgrade`] — after the destructive in-place redb v2→v3
 ///   upgrade returns, before the redb-4.1 reopen.
 ///
@@ -38,6 +44,11 @@ pub enum Boundary {
     /// Pre-txn: inside `backup_once`, after the sidecar bytes are copied but
     /// before the `#53c` fsync makes them durable.
     MidBackupPreFsync,
+    /// Pre-txn: inside the durable schema-sidecar publish, after the staged
+    /// copy is copied and fsync'd but before it is validated and published.
+    /// A crash here leaves the final sidecar path ABSENT (the copy is still a
+    /// temp) and the store untouched.
+    MidSchemaBackup,
     /// Pre-txn: after the destructive in-place redb v2→v3 upgrade returns, before
     /// the redb-4.1 reopen.
     PostRedbUpgrade,
@@ -50,16 +61,28 @@ pub enum Boundary {
     PreMarker,
 }
 
-/// How to crash when the armed boundary is reached.
+/// How to crash — or hold — when the armed boundary is reached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     /// Unwind via `panic!` — Drop runs (graceful redb txn abort). Deterministic,
     /// CI-stable, catchable with `catch_unwind`; covers every boundary.
     Panic,
     /// `libc::raise(SIGKILL)` — the process dies immediately, no Drop. Used by
-    /// exactly one subprocess test at `PreMarker` for genuine crash fidelity.
+    /// the subprocess crash-fidelity tests for genuine crash semantics.
     Sigkill,
+    /// Hold the migration at the boundary until the test releases it. Writes
+    /// the file named by `FI_PAUSE_MARKER`, then waits for the file named by
+    /// `FI_PAUSE_RELEASE` (a 50 ms poll, at most 60 s); a timeout exits the
+    /// process non-zero so a crashed parent cannot leave the child hung. For
+    /// subprocess use only — in-process it would block the test thread.
+    Pause,
 }
+
+/// How long `Action::Pause` waits for the release file before exiting non-zero.
+const PAUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The poll interval of `Action::Pause`'s release-file wait.
+const PAUSE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 thread_local! {
     static ARMED: Cell<Option<(Boundary, Action)>> = const { Cell::new(None) };
@@ -156,7 +179,51 @@ pub(crate) fn maybe_inject(boundary: Boundary) {
                     // Unreachable in practice; guard against a spurious return.
                     unreachable!("SIGKILL did not terminate the process");
                 }
+                Action::Pause => pause_until_released(boundary),
             }
         }
     }
+}
+
+/// `Action::Pause`: announce the pause, then wait for the release file.
+///
+/// The marker is written (and fsync'd) FIRST, so a parent that waits for it
+/// observes a child that is already past the boundary. Paths come from
+/// `FI_PAUSE_MARKER` / `FI_PAUSE_RELEASE`; either missing is a test bug and
+/// panics loudly. On timeout the process exits non-zero — the parent will not
+/// release a dead child, and nothing should hang waiting for it.
+fn pause_until_released(boundary: Boundary) {
+    use std::io::Write as _;
+
+    let marker = std::env::var("FI_PAUSE_MARKER").unwrap_or_else(|_| {
+        panic!("fault-injection: paused at {boundary:?} but FI_PAUSE_MARKER is not set")
+    });
+    let release = std::env::var("FI_PAUSE_RELEASE").unwrap_or_else(|_| {
+        panic!("fault-injection: paused at {boundary:?} but FI_PAUSE_RELEASE is not set")
+    });
+
+    match std::fs::File::create(&marker) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "paused at {boundary:?}");
+            let _ = file.sync_all();
+        }
+        Err(error) => {
+            eprintln!("fault-injection: cannot write pause marker {marker}: {error}");
+            std::process::exit(93);
+        }
+    }
+
+    let deadline = std::time::Instant::now() + PAUSE_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if std::path::Path::new(&release).exists() {
+            return;
+        }
+        std::thread::sleep(PAUSE_POLL_INTERVAL);
+    }
+    eprintln!(
+        "fault-injection: pause at {boundary:?} timed out after {:?} waiting for {release}; \
+         exiting non-zero",
+        PAUSE_TIMEOUT
+    );
+    std::process::exit(94);
 }
