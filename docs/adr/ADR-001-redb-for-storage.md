@@ -85,3 +85,7 @@ EXPERIENCES_BY_TYPE_TABLE       - Secondary index (collective + type tag -> expe
 - `src/storage/schema.rs` - Table definitions and schema versioning
 - `docs/03-Architecture.md` - Storage layer architecture (Section 5.2)
 - `docs/06-Performance.md` - Write throughput benchmarks
+
+## Amendment 2026-10-09 — lazy derived-index lifecycle
+
+**Context:** Collective existence and derived-index existence are distinct. **Decision:** redb remains authoritative; reads do not allocate HNSW indexes, the first indexed write creates one under the map write lock with a re-check, and reopen rebuilds only populated indexes (`src/db.rs:1015–1125`, `src/db.rs:878–931`, `src/db.rs:955–1009`). **Consequences:** An existing collective can have no index and return empty search results. [ADR-005's amendment](ADR-005-pure-rust-hnsw.md#amendment-2026-10-09--lazy-derived-index-lifecycle) records allocation compensation and the best-effort writable-open cleanup of stale sidecars.

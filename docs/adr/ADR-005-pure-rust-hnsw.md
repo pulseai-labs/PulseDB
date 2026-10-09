@@ -109,3 +109,20 @@ For MVP: scalar-only (no SIMD feature flags). At 100K vectors with M=16, search 
 - The filtered-traversal claim (`hnsw_rs::search_filter`) is **not exercised** by the shipped tag-filter tests: they use ≤14 experiences, below the `BRUTE_FORCE_THRESHOLD` (128) linear-scan cutoff, so the HNSW filter branch never runs in CI. Add an above-threshold filtered test before trusting filter-during-traversal at scale.
 
 <!-- Appended at ossify adoption smoke pass, 2026-08-23 -->
+
+## Amendment 2026-10-09 — lazy derived-index lifecycle
+
+### Context
+
+Eager experience and insight indexes imposed a fixed allocation on empty collectives. The r1.s5 lifecycle keeps redb authoritative and allocates derived HNSW state as data is indexed.
+
+### Decision
+
+- Determine collective existence from redb. For a valid search, an existing collective without an index returns empty; reads never create indexes (`src/db.rs:1015–1053`, `src/db.rs:2110–2117`, `src/db.rs:2151–2168`).
+- The first indexed write creates the relevant index under its map write lock, re-checking the entry after the read-lock fast path. This applies to both experience and insight maps (`src/db.rs:1056–1125`).
+- On reopen, rebuild each index only when its collective has stored embeddings. On writable open, attempt removal of stale sidecars for an emptied collective; cleanup errors are logged and open continues. Read-only open skips removal (`src/db.rs:878–931`, `src/db.rs:955–1009`).
+- Compensate the `hnsw_rs` 0.3.4 allocation hint for its missing second `exp()`, targeting about `max_elements` total reserved slots; layer zero still grows independently. The upstream defect is [hnswlib-rs#41](https://github.com/jean-pierreBoth/hnswlib-rs/issues/41), with dependency-sensitive compensation tracked by [#107](https://github.com/pulseai-labs/PulseDB/issues/107) (`src/vector/hnsw.rs:36–79`, `src/vector/hnsw.rs:231–237`).
+
+### Consequences
+
+Empty collectives need no HNSW graph; first indexed writes pay creation cost while holding the map write lock. redb remains the rebuild source. Open-time stale-sidecar cleanup is best effort, **not fail-closed** at this baseline; that distinction limits the cleanup guarantee. Whether a leftover deleted mark after failed cleanup can hide a re-recorded id remains an open question in [#115](https://github.com/pulseai-labs/PulseDB/issues/115). The compensation must be revisited when upstream allocation arithmetic changes. See [ADR-001](ADR-001-redb-for-storage.md).
