@@ -617,12 +617,14 @@ fn read_known_multimap_entries(read_txn: &::redb::ReadTransaction, name: &str) -
 ///
 /// Every failure REFUSES the migration with a typed error and removes the
 /// staged temp: a `sync_all` failure, a staged copy that fails validation, and
-/// a `hard_link` failure that is not `AlreadyExists` all leave the store
+/// a failed hard-link/copy publication all leave the store
 /// untouched at its pre-migration schema. A loser's `AlreadyExists` is the
 /// preserve branch, not a failure: the sidecar already at the final path wins
 /// and this call's staged copy is discarded.
 ///
-/// The publish is `hard_link`, NOT `rename` — `rename` replaces an existing
+/// Publication uses `hard_link`, or an exclusive copy on link-less volumes.
+/// An interrupted fallback copy is invalid evidence that the next migrating
+/// open validates and quarantines before retrying. `rename` replaces an existing
 /// destination on both Unix and Windows, which would make the preserve rule a
 /// check-then-act race that could overwrite another process's genuine rollback
 /// point.
@@ -630,6 +632,27 @@ fn publish_durable_sidecar(
     source: &Path,
     backup_path: &Path,
     expected_schema_version: u32,
+) -> Result<()> {
+    publish_durable_sidecar_with(
+        source,
+        backup_path,
+        expected_schema_version,
+        |from, to| std::fs::hard_link(from, to),
+        |from, to| {
+            std::io::copy(from, to)?;
+            to.sync_all()
+        },
+    )
+}
+
+// The filesystem operations are injectable so link-less volumes and partial
+// destination failures can be exercised without depending on the host volume.
+fn publish_durable_sidecar_with(
+    source: &Path,
+    backup_path: &Path,
+    expected_schema_version: u32,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    copy_and_sync: impl FnOnce(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<()> {
     let temp_path = sidecar_staging_temp_path(backup_path);
     // Symlink-safe staging (same posture as `backup_once`): unlink any stale
@@ -668,18 +691,35 @@ fn publish_durable_sidecar(
         let _ = std::fs::remove_file(&temp_path);
         return Err(error);
     }
-    // Create-if-absent publish; never replaces.
-    let published = std::fs::hard_link(&temp_path, backup_path);
-    // The link does not consume the temp; remove it on every path.
-    let _ = std::fs::remove_file(&temp_path);
-    match published {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            debug!("pre-migration backup already exists; preserving it");
-            return Ok(());
+    // Keep the validated stage until either publish path has finished. Only
+    // exclusive destination creation grants ownership for failure cleanup.
+    let published = (|| -> std::io::Result<()> {
+        match link(&temp_path, backup_path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                debug!("pre-migration backup already exists; preserving it");
+                return Ok(());
+            }
+            Err(_) => {} // Link-less volume: exclusive copy below.
         }
-        Err(error) => return Err(PulseDBError::Io(error)),
-    }
+        let mut destination = match create_sidecar_file(source, backup_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(error) => return Err(error), // We own no output; never unlink.
+        };
+        let result = (|| {
+            let mut staged = std::fs::File::open(&temp_path)?;
+            copy_and_sync(&mut staged, &mut destination)
+        })();
+        // Close both handles before removing our failed output on Windows.
+        drop(destination);
+        if result.is_err() {
+            let _ = std::fs::remove_file(backup_path);
+        }
+        result
+    })();
+    let _ = std::fs::remove_file(&temp_path);
+    published.map_err(PulseDBError::Io)?;
     // Best-effort parent-directory fsync so the new entry is durable where the
     // platform supports it (B3); an unsupported dir-fsync is not fatal — the
     // sidecar's own bytes were already made durable before the publish.
@@ -5507,6 +5547,167 @@ mod tests {
             .expect("an already-published sidecar is preserved, not replaced");
         assert_eq!(std::fs::read(&backup_path).unwrap(), published);
         assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    fn unsupported_sidecar_link(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "injected link-less volume",
+        ))
+    }
+
+    fn copy_and_sync_sidecar(
+        from: &mut std::fs::File,
+        to: &mut std::fs::File,
+    ) -> std::io::Result<()> {
+        std::io::copy(from, to)?;
+        to.sync_all()
+    }
+
+    #[test]
+    fn test_schema_publication_linkless_bytes_and_permissions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        Box::new(RedbStorage::open(&path, &default_config()).unwrap())
+            .close()
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let original = std::fs::read(&path).unwrap();
+        let backup = pre_v5_backup_path(&path);
+        publish_durable_sidecar_with(
+            &path,
+            &backup,
+            SCHEMA_VERSION,
+            unsupported_sidecar_link,
+            copy_and_sync_sidecar,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        validate_sidecar_image(&backup, SCHEMA_VERSION).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+        }
+        assert!(leftover_sidecar_temps(&backup).is_empty());
+    }
+
+    #[test]
+    fn test_schema_publication_linkless_preserves_racing_winner() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        Box::new(RedbStorage::open(&path, &default_config()).unwrap())
+            .close()
+            .unwrap();
+        let backup = pre_v5_backup_path(&path);
+        publish_durable_sidecar_with(
+            &path,
+            &backup,
+            SCHEMA_VERSION,
+            |from, to| {
+                // A winner appears only after staging/validation, before the
+                // fallback's exclusive destination creation.
+                std::fs::copy(from, to)?;
+                unsupported_sidecar_link(from, to)
+            },
+            |_, _| panic!("a preserved winner must not be copied into"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        assert!(leftover_sidecar_temps(&backup).is_empty());
+    }
+
+    #[test]
+    fn test_schema_publication_linkless_cleans_owned_partial_output() {
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        Box::new(RedbStorage::open(&path, &default_config()).unwrap())
+            .close()
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let backup = pre_v5_backup_path(&path);
+        let error = publish_durable_sidecar_with(
+            &path,
+            &backup,
+            SCHEMA_VERSION,
+            unsupported_sidecar_link,
+            |_, to| {
+                to.write_all(b"partial sidecar")?;
+                Err(std::io::Error::other("injected copy/sync failure"))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PulseDBError::Io(ref e) if e.to_string() == "injected copy/sync failure")
+        );
+        assert!(!backup.exists(), "only our failed output must be removed");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(leftover_sidecar_temps(&backup).is_empty());
+    }
+
+    #[test]
+    fn test_schema_publication_linkless_cleans_output_when_stage_reopen_fails() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        Box::new(RedbStorage::open(&path, &default_config()).unwrap())
+            .close()
+            .unwrap();
+        let backup = pre_v5_backup_path(&path);
+        let error = publish_durable_sidecar_with(
+            &path,
+            &backup,
+            SCHEMA_VERSION,
+            |from, to| {
+                std::fs::remove_file(from)?;
+                unsupported_sidecar_link(from, to)
+            },
+            copy_and_sync_sidecar,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PulseDBError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+        );
+        assert!(!backup.exists());
+        assert!(leftover_sidecar_temps(&backup).is_empty());
+    }
+
+    #[test]
+    fn test_schema_publication_linkless_cleans_output_on_destination_sync_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        Box::new(RedbStorage::open(&path, &default_config()).unwrap())
+            .close()
+            .unwrap();
+        let backup = pre_v5_backup_path(&path);
+        let original = std::fs::read(&path).unwrap();
+        let error = publish_durable_sidecar_with(
+            &path,
+            &backup,
+            SCHEMA_VERSION,
+            unsupported_sidecar_link,
+            |from, to| {
+                std::io::copy(from, to)?;
+                Err(std::io::Error::other("injected destination sync failure"))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PulseDBError::Io(ref e) if e.to_string() == "injected destination sync failure")
+        );
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(leftover_sidecar_temps(&backup).is_empty());
     }
 
     /// A sidecar is a byte copy of the database, so it must never be more

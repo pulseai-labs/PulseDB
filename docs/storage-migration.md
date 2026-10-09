@@ -117,7 +117,9 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    (re-opened read-only: `schema_version` read back, then every table and multimap the image lists
    traversed and every entry read — a metadata-only check cannot see a copy torn by a concurrent
    writer's commit), and published by an atomic create-if-absent hard link, which never replaces an
-   existing sidecar. Any failure — a failed fsync, a torn image, a failed link — **refuses the
+   existing sidecar. On link-less volumes, an exclusive create-and-copy of the validated stage
+   is synced before success; an interrupted copy is validated and quarantined on the next
+   migrating open. Any failure — a failed fsync, a torn image, a failed publish — **refuses the
    migration** with a typed error; the store stays at its pre-migration schema and the temp is
    removed. If the peek cannot run (crashed session, locked file) and the open discovers a pending
    migration, the copy is taken from the post-open bytes instead — a valid store, but not

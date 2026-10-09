@@ -43,7 +43,12 @@ mechanics are unchanged.
   After the publish the parent directory is fsync'd best-effort, where the
   platform supports it; an unsupported directory fsync is not fatal — the
   file's own bytes are already durable.
-- **Never replace.** Publication is a create-if-absent hard link, not a rename.
+- **Never replace.** Publication is a create-if-absent hard link, with an
+  exclusive create-and-copy fallback on link-less volumes. The fallback copies
+  the validated stage and syncs its destination before success. An interrupted
+  fallback may leave an invalid image; the next migrating open validates and
+  quarantines it before retrying. Only outputs exclusively created by this
+  attempt are removed on failure. Publication never uses a rename.
   `rename` replaces an existing destination on both Unix and Windows, which
   would make "preserve an existing sidecar" a check-then-act race that could
   overwrite another process's genuine rollback point.
