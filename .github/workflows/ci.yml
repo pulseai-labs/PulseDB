@@ -131,6 +131,38 @@ jobs:
       - name: Run tests
         run: cargo test ${{ matrix.features }}
 
+      - name: Collective memory measurement (F-CI2b)
+        # r1.s5 evidence for release r1 exit criterion 8: what one empty
+        # collective costs a PulseDB process at create and at reopen, and how
+        # that cost moves with HnswConfig::max_elements. Four legs only — the two
+        # OSes the PR #88 commit blow-up has to be compared on, each in the
+        # feature set that failed (sync-http) and the baseline (default).
+        # The grid measures; the E/R bound fails the step on a breach.
+        if: >-
+          (matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest')
+          && (matrix.features == '' || matrix.features == '--features sync-http')
+        shell: bash
+        env:
+          PULSEDB_MEM_OUT: collective-memory-${{ matrix.os }}-${{ matrix.features == '--features sync-http' && 'sync-http' || 'default' }}.jsonl
+        run: |
+          cargo test ${{ matrix.features }} --test collective_memory -- --ignored --nocapture --test-threads=1 collective_memory_grid
+          cargo test ${{ matrix.features }} --test collective_memory -- --ignored --nocapture --test-threads=1 collective_memory_bound
+          echo "--- ${PULSEDB_MEM_OUT} ---"
+          cat "${PULSEDB_MEM_OUT}"
+
+      - name: Upload collective memory artifact
+        # `always()` keeps whatever the run measured even when the measurement
+        # step aborts (the child's 2 GiB ceiling) or fails.
+        if: >-
+          always()
+          && (matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest')
+          && (matrix.features == '' || matrix.features == '--features sync-http')
+        uses: actions/upload-artifact@v7
+        with:
+          name: collective-memory-${{ matrix.os }}-${{ matrix.features == '--features sync-http' && 'sync-http' || 'default' }}
+          path: collective-memory-${{ matrix.os }}-${{ matrix.features == '--features sync-http' && 'sync-http' || 'default' }}.jsonl
+          if-no-files-found: warn
+
   # ─────────────────────────────────────────────
   # Job 2b: migration crash-recovery gate (VS-4.0.4 / #46)
   # Runs the kill-at-boundary fault-injection suite. Linux-only: the one

@@ -305,7 +305,35 @@ impl RemoteChangeApplier {
                         experience.applications.len()
                     )));
                 }
+                // The collective is the create's dependency, and an absent one
+                // is a non-completion rather than an idempotent skip (A2): the
+                // change is left unacknowledged so it repeats, instead of
+                // surfacing later as a transport-shaped string from the apply
+                // below. A collective that exists WITHOUT an index is a
+                // different case — that error comes from the apply itself.
+                let collective_id = experience.collective_id;
+                if self
+                    .db
+                    .get_collective(collective_id)
+                    .map_err(map_err)?
+                    .is_none()
+                {
+                    return Err(SyncError::MissingDependency {
+                        entity: "collective",
+                        id: collective_id.to_string(),
+                    });
+                }
                 if self.db.get_experience(id).map_err(map_err)?.is_some() {
+                    // The row is already here. Before this counts as an
+                    // idempotent create, its index entry has to exist: an
+                    // earlier index failure leaves the row present and
+                    // unsearchable, and acknowledging it would move the cursors
+                    // (and `compact_wal`) past a record search can never find
+                    // (#96). Repair first, then the unchanged counter merge.
+                    let repaired = self
+                        .db
+                        .ensure_synced_experience_indexed(id)
+                        .map_err(map_err)?;
                     let merged = self
                         .db
                         .apply_synced_experience_counter_merge(
@@ -314,8 +342,12 @@ impl RemoteChangeApplier {
                             Some(experience.last_reinforced),
                         )
                         .map_err(map_err)?;
-                    if merged {
-                        trace!(id = %id, "Merged ExperienceCreated counter collision");
+                    if repaired || merged {
+                        if repaired {
+                            trace!(id = %id, "Repaired ExperienceCreated: existing row was unsearchable");
+                        } else {
+                            trace!(id = %id, "Merged ExperienceCreated counter collision");
+                        }
                         return Ok(ApplyOutcome::Applied);
                     }
                     trace!(id = %id, "Skipping ExperienceCreated: already exists");
@@ -352,6 +384,11 @@ impl RemoteChangeApplier {
                 if self.db.get_experience(id).map_err(map_err)?.is_none() {
                     return Err(SyncError::missing_experience(id));
                 }
+                // Every completion path, including counter-only and LWW skips,
+                // must prove the durable row is indexed before acknowledging it.
+                self.db
+                    .ensure_synced_experience_indexed(id)
+                    .map_err(map_err)?;
                 let applications = update.applications.as_ref().cloned().unwrap_or_default();
                 let last_reinforced = update.last_reinforced;
                 let has_counter_merge =
@@ -411,6 +448,9 @@ impl RemoteChangeApplier {
                     trace!(id = %id, "Skipping ExperienceArchived: not found");
                     return Ok(ApplyOutcome::Skipped);
                 }
+                self.db
+                    .ensure_synced_experience_indexed(id)
+                    .map_err(map_err)?;
                 // An archive of a record that IS present; the already-absent
                 // case took the idempotent skip above and keeps it.
                 if !self
@@ -460,8 +500,28 @@ impl RemoteChangeApplier {
             // ─── Insight ─────────────────────────────────────────────
             SyncPayload::InsightCreated(insight) => {
                 let id = insight.id;
-                // Idempotent: skip if already exists
+                // Same dependency rule as the experience create above: the
+                // collective must be here, and its absence is a non-completion.
+                let collective_id = insight.collective_id;
+                if self
+                    .db
+                    .get_collective(collective_id)
+                    .map_err(map_err)?
+                    .is_none()
+                {
+                    return Err(SyncError::MissingDependency {
+                        entity: "collective",
+                        id: collective_id.to_string(),
+                    });
+                }
                 if self.db.get_insight(id).map_err(map_err)?.is_some() {
+                    // An existing row is only a finished create once the insight
+                    // is searchable — same repair-before-skip as experiences.
+                    let repaired = self.db.ensure_synced_insight_indexed(id).map_err(map_err)?;
+                    if repaired {
+                        trace!(id = %id, "Repaired InsightCreated: existing row was unsearchable");
+                        return Ok(ApplyOutcome::Applied);
+                    }
                     trace!(id = %id, "Skipping InsightCreated: already exists");
                     return Ok(ApplyOutcome::Skipped);
                 }
@@ -545,6 +605,148 @@ mod tests {
             timestamp: Timestamp::now(),
         }
     }
+
+    fn unindexed_completion_case(case: &str, broken_embedding: bool) {
+        let (db, _dir) = open_db();
+        let cid = db.create_collective("completion-repair").unwrap();
+        let seed = db.record_experience(minimal_exp(cid)).unwrap();
+        let mut record = db.get_experience(seed).unwrap().unwrap();
+        record.id = ExperienceId::new(); // Durable row whose graph mapping never published.
+        if broken_embedding {
+            record.embedding.clear();
+        }
+        db.storage_for_test().save_experience(&record).unwrap();
+        assert!(!db
+            .with_vector_index(cid, |index| Ok(index.is_searchable(record.id)))
+            .unwrap()
+            .unwrap());
+        let remote = InstanceId::new();
+        let old = case.starts_with("lww_skip") || case == "counter_only";
+        let config = SyncConfig {
+            conflict_resolution: if case.starts_with("server") || case == "counter_only" {
+                ConflictResolution::ServerWins
+            } else {
+                ConflictResolution::LastWriteWins
+            },
+            ..Default::default()
+        };
+        let payload = if case == "archive" {
+            SyncPayload::ExperienceArchived {
+                id: record.id,
+                timestamp: Timestamp::now(),
+            }
+        } else {
+            let applications = if case == "lww_skip_merge" || case == "counter_only" {
+                Some(BTreeMap::from([(remote, 7)]))
+            } else if case == "lww_skip_noop" {
+                Some(BTreeMap::new())
+            } else {
+                None
+            };
+            SyncPayload::ExperienceUpdated {
+                id: record.id,
+                update: SerializableExperienceUpdate {
+                    importance: if case == "counter_only" {
+                        None
+                    } else {
+                        Some(0.1)
+                    },
+                    applications,
+                    ..Default::default()
+                },
+                timestamp: if old {
+                    Timestamp::from_millis(0)
+                } else {
+                    Timestamp::from_millis(record.timestamp.as_millis() + 1)
+                },
+            }
+        };
+        let applier = RemoteChangeApplier::new(db.clone(), config);
+        let wal_before = db.get_current_sequence().unwrap();
+        for _ in 0..2 {
+            let result = applier
+                .apply_batch(vec![change(payload.clone(), cid)])
+                .unwrap();
+            let stored = db.get_experience(record.id).unwrap().unwrap();
+            if broken_embedding {
+                assert_eq!(
+                    result.failed, 1,
+                    "{case}: failed repair must fail completion"
+                );
+                assert_eq!(
+                    result.safe_through, None,
+                    "{case}: failed repair must not ACK"
+                );
+                assert_eq!(stored.archived, record.archived);
+                assert_eq!(stored.importance, record.importance);
+                assert_eq!(stored.applications, record.applications);
+            } else {
+                assert_eq!(result.failed, 0, "{case}: repair should complete");
+                assert_eq!(
+                    result.safe_through,
+                    Some(1),
+                    "{case}: repaired row should ACK"
+                );
+                assert!(
+                    db.with_vector_index(cid, |index| Ok(index.is_searchable(record.id)))
+                        .unwrap()
+                        .unwrap(),
+                    "{case}: ACK requires a searchable index entry"
+                );
+                assert_eq!(
+                    db.storage_for_test().get_embedding(record.id).unwrap(),
+                    Some(record.embedding.clone())
+                );
+                if case == "archive" {
+                    assert!(stored.archived);
+                }
+                if case == "lww_skip_merge" || case == "counter_only" {
+                    assert_eq!(stored.applications.get(&remote), Some(&7));
+                }
+            }
+            assert_eq!(
+                db.get_current_sequence().unwrap(),
+                wal_before,
+                "repair/apply must not emit local WAL"
+            );
+        }
+    }
+
+    macro_rules! completion_repair_tests {
+        ($success:ident, $failure:ident, $case:literal) => {
+            #[test]
+            fn $success() {
+                unindexed_completion_case($case, false);
+            }
+            #[test]
+            fn $failure() {
+                unindexed_completion_case($case, true);
+            }
+        };
+    }
+    completion_repair_tests!(
+        repair_server_update,
+        failed_repair_server_update,
+        "server_update"
+    );
+    completion_repair_tests!(repair_lww_update, failed_repair_lww_update, "lww_update");
+    completion_repair_tests!(repair_lww_skip, failed_repair_lww_skip, "lww_skip");
+    completion_repair_tests!(
+        repair_lww_skip_merge,
+        failed_repair_lww_skip_merge,
+        "lww_skip_merge"
+    );
+    completion_repair_tests!(
+        repair_lww_skip_noop,
+        failed_repair_lww_skip_noop,
+        "lww_skip_noop"
+    );
+    completion_repair_tests!(
+        repair_counter_only,
+        failed_repair_counter_only,
+        "counter_only"
+    );
+    completion_repair_tests!(repair_archive, failed_repair_archive, "archive");
 
     #[test]
     fn experience_created_collision_merges_gcounter_fields() {

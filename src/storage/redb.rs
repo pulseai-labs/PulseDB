@@ -56,6 +56,29 @@ use crate::config::{Config, EmbeddingDimension, RecallWeights};
 use crate::embedding::ProviderIdentity;
 use crate::error::{PulseDBError, Result, StorageError, ValidationError};
 
+// Test-only storage failures after the caller has soft-deleted its index.
+#[cfg(all(test, feature = "sync"))]
+thread_local! {
+    static DELETE_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, feature = "sync"))]
+pub(crate) fn fail_next_delete_for_test(boundary: &'static str) {
+    DELETE_FAILURE.with(|failure| failure.set(Some(boundary)));
+}
+
+#[cfg(all(test, feature = "sync"))]
+fn check_delete_failure_for_test(boundary: &'static str) -> Result<()> {
+    DELETE_FAILURE.with(|failure| {
+        if failure.get() == Some(boundary) {
+            failure.set(None);
+            Err(StorageError::serialization(format!("injected {boundary} delete failure")).into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
 /// Metadata key in the metadata table.
 const METADATA_KEY: &str = "db_metadata";
 
@@ -3432,6 +3455,8 @@ impl StorageEngine for RedbStorage {
     }
 
     fn delete_experience(&self, id: ExperienceId) -> Result<bool> {
+        #[cfg(all(test, feature = "sync"))]
+        check_delete_failure_for_test("experience")?;
         // First read the experience to get collective_id, timestamp, type_tag,
         // and tags (needed for cleaning up secondary indices and WAL event)
         let (collective_id, timestamp, type_tag, tags) = {
@@ -3726,6 +3751,8 @@ impl StorageEngine for RedbStorage {
     }
 
     fn delete_relations_for_experience(&self, experience_id: ExperienceId) -> Result<u64> {
+        #[cfg(all(test, feature = "sync"))]
+        check_delete_failure_for_test("relations")?;
         // Phase 1: Read — collect all relation IDs from both indexes
         let relation_ids: Vec<RelationId> = {
             let read_txn = self.db.begin_read().map_err(StorageError::from)?;
@@ -3873,6 +3900,8 @@ impl StorageEngine for RedbStorage {
     }
 
     fn delete_insight(&self, id: InsightId) -> Result<bool> {
+        #[cfg(all(test, feature = "sync"))]
+        check_delete_failure_for_test("insight")?;
         // Read the insight first to get collective_id for index cleanup
         let collective_id = {
             let read_txn = self.db.begin_read().map_err(StorageError::from)?;

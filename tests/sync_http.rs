@@ -790,6 +790,14 @@ async fn test_http_reinforcement_gcounter_converges_exact_total() {
     let cid = server.db.create_collective("http-gcounter").unwrap();
     let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
 
+    // Seed the client with the same record through the apply path, collective
+    // first. The collective's durable dimension is needed to validate the
+    // experience before saving it; applying the experience then builds the
+    // lazy index. Both applies run under the guard, as a synced change would.
+    let collective = server.db.get_collective(cid).unwrap().unwrap();
+    let guard = SyncApplyGuard::enter();
+    db_client.apply_synced_collective(collective).unwrap();
+    drop(guard);
     let seed = server.db.get_experience(exp_id).unwrap().unwrap();
     let guard = SyncApplyGuard::enter();
     db_client.apply_synced_experience(seed).unwrap();
@@ -4235,4 +4243,83 @@ async fn recovery_completion_http_413_does_not_wait_for_body() {
         .expect("a 413 must be classified without waiting for its body")
         .expect_err("413");
     assert!(err.is_peer_rejected_size(), "got {err:?}");
+}
+
+// ============================================================================
+// r1.s5.w3 — a synced create is acknowledged only once it is searchable (#96)
+// ============================================================================
+
+/// The #96 repair over real HTTP: a create whose row the client already holds
+/// without an index entry is repaired from redb before it is acknowledged.
+///
+/// The same scenario as the `sync_engine` test of the same name, over the real
+/// transport — the journey line s5-a1. It is the shape the residual defect
+/// leaves in a running system: the row reached the store (so `get_experience`
+/// finds it and the applier reads it as a finished idempotent create) while
+/// the vector index never got an entry, because the insert runs after the redb
+/// commit and its failure is not undone.
+#[tokio::test]
+async fn http_synced_create_repairs_unindexed_row_before_ack() {
+    let server = start_test_server().await;
+    let dir_client = tempdir().unwrap();
+    let db_client =
+        Arc::new(PulseDB::open(dir_client.path().join("client.db"), Config::default()).unwrap());
+
+    let transport = HttpSyncTransport::new(&server.base_url);
+    let mut manager = SyncManager::new(
+        Arc::clone(&db_client),
+        Box::new(transport),
+        SyncConfig::default(),
+    )
+    .unwrap();
+
+    // The collective crosses first, so the client holds a real index for it.
+    let cid = server
+        .db
+        .create_collective("http-repair-unindexed")
+        .unwrap();
+    manager
+        .initial_sync(None)
+        .await
+        .expect("the collective must catch up");
+    assert!(
+        db_client.get_collective(cid).unwrap().is_some(),
+        "the client must hold the collective before its index can be under test"
+    );
+
+    // The experience is created after that catch-up, so it arrives on the next
+    // one. The client gets the ROW by hand: record and embedding in the store,
+    // no index entry.
+    let exp_id = server.db.record_experience(minimal_exp(cid)).unwrap();
+    let stored = server.db.get_experience(exp_id).unwrap().unwrap();
+    assert!(
+        !stored.embedding.is_empty(),
+        "the fixture must carry a vector, or the repair has nothing to insert"
+    );
+    db_client
+        .storage_for_test()
+        .save_experience(&stored)
+        .unwrap();
+
+    let query = vec![0.1f32; 384];
+    assert!(
+        db_client.search_similar(cid, &query, 5).unwrap().is_empty(),
+        "the fixture must start unsearchable, or the repair is not what makes it findable"
+    );
+
+    manager
+        .sync_once()
+        .await
+        .expect("a repaired create must not fail the cycle");
+
+    assert!(
+        db_client.get_experience(exp_id).unwrap().is_some(),
+        "the record was already on the client and must still be there"
+    );
+    let hits = db_client.search_similar(cid, &query, 5).unwrap();
+    assert!(
+        hits.iter().any(|hit| hit.experience.id == exp_id),
+        "a synced create acknowledged as applied must be searchable on the \
+         client: the missing index entry has to be repaired from redb"
+    );
 }

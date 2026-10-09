@@ -11,6 +11,8 @@
 //! so `insert()` takes `&self`. Our metadata (`IndexState`) is
 //! protected by `std::sync::RwLock`.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -30,6 +32,39 @@ use super::VectorIndex;
 /// small collections this causes missed results. Linear scan is both more
 /// reliable (100% recall) and faster (no graph overhead) at this scale.
 const BRUTE_FORCE_THRESHOLD: usize = 128;
+
+/// Compensates hnsw_rs 0.3.4's missing second exp() at hnsw.rs line 453
+/// (https://github.com/jean-pierreBoth/hnswlib-rs/issues/41). Remove when fixed
+/// upstream. This gives a total reservation of about `max_elements` slots;
+/// the skew between layers remains, and layer zero grows by ordinary Vec growth.
+fn allocation_hint(config: &HnswConfig) -> usize {
+    let s = 1. / (config.max_nb_connection as f64).ln();
+    let fractions: Vec<f64> = (0..config.max_layer.min(16))
+        .map(|i| (-(i as f64) / s).exp() - (-((i + 1) as f64) / s))
+        .collect();
+    let factor: f64 = fractions.iter().sum();
+    if factor.is_nan() || factor < 1. {
+        return config.max_elements;
+    }
+    let reservation = |hint: usize| {
+        fractions.iter().fold(0usize, |total, frac| {
+            total.saturating_add((frac * hint as f64).round() as usize)
+        })
+    };
+    // Search the rounded sum, rather than rounding N/factor: the latter can
+    // under-reserve or skip the smallest hint at rounding boundaries.
+    let mut low = 1;
+    let mut high = config.max_elements.max(1);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if reservation(mid) >= config.max_elements {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
+}
 
 /// Newtype wrapper that bridges `&dyn Fn(&usize) -> bool` to `FilterT`.
 ///
@@ -78,17 +113,60 @@ pub struct HnswIndex {
 #[derive(Debug)]
 struct IndexState {
     /// Forward map: ExperienceId → internal usize ID.
+    ///
+    /// An entry here means the graph insert for that id **returned**: the
+    /// mapping is published after the insert, never before, so a reader can
+    /// treat it as "search can reach this point".
     id_to_internal: HashMap<ExperienceId, usize>,
 
     /// Reverse map: internal usize ID → ExperienceId.
     /// Uses Vec for O(1) lookup by index.
-    internal_to_id: Vec<ExperienceId>,
+    ///
+    /// `None` marks an internal id that was claimed but never published — a
+    /// graph insert that failed or unwound. Every search path skips those
+    /// slots rather than treating them as a mapping.
+    internal_to_id: Vec<Option<ExperienceId>>,
 
     /// Set of soft-deleted internal IDs (excluded from search).
+    ///
+    /// Holds live mappings, and — transiently — the internal id of an insert
+    /// that is still in flight when its id is deleted. Live counts subtract
+    /// only deleted IDs whose mappings have actually been published.
     deleted: HashSet<usize>,
 
     /// Next internal ID to assign (monotonically increasing).
     next_id: usize,
+
+    /// Inserts in flight: ExperienceId → the internal id claimed for it.
+    ///
+    /// A claim is taken before the graph insert and released after the mapping
+    /// is published, so a second insert of the same id can tell "another
+    /// thread is putting this point in right now" from "this id is absent" and
+    /// refrain from adding a second graph point for it.
+    pending: HashMap<ExperienceId, usize>,
+}
+
+impl IndexState {
+    fn active_count(&self) -> usize {
+        let deleted_published = self
+            .deleted
+            .iter()
+            .filter(|&&id| self.internal_to_id.get(id).is_some_and(Option::is_some))
+            .count();
+        self.id_to_internal.len() - deleted_published
+    }
+
+    /// Grows `internal_to_id` until `internal_id` is addressable.
+    ///
+    /// Ids are handed out in increasing order, so growth is the common case;
+    /// the resize is what makes a *non*-adjacent id (one published while an
+    /// earlier insert was still in flight, or one whose predecessor failed)
+    /// addressable at its own index instead of shifting every later mapping.
+    fn reserve_slot(&mut self, internal_id: usize) {
+        if self.internal_to_id.len() <= internal_id {
+            self.internal_to_id.resize(internal_id + 1, None);
+        }
+    }
 }
 
 /// Serializable metadata for persistence.
@@ -106,6 +184,42 @@ pub(crate) struct IndexMetadata {
     pub(crate) deleted: Vec<String>,
 }
 
+/// Releases an in-flight claim on an id if the graph insert never returned.
+///
+/// Without this, a graph insert that unwinds would leave the id claimed
+/// forever: every later `insert_experience` of it would read the claim as
+/// "another thread is on it" and return without a point, so the id could never
+/// become searchable. The abandoned internal id is not reused — its slot in
+/// `internal_to_id` stays `None` and every search path skips it — so the id
+/// counter keeps moving forward and no live mapping is ever displaced.
+struct PendingClaim<'a> {
+    index: &'a HnswIndex,
+    exp_id: ExperienceId,
+    internal_id: usize,
+    /// Set once the mapping has been published, at which point there is nothing
+    /// left to release.
+    published: bool,
+}
+
+impl Drop for PendingClaim<'_> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        // Best effort: a poisoned lock means the whole index is unusable
+        // anyway, and a panic here would replace the caller's.
+        if let Ok(mut state) = self.index.state.write() {
+            if state.pending.get(&self.exp_id) == Some(&self.internal_id) {
+                state.pending.remove(&self.exp_id);
+                // The id never landed, so a soft-delete mark taken against the
+                // claim has nothing left to apply to. Dropping it keeps
+                // `deleted` a subset of "mapped or pending".
+                state.deleted.remove(&self.internal_id);
+            }
+        }
+    }
+}
+
 impl HnswIndex {
     /// Creates a new empty HNSW index.
     ///
@@ -113,10 +227,14 @@ impl HnswIndex {
     ///
     /// * `dimension` - Expected embedding dimension (validated on insert)
     /// * `config` - HNSW tuning parameters
+    ///
+    /// Compensates hnsw_rs 0.3.4's allocation hint for a total reservation of
+    /// about `max_elements` slots. Layer zero grows independently as points
+    /// arrive; this does not reserve `max_elements` slots in every layer.
     pub fn new(dimension: usize, config: &HnswConfig) -> Self {
         let hnsw = Hnsw::new(
             config.max_nb_connection,
-            config.max_elements,
+            allocation_hint(config),
             config.max_layer,
             config.ef_construction,
             DistCosine,
@@ -129,6 +247,7 @@ impl HnswIndex {
                 internal_to_id: Vec::new(),
                 deleted: HashSet::new(),
                 next_id: 0,
+                pending: HashMap::new(),
             }),
             config: config.clone(),
             dimension,
@@ -157,36 +276,111 @@ impl HnswIndex {
 
     /// Inserts an experience embedding into the index.
     ///
-    /// Assigns a new internal usize ID and records the mapping.
-    /// If the ExperienceId is already present, this is a no-op.
+    /// If the ExperienceId is already present, this is a no-op — including an
+    /// id that is present but soft-deleted: reviving one of those is
+    /// `clear_deleted_mark`'s job, and a second graph point for the same id is
+    /// never the answer.
+    ///
+    /// # Publishing order, and why it is load-bearing
+    ///
+    /// The id is claimed, the graph insert runs, and only then is the mapping
+    /// published. So [`contains`](Self::contains) answers "search can reach this
+    /// point", not "someone tried to insert this id" — an insert that fails or
+    /// unwinds leaves nothing behind, and a later insert of the same id
+    /// succeeds and becomes searchable. A claim that is abandoned (the graph
+    /// insert unwound) is released by
+    /// [`PendingClaim`]'s `Drop`, so it can never wedge the id.
+    ///
+    /// The state lock is released around the graph insert, which keeps the
+    /// lock order the search paths already use (`state` then the graph's own
+    /// lock — never the other way round) and keeps a search from waiting on an
+    /// insert. Two concurrent inserts of one id add at most one graph point:
+    /// the second sees the claim and returns.
     pub fn insert_experience(&self, exp_id: ExperienceId, embedding: &[f32]) -> Result<()> {
         self.validate_embedding(embedding)?;
 
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
+        // Claim an internal id, then let go of the lock: the graph insert must
+        // not run under `state` (search walks the graph while holding it).
+        let internal_id = {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
 
-        // Skip if already inserted (idempotent)
-        if state.id_to_internal.contains_key(&exp_id) {
-            return Ok(());
-        }
+            // Already published: idempotent, mapping and point both in place.
+            if state.id_to_internal.contains_key(&exp_id) {
+                return Ok(());
+            }
+            // In flight on another thread: one point per id is the contract,
+            // so this call joins that insert instead of racing a second point
+            // into the graph.
+            if state.pending.contains_key(&exp_id) {
+                return Ok(());
+            }
 
-        // Assign next sequential internal ID
-        let internal_id = state.next_id;
-        state.next_id += 1;
+            // Assign next sequential internal ID
+            let internal_id = state.next_id;
+            state.next_id += 1;
+            state.pending.insert(exp_id, internal_id);
+            internal_id
+        };
 
-        // Record bidirectional mapping
-        state.id_to_internal.insert(exp_id, internal_id);
-        state.internal_to_id.push(exp_id);
+        let mut claim = PendingClaim {
+            index: self,
+            exp_id,
+            internal_id,
+            published: false,
+        };
 
-        // Drop the lock before calling hnsw insert (which acquires its own lock)
-        drop(state);
+        #[cfg(test)]
+        maybe_fail_graph_insert();
 
         // Insert into HNSW graph (uses interior mutability via parking_lot::RwLock)
         self.hnsw.insert((embedding, internal_id));
 
+        // The point is in the graph — now, and not before, is the mapping true.
+        {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
+            state.pending.remove(&exp_id);
+            state.id_to_internal.insert(exp_id, internal_id);
+            state.reserve_slot(internal_id);
+            state.internal_to_id[internal_id] = Some(exp_id);
+        }
+        claim.published = true;
+
         Ok(())
+    }
+
+    /// Test-only: takes an in-flight claim on `exp_id`, leaving it held, and
+    /// returns the internal id it claimed.
+    ///
+    /// A real insert holds exactly this state for the duration of its graph
+    /// insert. Nothing else can construct it without a second thread and a
+    /// timing window, and the two behaviours that live in that window — a
+    /// delete landing inside it, and a second insert that joins it publishing
+    /// nothing — are what the callers of this probe assert. `#[cfg(test)]`-only
+    /// and crate-visible: absent from non-test builds, and not public API.
+    #[cfg(test)]
+    pub(crate) fn claim_for_test(&self, exp_id: ExperienceId) -> usize {
+        let mut state = self
+            .state
+            .write()
+            .expect("test claim: index state lock poisoned");
+        assert!(
+            !state.id_to_internal.contains_key(&exp_id),
+            "test claim: the id is already published"
+        );
+        assert!(
+            !state.pending.contains_key(&exp_id),
+            "test claim: the id is already claimed"
+        );
+        let internal_id = state.next_id;
+        state.next_id += 1;
+        state.pending.insert(exp_id, internal_id);
+        internal_id
     }
 
     /// Marks an experience as deleted in the index.
@@ -194,6 +388,11 @@ impl HnswIndex {
     /// The vector remains in the graph but is excluded from search
     /// results via filtered search. Returns Ok even if the experience
     /// is not in the index (idempotent).
+    ///
+    /// An id whose insert is still in flight is deleted too: the delete marks
+    /// the internal id that insert has claimed, so the publish that follows
+    /// lands already soft-deleted instead of resurrecting an id the store no
+    /// longer has.
     pub fn delete_experience(&self, exp_id: ExperienceId) -> Result<()> {
         let mut state = self
             .state
@@ -202,6 +401,10 @@ impl HnswIndex {
 
         if let Some(&internal_id) = state.id_to_internal.get(&exp_id) {
             state.deleted.insert(internal_id);
+        } else if let Some(&pending_id) = state.pending.get(&exp_id) {
+            // In flight, not yet published. Marking the pending internal id is
+            // what makes the delete survive the insert that finishes after it.
+            state.deleted.insert(pending_id);
         }
 
         Ok(())
@@ -229,7 +432,8 @@ impl HnswIndex {
     /// entirely. This bounds the work done by the vector index, which is the
     /// load-bearing requirement of VS-4.3.2: a search for `k` results among a
     /// tagged subset returns exactly `k` tagged results, not `k′ < k` after a
-    /// post-recall truncate.
+    /// post-recall truncate. If ANN cannot fill that budget because of graph
+    /// fragmentation, an exact scan of eligible points completes the search.
     ///
     /// When `allowed` is `None`, behavior is identical to
     /// [`search_experiences`](Self::search_experiences).
@@ -253,7 +457,8 @@ impl HnswIndex {
             .read()
             .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
 
-        let active_count = state.next_id - state.deleted.len();
+        // Pending/raw graph IDs are not part of the published search budget.
+        let active_count = state.active_count();
         if active_count == 0 {
             return Ok(vec![]);
         }
@@ -264,6 +469,7 @@ impl HnswIndex {
         let allowed_internal: Option<HashSet<usize>> = allowed.map(|ids| {
             ids.iter()
                 .filter_map(|exp_id| state.id_to_internal.get(exp_id).copied())
+                .filter(|internal| !state.deleted.contains(internal))
                 .collect()
         });
 
@@ -278,70 +484,95 @@ impl HnswIndex {
         }
         let effective_k = k.min(searchable);
 
-        if active_count <= BRUTE_FORCE_THRESHOLD {
-            // Linear scan: iterate all stored vectors and compute exact distances.
-            // Guarantees 100% recall for small collections where HNSW's layer
-            // fragmentation causes missed results.
-            let dist_fn = DistCosine;
-            let mut all_distances: Vec<(ExperienceId, f32)> = Vec::with_capacity(searchable);
+        if active_count > BRUTE_FORCE_THRESHOLD {
+            // HNSW graph search for larger collections.
+            let effective_ef = ef_search.max(effective_k);
+            let deleted_ref = &state.deleted;
 
-            for point in self.hnsw.get_point_indexation().into_iter() {
-                let origin_id = point.get_origin_id();
-                if state.deleted.contains(&origin_id) {
-                    continue;
-                }
-                // Skip non-allowed points when an allowed set is provided.
-                if let Some(ref internal) = allowed_internal {
-                    if !internal.contains(&origin_id) {
-                        continue;
-                    }
-                }
-                let distance = dist_fn.eval(query, point.get_v());
-                if let Some(&exp_id) = state.internal_to_id.get(origin_id) {
-                    all_distances.push((exp_id, distance));
-                }
-            }
-
-            all_distances
-                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            all_distances.truncate(effective_k);
-            return Ok(all_distances);
-        }
-
-        // HNSW graph search for larger collections.
-        let effective_ef = ef_search.max(effective_k);
-        let deleted_ref = &state.deleted;
-
-        // Combined predicate: not-deleted AND (allowed is None OR in allowed set).
-        let needs_filter = !state.deleted.is_empty() || allowed_internal.is_some();
-        let results = if needs_filter {
+            // Mapping-facing search always excludes unpublished/raw points before
+            // they can consume k. The raw-ID VectorIndex search APIs stay unchanged.
+            let published = &state.internal_to_id;
             let allowed_ref = allowed_internal.as_ref();
             let filter_fn = move |id: &usize| -> bool {
-                !deleted_ref.contains(id)
+                published.get(*id).is_some_and(Option::is_some)
+                    && !deleted_ref.contains(id)
                     && allowed_ref.is_none_or(|internal| internal.contains(id))
             };
-            self.hnsw
-                .search_filter(query, effective_k, effective_ef, Some(&filter_fn))
-        } else {
-            self.hnsw.search(query, effective_k, effective_ef)
-        };
+            let results =
+                self.hnsw
+                    .search_filter(query, effective_k, effective_ef, Some(&filter_fn));
 
-        // Map internal IDs back to ExperienceIds
-        let mapped: Vec<(ExperienceId, f32)> = results
-            .into_iter()
-            .filter_map(|n| {
-                state
-                    .internal_to_id
-                    .get(n.d_id)
-                    .map(|&exp_id| (exp_id, n.distance))
-            })
-            .collect();
+            // Map internal IDs back to ExperienceIds
+            let mapped: Vec<(ExperienceId, f32)> = results
+                .into_iter()
+                .filter_map(|n| {
+                    state
+                        .internal_to_id
+                        .get(n.d_id)
+                        .copied()
+                        .flatten()
+                        .map(|exp_id| (exp_id, n.distance))
+                })
+                .collect();
 
-        Ok(mapped)
+            if mapped.len() == effective_k {
+                return Ok(mapped);
+            }
+        }
+
+        // Small collections use exact search. Larger collections reach this
+        // fallback only when filtered ANN underfills the published budget:
+        // random graph fragmentation can make live points unreachable from
+        // its pivot even with ef greater than the whole collection. Preserve
+        // full k without admitting unpublished, deleted, or disallowed points.
+        let dist_fn = DistCosine;
+        let mut all_distances: Vec<(ExperienceId, f32)> = Vec::with_capacity(searchable);
+
+        for point in self.hnsw.get_point_indexation().into_iter() {
+            let origin_id = point.get_origin_id();
+            if state.deleted.contains(&origin_id) {
+                continue;
+            }
+            // Skip non-allowed points when an allowed set is provided.
+            if let Some(ref internal) = allowed_internal {
+                if !internal.contains(&origin_id) {
+                    continue;
+                }
+            }
+            let distance = dist_fn.eval(query, point.get_v());
+            // A point whose mapping is not published (an insert still in
+            // flight, or one that never landed) is skipped, never panicked
+            // on: the graph can hold a point this index cannot name yet.
+            if let Some(exp_id) = state.internal_to_id.get(origin_id).copied().flatten() {
+                all_distances.push((exp_id, distance));
+            }
+        }
+
+        all_distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        all_distances.truncate(effective_k);
+        Ok(all_distances)
     }
 
     /// Returns true if the given experience is in the index (and not deleted).
+    ///
+    /// The same predicate the crate's sync paths ask for by name
+    /// (`is_searchable`), under the name this type has always had. Callers that
+    /// mean "can search find this" should ask for searchability explicitly: a
+    /// soft-deleted id stays *mapped*, and the two states are easy to conflate.
     pub fn contains(&self, exp_id: ExperienceId) -> bool {
+        self.is_searchable(exp_id)
+    }
+
+    /// Returns true only when a search can find `exp_id` right now.
+    ///
+    /// Crate-visible: the sync repair path is the caller that needs the name,
+    /// and it is not public API.
+    ///
+    /// Both halves are required: the id must be mapped (its graph insert
+    /// returned — see [`insert_experience`](Self::insert_experience)) **and**
+    /// free of a soft-delete mark. A soft-deleted id keeps its mapping, so a
+    /// check that only looked at the mapping would call it searchable.
+    pub(crate) fn is_searchable(&self, exp_id: ExperienceId) -> bool {
         let state = self.state.read().ok();
         state.is_some_and(|s| {
             s.id_to_internal
@@ -350,10 +581,39 @@ impl HnswIndex {
         })
     }
 
+    /// Clears a soft-delete mark, making a mapped id searchable again.
+    ///
+    /// Crate-visible: the sync repair path is the only caller, and it is not
+    /// public API. Without the `sync` feature nothing in the crate calls it,
+    /// which is what the conditional `allow` says.
+    ///
+    /// Returns whether a mark was actually cleared: `false` for an id that is
+    /// not mapped, and for one that was not soft-deleted.
+    ///
+    /// Nothing is re-inserted. The graph point is still there and already
+    /// carries this id's embedding, and **experience embeddings are immutable
+    /// per id**, so the point a search would now reach holds the same vector
+    /// the id has in redb — which is also why this cannot resurrect a point
+    /// whose embedding later changed: nothing can.
+    #[cfg_attr(not(feature = "sync"), allow(dead_code))]
+    pub(crate) fn clear_deleted_mark(&self, exp_id: ExperienceId) -> Result<bool> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| PulseDBError::vector("Index state lock poisoned"))?;
+        let Some(&internal_id) = state.id_to_internal.get(&exp_id) else {
+            return Ok(false);
+        };
+        Ok(state.deleted.remove(&internal_id))
+    }
+
     /// Returns the number of active (non-deleted) vectors.
+    ///
+    /// Only published mappings count; a deleted pending or raw graph ID does
+    /// not reduce the count of unrelated searchable experiences.
     pub fn active_count(&self) -> usize {
         let state = self.state.read().ok();
-        state.map_or(0, |s| s.id_to_internal.len() - s.deleted.len())
+        state.map_or(0, |s| s.active_count())
     }
 
     /// Returns the total number of vectors (including deleted).
@@ -417,6 +677,8 @@ impl HnswIndex {
                     state
                         .internal_to_id
                         .get(internal_id)
+                        .copied()
+                        .flatten()
                         .map(|exp_id| exp_id.to_string())
                 })
                 .collect(),
@@ -463,10 +725,79 @@ impl HnswIndex {
         Ok(Some(metadata))
     }
 
+    /// Invalidates one absent row's stale mark before its durable re-create.
+    /// The caller serializes edits to this sidecar. Other pending marks survive.
+    #[cfg(feature = "sync")]
+    pub(crate) fn clear_persisted_deleted_mark(
+        dir: &Path,
+        name: &str,
+        id: ExperienceId,
+    ) -> Result<()> {
+        let meta_path = dir.join(format!("{name}.hnsw.meta"));
+        if !meta_path.exists() {
+            return Ok(());
+        }
+        // A read error may be transient: the stale mark could be readable at
+        // the next open and hide the re-created row, so refuse and let sync retry.
+        let json = fs::read_to_string(&meta_path)
+            .map_err(|e| PulseDBError::vector(format!("Failed to read HNSW metadata: {e}")))?;
+        // Unparseable bytes stay unparseable, and open ignores them
+        // (`load_metadata(..).ok()`), so no mark can come back; refusing would only stall sync.
+        let mut metadata: IndexMetadata = match serde_json::from_str(&json) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(%error, name, "Unparseable HNSW sidecar; open ignores it, so no mark to clear");
+                return Ok(());
+            }
+        };
+        let mut kept = Vec::with_capacity(metadata.deleted.len());
+        for mark in &metadata.deleted {
+            let uuid = uuid::Uuid::parse_str(mark)
+                .map_err(|e| PulseDBError::vector(format!("Invalid UUID in deleted set: {e}")))?;
+            if ExperienceId::from_bytes(*uuid.as_bytes()) != id {
+                kept.push(mark.clone());
+            }
+        }
+        if kept.len() == metadata.deleted.len() {
+            return Ok(());
+        }
+        metadata.deleted = kept;
+        let json = serde_json::to_vec_pretty(&metadata)
+            .map_err(|e| PulseDBError::vector(format!("Failed to serialize HNSW metadata: {e}")))?;
+        let target = dir.join(format!("{name}.hnsw.meta"));
+        let temp = dir.join(format!(".{name}.{}.meta.tmp", uuid::Uuid::now_v7()));
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &target)?;
+            #[cfg(unix)]
+            fs::File::open(dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temp);
+            return Err(PulseDBError::vector(format!(
+                "Failed to clear persisted deleted mark: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Rebuilds an index from a set of embeddings.
     ///
     /// Used during `PulseDB::open()` to reconstruct the HNSW graph
     /// from embeddings stored in redb (the source of truth).
+    ///
+    /// This bulk path publishes its mappings before the batch insert, unlike
+    /// [`insert_experience`](Self::insert_experience): the index is being
+    /// constructed and is not reachable by any reader until this returns, so
+    /// there is no window for anyone to observe a mapping without its point.
     pub fn rebuild_from_embeddings(
         dimension: usize,
         config: &HnswConfig,
@@ -490,7 +821,8 @@ impl HnswIndex {
             let internal_id = state.next_id;
             state.next_id += 1;
             state.id_to_internal.insert(*exp_id, internal_id);
-            state.internal_to_id.push(*exp_id);
+            state.reserve_slot(internal_id);
+            state.internal_to_id[internal_id] = Some(*exp_id);
             batch.push((embedding, internal_id));
         }
 
@@ -597,10 +929,93 @@ impl VectorIndex for HnswIndex {
 // Tests
 // ==========================================================================
 
+// Test-only: this thread's next graph insert must fail.
+//
+// The graph insert is where an insert can fail after the index has already
+// committed to an id, so it is the only place a test can reach the state the
+// publish-after-insert ordering exists for. Thread-local on purpose: an armed
+// failure can never leak into a test running on another thread.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_GRAPH_INSERT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arms [`maybe_fail_graph_insert`] for this thread — one shot.
+#[cfg(test)]
+fn arm_graph_insert_failure() {
+    FAIL_NEXT_GRAPH_INSERT.with(|armed| armed.set(true));
+}
+
+/// Fails the graph insert if this thread armed one, then disarms.
+///
+/// Checked immediately before `self.hnsw.insert(..)`, which is the point the
+/// spec calls out: everything the index publishes about an id must come after
+/// the graph insert returns, so failing here must leave no trace.
+#[cfg(test)]
+fn maybe_fail_graph_insert() {
+    FAIL_NEXT_GRAPH_INSERT.with(|armed| {
+        if armed.replace(false) {
+            panic!("test hook: graph insert failure armed for this thread");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::HnswConfig;
+
+    #[test]
+    fn allocation_hint_reserves_about_max_elements() {
+        // Independent copy of upstream 0.3.4's expression and per-layer rounding.
+        let reservation = |config: &HnswConfig, hint: usize| -> usize {
+            let s = 1. / (config.max_nb_connection as f64).ln();
+            (0..config.max_layer.min(16))
+                .map(|i| {
+                    let frac = (-(i as f64) / s).exp() - (-((i + 1) as f64) / s);
+                    (frac * hint as f64).round() as usize
+                })
+                .sum()
+        };
+        assert!(allocation_hint(&HnswConfig::default()) <= 100);
+        for max_nb_connection in [2, 16, 32] {
+            for max_layer in [1, 8, 16, 32] {
+                for max_elements in [1, 100, 10_000, 1_000_000] {
+                    let config = HnswConfig {
+                        max_nb_connection,
+                        max_layer,
+                        max_elements,
+                        ..HnswConfig::default()
+                    };
+                    let hint = allocation_hint(&config);
+                    let total = reservation(&config, hint);
+                    let step = total - reservation(&config, hint.saturating_sub(1));
+                    assert!(hint >= 1);
+                    assert!(total >= max_elements, "{config:?}: {hint} reserves {total}");
+                    assert!(
+                        total <= max_elements + step,
+                        "{config:?}: excess reservation {total}"
+                    );
+                    if hint > 1 {
+                        assert!(reservation(&config, hint - 1) < max_elements);
+                    }
+                }
+            }
+        }
+        let no_layers = HnswConfig {
+            max_layer: 0,
+            ..HnswConfig::default()
+        };
+        assert_eq!(allocation_hint(&no_layers), no_layers.max_elements);
+        let invalid_factor = HnswConfig {
+            max_nb_connection: 0,
+            ..HnswConfig::default()
+        };
+        assert_eq!(
+            allocation_hint(&invalid_factor),
+            invalid_factor.max_elements
+        );
+    }
 
     fn test_config() -> HnswConfig {
         HnswConfig {
@@ -904,6 +1319,214 @@ mod tests {
             results[0].1 < 0.001,
             "Expected near-zero distance for identical vectors, got {}",
             results[0].1
+        );
+    }
+
+    /// A graph insert that fails must leave the id absent, and the same id must
+    /// still be insertable afterwards.
+    ///
+    /// Both halves matter to the sync repair (#96): the repair decides whether
+    /// to insert by asking whether the id is already there, so an id published
+    /// by an insert that never reached the graph makes the repair skip a row
+    /// search can never find. And a failed attempt that keeps its claim would
+    /// make every later attempt a silent no-op, so the row could never be
+    /// repaired at all.
+    #[test]
+    fn graph_insert_failure_leaves_id_absent_and_retryable() {
+        let dim = 8;
+        let index = HnswIndex::new(dim, &test_config());
+        let exp_id = ExperienceId::new();
+        let embedding = make_embedding(3, dim);
+
+        arm_graph_insert_failure();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            index.insert_experience(exp_id, &embedding)
+        }));
+        assert!(
+            caught.is_err(),
+            "the armed hook must fail the graph insert, or this test proves nothing"
+        );
+
+        assert!(
+            !index.contains(exp_id),
+            "an id whose graph insert never returned must not be reported as present"
+        );
+        assert_eq!(
+            index.total_count(),
+            0,
+            "the failed insert must not have put a point in the graph"
+        );
+
+        // The retry: the failed attempt's claim on the id must not survive it.
+        index
+            .insert_experience(exp_id, &embedding)
+            .expect("the retry must not be refused by the failed attempt");
+        assert!(index.contains(exp_id), "the retry must publish the id");
+        assert_eq!(index.total_count(), 1, "exactly one point for the id");
+        let hits = index.search_experiences(&embedding, 5, 50).unwrap();
+        assert!(
+            hits.iter().any(|(hit, _)| *hit == exp_id),
+            "the retry must make the id findable, not merely present"
+        );
+    }
+
+    #[test]
+    fn pending_delete_does_not_reduce_published_search_budget() {
+        let index = HnswIndex::new(4, &test_config());
+        let live = ExperienceId::new();
+        index
+            .insert_experience(live, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let pending = ExperienceId::new();
+        index.claim_for_test(pending);
+        index.delete_experience(pending).unwrap();
+        assert_eq!(
+            index.active_count(),
+            1,
+            "a deleted pending claim is not a deleted published point"
+        );
+        let hits = index
+            .search_experiences(&[1.0, 0.0, 0.0, 0.0], 1, 50)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, live);
+        let allowed = HashSet::from([live, pending]);
+        assert_eq!(
+            index
+                .search_experiences_with_allowed(&[1.0, 0.0, 0.0, 0.0], 1, 50, Some(&allowed))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unmapped_graph_points_cannot_consume_mapped_top_k() {
+        // All 145 points fit in each one-layer neighborhood, avoiding random
+        // layer/neighbor pruning. The unpublished point is separated from all
+        // mapped points by cosine distance 1, so raw k=1 has a unique answer.
+        let config = HnswConfig {
+            max_nb_connection: 200,
+            max_layer: 1,
+            ef_construction: 200,
+            ..test_config()
+        };
+        let index = HnswIndex::new(4, &config);
+        let mut ids = Vec::new();
+        for i in 0..(BRUTE_FORCE_THRESHOLD + 16) {
+            let id = ExperienceId::new();
+            index
+                .insert_experience(id, &[0.0, 1.0, i as f32 / 144.0, 0.0])
+                .unwrap();
+            ids.push(id);
+        }
+        let pending = ExperienceId::new();
+        let internal = index.claim_for_test(pending);
+        let query = [1.0, 0.0, 0.0, 0.0];
+        // Exactly the graph-insert-before-mapping-publication window.
+        index.hnsw.insert((&query, internal));
+        let raw = VectorIndex::search(&index, &query, 1, 200).unwrap();
+        assert_eq!(
+            raw[0].0, internal,
+            "raw-ID searches must still see raw graph points"
+        );
+        let mapped = index.search_experiences(&query, 1, 200).unwrap();
+        assert_eq!(
+            mapped.len(),
+            1,
+            "an unmapped closest point must not consume mapped k=1"
+        );
+        assert!(ids.contains(&mapped[0].0));
+        assert_eq!(index.search_experiences(&query, 4, 200).unwrap().len(), 4);
+        let full = index.search_experiences(&query, ids.len(), 200).unwrap();
+        assert_eq!(full.len(), ids.len());
+        assert_eq!(
+            full.iter().map(|(id, _)| *id).collect::<HashSet<_>>(),
+            ids.iter().copied().collect()
+        );
+        index.delete_experience(ids[0]).unwrap();
+        assert_eq!(
+            index
+                .search_experiences(&query, ids.len(), 200)
+                .unwrap()
+                .len(),
+            ids.len() - 1
+        );
+        let allowed = HashSet::from([ids[0], ids[1], ids[2], pending]);
+        let hits = index
+            .search_experiences_with_allowed(&query, 4, 200, Some(&allowed))
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "budget counts only allowed, published, undeleted IDs"
+        );
+        assert!(hits.iter().all(|(id, _)| *id == ids[1] || *id == ids[2]));
+        assert_eq!(index.active_count(), ids.len() - 1);
+    }
+
+    #[test]
+    fn fragmented_graph_does_not_underfill_published_search_budget() {
+        // One layer fixes the entry point; four bottom-layer connections keep
+        // the five identical early points isolated from the later far cluster.
+        let config = HnswConfig {
+            max_nb_connection: 2,
+            max_layer: 1,
+            ..test_config()
+        };
+        let index = HnswIndex::new(4, &config);
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let mut ids = Vec::new();
+        for i in 0..(BRUTE_FORCE_THRESHOLD + 16) {
+            let id = ExperienceId::new();
+            let vector = if i < 5 {
+                query
+            } else {
+                [0.0, 1.0, i as f32 * 0.001, 0.0]
+            };
+            index.insert_experience(id, &vector).unwrap();
+            ids.push(id);
+        }
+        let raw = VectorIndex::search(&index, &query, 8, 200).unwrap();
+        assert_eq!(raw.len(), 5, "fixture must exercise a real ANN shortfall");
+        assert_eq!(index.search_experiences(&query, 8, 200).unwrap().len(), 8);
+        index.delete_experience(ids[0]).unwrap();
+        let allowed = HashSet::from([ids[0], ids[1], ids[2], ids[130], ids[131]]);
+        let hits = index
+            .search_experiences_with_allowed(&query, 8, 200, Some(&allowed))
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+        assert!(hits
+            .iter()
+            .all(|(id, _)| allowed.contains(id) && *id != ids[0]));
+    }
+
+    /// A delete that lands while an insert for the same id is in flight must
+    /// survive that insert.
+    ///
+    /// The delete finds no mapping (the insert has not published one yet), so
+    /// without the claim being consulted it marks nothing — and the insert that
+    /// finishes afterwards publishes the id as searchable, for a record the
+    /// store no longer has. The delete has to reach the pending internal id so
+    /// the publish lands already soft-deleted.
+    #[test]
+    fn a_delete_during_an_in_flight_insert_lands_soft_deleted() {
+        let index = HnswIndex::new(8, &test_config());
+        let exp_id = ExperienceId::new();
+
+        // The insert is in flight: claimed, not yet published.
+        let internal_id = index.claim_for_test(exp_id);
+        assert!(
+            !index.is_searchable(exp_id),
+            "a claim alone must not make an id searchable"
+        );
+
+        index.delete_experience(exp_id).unwrap();
+
+        assert!(
+            index.is_deleted(internal_id),
+            "the delete must mark the pending internal id, so the insert that \
+             finishes afterwards publishes an id that is already soft-deleted"
         );
     }
 }

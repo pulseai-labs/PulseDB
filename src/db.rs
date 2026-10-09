@@ -403,13 +403,15 @@ impl PulseDB {
         config.validate().map_err(PulseDBError::from)?;
 
         let storage = open_storage(&path, config)?;
-        let vectors = Self::load_all_indexes(&*storage, config)?;
+        let (vectors, collective_count) = Self::load_all_indexes(&*storage, config)?;
         let insight_vectors = Self::load_all_insight_indexes(&*storage, config)?;
 
         info!(
             dimension = config.embedding_dimension.size(),
             sync_mode = ?config.sync_mode,
-            collectives = vectors.len(),
+            collectives = collective_count,
+            experience_indexes = vectors.len(),
+            insight_indexes = insight_vectors.len(),
             "PulseDB opened successfully"
         );
 
@@ -863,7 +865,7 @@ impl PulseDB {
     fn load_all_indexes(
         storage: &dyn StorageEngine,
         config: &Config,
-    ) -> Result<HashMap<CollectiveId, HnswIndex>> {
+    ) -> Result<(HashMap<CollectiveId, HnswIndex>, usize)> {
         let collectives = storage.list_collectives()?;
         let mut vectors = HashMap::with_capacity(collectives.len());
 
@@ -887,6 +889,20 @@ impl PulseDB {
                 }
             }
 
+            if embeddings.is_empty() {
+                // No live embeddings remain; stale deleted marks must not
+                // survive a later synced re-create and crash before close.
+                if !config.read_only {
+                    if let Some(dir) = &hnsw_dir {
+                        if let Err(error) = HnswIndex::remove_files(dir, &collective.id.to_string())
+                        {
+                            warn!(collective = %collective.id, %error, "Failed to clean stale experience sidecar (non-fatal)");
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Try loading metadata (for deleted set and ID mappings)
             let metadata = hnsw_dir
                 .as_ref()
@@ -894,9 +910,7 @@ impl PulseDB {
                 .flatten();
 
             // Rebuild the HNSW graph from embeddings
-            let index = if embeddings.is_empty() {
-                HnswIndex::new(dimension, &config.hnsw)
-            } else {
+            let index = {
                 let start = std::time::Instant::now();
                 let idx = HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
                 info!(
@@ -908,7 +922,8 @@ impl PulseDB {
                 idx
             };
 
-            // Restore deleted set from metadata if available
+            // A mark for a durable row can represent a failed pending delete.
+            // Re-creates invalidate only their own persisted mark before saving.
             if let Some(meta) = metadata {
                 index.restore_deleted_set(&meta.deleted)?;
             }
@@ -916,7 +931,7 @@ impl PulseDB {
             vectors.insert(collective.id, index);
         }
 
-        Ok(vectors)
+        Ok((vectors, collectives.len()))
     }
 
     /// Loads or rebuilds insight HNSW indexes for all existing collectives.
@@ -952,6 +967,20 @@ impl PulseDB {
                 }
             }
 
+            if embeddings.is_empty() {
+                // Insight sidecars carry the same deleted-mark hazard.
+                if !config.read_only {
+                    if let Some(dir) = &hnsw_dir {
+                        if let Err(error) =
+                            HnswIndex::remove_files(dir, &format!("{}_insights", collective.id))
+                        {
+                            warn!(collective = %collective.id, %error, "Failed to clean stale insight sidecar (non-fatal)");
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Try loading metadata (for deleted set)
             let name = format!("{}_insights", collective.id);
             let metadata = hnsw_dir
@@ -960,9 +989,7 @@ impl PulseDB {
                 .flatten();
 
             // Rebuild HNSW graph from embeddings
-            let index = if embeddings.is_empty() {
-                HnswIndex::new(dimension, &config.hnsw)
-            } else {
+            let index = {
                 let start = std::time::Instant::now();
                 let idx = HnswIndex::rebuild_from_embeddings(dimension, &config.hnsw, embeddings)?;
                 info!(
@@ -974,7 +1001,7 @@ impl PulseDB {
                 idx
             };
 
-            // Restore deleted set from metadata if available
+            // Preserve pending-delete marks; a re-create clears only its mark.
             if let Some(meta) = metadata {
                 index.restore_deleted_set(&meta.deleted)?;
             }
@@ -1004,6 +1031,97 @@ impl PulseDB {
             Some(index) => Ok(Some(f(index)?)),
             None => Ok(None),
         }
+    }
+
+    /// Executes a closure with an existing insight index; never creates one.
+    #[doc(hidden)]
+    pub fn with_insight_vector_index<F, R>(
+        &self,
+        collective_id: CollectiveId,
+        f: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnOnce(&HnswIndex) -> Result<R>,
+    {
+        let indexes = self
+            .insight_vectors
+            .read()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        match indexes.get(&collective_id) {
+            Some(index) => Ok(Some(f(index)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Runs an indexed write after its storage transaction has committed.
+    /// Never call while the insight map is locked. The only storage access
+    /// under the write guard is the collective existence/dimension read.
+    fn with_or_create_vector_index<F, R>(&self, collective_id: CollectiveId, f: F) -> Result<R>
+    where
+        F: FnOnce(&HnswIndex) -> Result<R>,
+    {
+        {
+            let vectors = self
+                .vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+            if let Some(index) = vectors.get(&collective_id) {
+                return f(index);
+            }
+        }
+        let mut vectors = self
+            .vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = vectors.entry(collective_id) {
+            let collective = self
+                .storage
+                .get_collective(collective_id)?
+                .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+            entry.insert(HnswIndex::new(
+                collective.embedding_dimension as usize,
+                &self.config.hnsw,
+            ));
+            tracing::debug!(collective = %collective_id, index_kind = "experience", "Created HNSW index on first indexed write");
+        }
+        f(&vectors[&collective_id])
+    }
+
+    /// Insight counterpart of `with_or_create_vector_index`.
+    /// Never call while the experience map is locked or a storage write is open.
+    fn with_or_create_insight_vector_index<F, R>(
+        &self,
+        collective_id: CollectiveId,
+        f: F,
+    ) -> Result<R>
+    where
+        F: FnOnce(&HnswIndex) -> Result<R>,
+    {
+        {
+            let indexes = self
+                .insight_vectors
+                .read()
+                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+            if let Some(index) = indexes.get(&collective_id) {
+                return f(index);
+            }
+        }
+        let mut indexes = self
+            .insight_vectors
+            .write()
+            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = indexes.entry(collective_id) {
+            let collective = self
+                .storage
+                .get_collective(collective_id)?
+                .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+            entry.insert(HnswIndex::new(
+                collective.embedding_dimension as usize,
+                &self.config.hnsw,
+            ));
+            tracing::debug!(collective = %collective_id, index_kind = "insight", "Created HNSW index on first indexed write");
+        }
+        f(&indexes[&collective_id])
     }
 
     // =========================================================================
@@ -1075,18 +1193,6 @@ impl PulseDB {
         // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
 
-        // Create empty HNSW indexes for this collective
-        let exp_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        let insight_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        self.vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, exp_index);
-        self.insight_vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
-            .insert(id, insight_index);
-
         info!(id = %id, name = %name, "Collective created");
         Ok(id)
     }
@@ -1122,18 +1228,6 @@ impl PulseDB {
 
         // Persist to redb first (source of truth)
         self.storage.save_collective(&collective)?;
-
-        // Create empty HNSW indexes for this collective
-        let exp_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        let insight_index = HnswIndex::new(dimension as usize, &self.config.hnsw);
-        self.vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, exp_index);
-        self.insight_vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
-            .insert(id, insight_index);
 
         info!(id = %id, name = %name, owner = %owner_id, "Collective created with owner");
         Ok(id)
@@ -1377,13 +1471,9 @@ impl PulseDB {
         self.storage.save_experience(&experience)?;
 
         // Insert into HNSW index (derived structure)
-        let vectors = self
-            .vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-        if let Some(index) = vectors.get(&collective_id) {
-            index.insert_experience(id, &embedding_for_hnsw)?;
-        }
+        self.with_or_create_vector_index(collective_id, |index| {
+            index.insert_experience(id, &embedding_for_hnsw)
+        })?;
 
         // Emit watch event after both storage and HNSW succeed
         self.watch.emit(
@@ -2591,13 +2681,9 @@ impl PulseDB {
 
         // Insert into insight HNSW index (using InsightId→ExperienceId byte conversion)
         let exp_id = ExperienceId::from_bytes(*id.as_bytes());
-        let insight_vectors = self
-            .insight_vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-        if let Some(index) = insight_vectors.get(&insight.collective_id) {
-            index.insert_experience(exp_id, &embedding_for_hnsw)?;
-        }
+        self.with_or_create_insight_vector_index(insight.collective_id, |index| {
+            index.insert_experience(exp_id, &embedding_for_hnsw)
+        })?;
 
         info!(id = %id, "Insight stored");
         Ok(id)
@@ -3057,14 +3143,9 @@ impl PulseDB {
         let id = experience.id;
 
         self.storage.save_experience(&experience)?;
-        let vectors = self
-            .vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-        let index = vectors
-            .get(&collective_id)
-            .ok_or_else(|| PulseDBError::vector("HNSW index missing for collective"))?;
-        index.insert_experience(id, &embedding_for_hnsw)?;
+        self.with_or_create_vector_index(collective_id, |index| {
+            index.insert_experience(id, &embedding_for_hnsw)
+        })?;
 
         Ok(id)
     }
@@ -3377,12 +3458,116 @@ impl PulseDB {
 
     /// Applies a synced experience from a remote peer.
     ///
+    /// Repairs a synced experience's index entry from redb, so an acknowledged
+    /// create is one search can find (#96).
+    ///
+    /// Returns `Ok(true)` when the index was repaired — an entry inserted, or a
+    /// soft-delete mark cleared — and `Ok(false)` when the id was already
+    /// searchable and nothing was needed.
+    ///
+    /// # The repair reads redb, never the payload
+    ///
+    /// The vector comes from `storage.get_embedding(id)`, not from the copy the
+    /// sync change carried. redb is the only durable truth (ADR-001) and the
+    /// index is derived from it, so the repair must reproduce what a reopen
+    /// would rebuild rather than what a peer claims about an id.
+    ///
+    /// # "Searchable" has two halves
+    ///
+    /// A mapped id can still be unsearchable: a create arriving after a local
+    /// delete finds its id mapped but soft-deleted, and inserting it again is a
+    /// no-op. That case clears the mark instead — the graph point already
+    /// carries this id's embedding, and experience embeddings are immutable per
+    /// id, so there is nothing to re-insert.
+    ///
+    /// # Errors, each of which repeats on every sync
+    ///
+    /// - the record is absent from redb;
+    /// - the collective has disappeared before its derived index is created;
+    /// - the record has no usable stored embedding: a **store-consistency
+    ///   violation**, because a record and its embedding commit in one
+    ///   transaction, so this state can only mean the store was altered outside
+    ///   PulseDB. It is never a silent pass (C6), and it repeats on every sync
+    ///   until the record is removed.
+    ///
+    /// None of them is acknowledged, so the peer keeps re-offering the change
+    /// instead of compacting past it.
+    #[cfg(feature = "sync")]
+    pub(crate) fn ensure_synced_experience_indexed(&self, id: ExperienceId) -> Result<bool> {
+        self.make_synced_experience_searchable(id, true)
+    }
+
+    /// The one implementation behind
+    /// [`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed).
+    ///
+    /// `repairing` says whether the record pre-existed the change being applied
+    /// (the applier's repair path) or was written moments ago by the caller
+    /// ([`apply_synced_experience`](Self::apply_synced_experience)). The work is
+    /// identical — the entry is always built from redb — but only the first is
+    /// a repair, and only a repair is worth a `warn!`: warning on every synced
+    /// create would say "repaired" about work that was never broken.
+    #[cfg(feature = "sync")]
+    fn make_synced_experience_searchable(&self, id: ExperienceId, repairing: bool) -> Result<bool> {
+        let experience = self.storage.get_experience(id)?.ok_or_else(|| {
+            PulseDBError::vector(format!(
+                "cannot make experience {id} searchable: the record is not in the store"
+            ))
+        })?;
+        let collective_id = experience.collective_id;
+
+        // Checked before the early return: a record whose embedding is missing
+        // is a broken store, and acknowledging it would hide that.
+        let embedding = self.storage.get_embedding(id)?.filter(|e| !e.is_empty());
+        let Some(embedding) = embedding else {
+            return Err(PulseDBError::vector(format!(
+                "store-consistency violation: experience {id} has no stored embedding \
+                 (absent or empty), so its index entry cannot be built; a record and \
+                 its embedding commit in one transaction, so the store was altered \
+                 outside PulseDB. This repeats on every sync until the record is removed"
+            )));
+        };
+
+        self.with_or_create_vector_index(collective_id, |index| {
+            if index.is_searchable(id) {
+                return Ok(false);
+            }
+
+            if !index.clear_deleted_mark(id)? {
+                index.insert_experience(id, &embedding)?;
+            }
+
+            // Prove it before reporting it (grill A1: acknowledge only once the id
+            // is searchable). An insert that joins another thread's in-flight claim
+            // returns without adding a point, and a concurrent delete can re-mark
+            // the id between the two steps above — so "we did something" is not the
+            // same as "search can find it now", and this call must not report a
+            // repair it did not achieve. The change stays unacknowledged and the
+            // next sync retries.
+            if !index.is_searchable(id) {
+                return Err(PulseDBError::vector(format!(
+                    "experience {id} is not searchable after the repair: its index entry is \
+                 not yet searchable (an insert for this id is still in flight, or the id \
+                 was deleted again); the change is not acknowledged and the next sync retries"
+                )));
+            }
+
+            if repairing {
+                tracing::warn!(
+                    id = %id,
+                    collective_id = %collective_id,
+                    "repaired missing index entry from redb"
+                );
+            }
+            Ok(true)
+        })
+    }
+
     /// Writes the full experience to storage and inserts into HNSW.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
     ///
     /// # Ordering, and what it does and does not guarantee (#96)
     ///
-    /// The embedding is checked against the collective's vector index BEFORE
+    /// The embedding is checked against the collective's stored dimension BEFORE
     /// anything is written. That is what closes the case this method was
     /// corrupting the store with: `Experience::embedding` is `#[serde(skip)]`,
     /// so a create crossing a serializing transport arrives with a zero-length
@@ -3394,13 +3579,16 @@ impl PulseDB {
     /// This is NOT atomicity. There is no transaction spanning the storage
     /// write and the in-memory HNSW index, so what remains possible is:
     ///
-    /// - the insert can still fail AFTER the record is saved — the state lock
-    ///   can be poisoned, or the collective's index can be replaced between the
-    ///   check and the insert — and nothing undoes the save. The error says so
-    ///   and is logged at `error!`; the row is left with no vector.
-    /// - a collective with no index yet takes the record with no vector at all,
-    ///   which is the long-standing behaviour of the `if let Some(index)` arm
-    ///   and is unchanged here.
+    /// - the index step can still fail AFTER the record is saved — the state
+    ///   lock can be poisoned, the collective's index can be replaced between
+    ///   the check and the insert, or the record can be left without a stored
+    ///   embedding — and nothing undoes the save. The error says so and is
+    ///   logged at `error!`; the row is left with no vector, and the next sync
+    ///   of the same create repairs it from redb rather than skipping it
+    ///   ([`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed)).
+    /// - a collective with no index gets one on the first indexed write. Its
+    ///   existence is re-checked under the map write guard; if it disappeared
+    ///   after the save, indexing fails and the change is not acknowledged.
     ///
     /// A genuine all-or-nothing apply needs a storage transaction that spans
     /// the record and the vector index (or a create-if-absent storage primitive
@@ -3415,41 +3603,53 @@ impl PulseDB {
         let id = experience.id;
         let embedding = experience.embedding.clone();
 
-        // Reject BEFORE the write: an embedding this index cannot take must
-        // leave no record, no secondary index entry and no WAL event behind.
-        {
-            let vectors = self
-                .vectors
-                .read()
-                .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-            if let Some(index) = vectors.get(&collective_id) {
-                index.validate_embedding(&embedding)?;
-            }
+        // Validate from durable collective metadata before saving or allocating.
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+        let dimension = collective.embedding_dimension as usize;
+        if embedding.len() != dimension {
+            return Err(PulseDBError::vector(format!(
+                "Embedding dimension mismatch: expected {}, got {}",
+                dimension,
+                embedding.len()
+            )));
         }
 
+        // Clear only this absent row's stale sidecar mark BEFORE committing its
+        // re-create. A failure leaves the row absent and the change unacknowledged;
+        // a crash after the save cannot reapply an old mark. Serialize sidecar
+        // edits with the existing map guard so concurrent re-creates keep each
+        // other's removals. Never clear marks for rows still awaiting deletion.
+        if self.storage.get_experience(id)?.is_none() {
+            if let Some(dir) = self.hnsw_dir() {
+                let _guard = self
+                    .vectors
+                    .write()
+                    .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
+                HnswIndex::clear_persisted_deleted_mark(&dir, &collective_id.to_string(), id)?;
+            }
+        }
         self.storage.save_experience(&experience)?;
 
-        // Insert into HNSW index
-        let vectors = self
-            .vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?;
-        if let Some(index) = vectors.get(&collective_id) {
-            if let Err(e) = index.insert_experience(id, &embedding) {
-                // The record is already committed and nothing here can take it
-                // back safely, so say plainly what was left behind rather than
-                // returning a bare index error.
-                tracing::error!(
-                    id = %id,
-                    collective_id = %collective_id,
-                    "Synced experience saved but NOT indexed; the record has no \
-                     vector and is not searchable: {e}"
-                );
-                return Err(PulseDBError::vector(format!(
-                    "experience {id} was saved but could not be indexed, so the \
-                     record remains without a vector and is not searchable: {e}"
-                )));
-            }
+        // Finish through the same make-searchable step the repair path uses, so
+        // a create whose id is mapped but soft-deleted becomes searchable
+        // instead of silently no-opping on the index insert.
+        if let Err(e) = self.make_synced_experience_searchable(id, false) {
+            // The record is already committed and nothing here can take it
+            // back safely, so say plainly what was left behind rather than
+            // returning a bare index error.
+            tracing::error!(
+                id = %id,
+                collective_id = %collective_id,
+                "Synced experience saved but NOT indexed; the record has no \
+                 vector and is not searchable: {e}"
+            );
+            return Err(PulseDBError::vector(format!(
+                "experience {id} was saved but could not be indexed, so the \
+                 record remains without a vector and is not searchable: {e}"
+            )));
         }
 
         debug!(id = %id, "Synced experience applied");
@@ -3576,6 +3776,82 @@ impl PulseDB {
         Ok(())
     }
 
+    /// Repairs a synced insight's index entry from redb — insight parity for
+    /// the #96 residual.
+    ///
+    /// The insight half of
+    /// [`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed),
+    /// with one difference: `DerivedInsight::embedding` is stored **inline**,
+    /// so the repair reads the stored insight's own vector rather than the
+    /// embeddings table. It is still the stored copy that is used, never the
+    /// one the sync change carried, and the insight index is keyed by the
+    /// insight id reinterpreted as an [`ExperienceId`] (byte conversion), which
+    /// is the same key `apply_synced_insight` inserts under.
+    ///
+    /// Errors are the same set, and repeat the same way: absent record, no
+    /// index for the collective, or a stored insight with no usable embedding —
+    /// the last a store-consistency violation that is never a silent pass.
+    #[cfg(feature = "sync")]
+    pub(crate) fn ensure_synced_insight_indexed(&self, id: InsightId) -> Result<bool> {
+        self.make_synced_insight_searchable(id, true)
+    }
+
+    /// The one implementation behind
+    /// [`ensure_synced_insight_indexed`](Self::ensure_synced_insight_indexed);
+    /// `repairing` carries the same meaning as it does for experiences.
+    #[cfg(feature = "sync")]
+    fn make_synced_insight_searchable(&self, id: InsightId, repairing: bool) -> Result<bool> {
+        let insight = self.storage.get_insight(id)?.ok_or_else(|| {
+            PulseDBError::vector(format!(
+                "cannot make insight {id} searchable: the record is not in the store"
+            ))
+        })?;
+        let collective_id = insight.collective_id;
+        // Insight HNSW keys insights by their id reinterpreted as an
+        // ExperienceId (byte conversion) — see `apply_synced_insight`.
+        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
+
+        // Checked before the early return, for the reason given on the
+        // experience path: an unindexable record is a broken store, and
+        // acknowledging it would hide that.
+        if insight.embedding.is_empty() {
+            return Err(PulseDBError::vector(format!(
+                "store-consistency violation: insight {id} has no stored embedding \
+                 (absent or empty), so its index entry cannot be built; a record and \
+                 its embedding commit in one transaction, so the store was altered \
+                 outside PulseDB. This repeats on every sync until the record is removed"
+            )));
+        }
+
+        self.with_or_create_insight_vector_index(collective_id, |index| {
+            if index.is_searchable(exp_id) {
+                return Ok(false);
+            }
+
+            if !index.clear_deleted_mark(exp_id)? {
+                index.insert_experience(exp_id, &insight.embedding)?;
+            }
+
+            // Same proof step as the experience path, and for the same reason.
+            if !index.is_searchable(exp_id) {
+                return Err(PulseDBError::vector(format!(
+                    "insight {id} is not searchable after the repair: its index entry is \
+                 not yet searchable (an insert for this id is still in flight, or the id \
+                 was deleted again); the change is not acknowledged and the next sync retries"
+                )));
+            }
+
+            if repairing {
+                tracing::warn!(
+                    id = %id,
+                    collective_id = %collective_id,
+                    "repaired missing index entry from redb"
+                );
+            }
+            Ok(true)
+        })
+    }
+
     /// Applies a synced insight from a remote peer.
     ///
     /// Writes to storage and inserts into insight HNSW index.
@@ -3583,54 +3859,69 @@ impl PulseDB {
     ///
     /// Same save-then-index shape, and the same limits, as
     /// [`apply_synced_experience`](Self::apply_synced_experience): the
-    /// embedding is checked against the insight index before anything is
-    /// written, and an insert that fails after the save is reported and logged
+    /// embedding is checked against the stored collective dimension before
+    /// anything is written, and an absent insight index is created after the
+    /// save. An index step that fails after the save is reported and logged
     /// rather than undone.
     ///
     /// Unlike `Experience::embedding`, `DerivedInsight::embedding` is stored
     /// inline and IS serialized, so this path does not meet #96's zero-length
     /// vector on the wire. The ordering is still what stops a dimension
     /// mismatch from any other source leaving a record behind with no vector.
+    ///
+    /// After the save, the record is made searchable through
+    /// [`ensure_synced_insight_indexed`](Self::ensure_synced_insight_indexed)'s
+    /// step — the entry is built from the stored insight, and a mapped but
+    /// soft-deleted id has its mark cleared rather than no-opping. That is what
+    /// lets a later sync repair a row this call left without an index entry.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_insight(&self, insight: DerivedInsight) -> Result<()> {
         let id = insight.id;
         let collective_id = insight.collective_id;
         let embedding = insight.embedding.clone();
-        // Insight HNSW keys insights by their id reinterpreted as an
-        // ExperienceId (byte conversion).
-        let exp_id = ExperienceId::from_bytes(*id.as_bytes());
 
-        // Reject BEFORE the write — see `apply_synced_experience`.
-        {
-            let insight_vectors = self
-                .insight_vectors
-                .read()
-                .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-            if let Some(index) = insight_vectors.get(&collective_id) {
-                index.validate_embedding(&embedding)?;
-            }
+        let collective = self
+            .storage
+            .get_collective(collective_id)?
+            .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
+        let dimension = collective.embedding_dimension as usize;
+        if embedding.len() != dimension {
+            return Err(PulseDBError::vector(format!(
+                "Embedding dimension mismatch: expected {}, got {}",
+                dimension,
+                embedding.len()
+            )));
         }
 
+        if self.storage.get_insight(id)?.is_none() {
+            if let Some(dir) = self.hnsw_dir() {
+                let _guard = self
+                    .insight_vectors
+                    .write()
+                    .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
+                HnswIndex::clear_persisted_deleted_mark(
+                    &dir,
+                    &format!("{collective_id}_insights"),
+                    ExperienceId::from_bytes(*id.as_bytes()),
+                )?;
+            }
+        }
         self.storage.save_insight(&insight)?;
 
-        let insight_vectors = self
-            .insight_vectors
-            .read()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?;
-        if let Some(index) = insight_vectors.get(&collective_id) {
-            if let Err(e) = index.insert_experience(exp_id, &embedding) {
-                tracing::error!(
-                    id = %id,
-                    collective_id = %collective_id,
-                    "Synced insight saved but NOT indexed; the record has no \
-                     vector and is not searchable: {e}"
-                );
-                return Err(PulseDBError::vector(format!(
-                    "insight {id} was saved but could not be indexed, so the \
-                     record remains without a vector and is not searchable: {e}"
-                )));
-            }
+        // Same make-searchable step as the experience path, including the
+        // soft-deleted case.
+        if let Err(e) = self.make_synced_insight_searchable(id, false) {
+            tracing::error!(
+                id = %id,
+                collective_id = %collective_id,
+                "Synced insight saved but NOT indexed; the record has no \
+                 vector and is not searchable: {e}"
+            );
+            return Err(PulseDBError::vector(format!(
+                "insight {id} was saved but could not be indexed, so the \
+                 record remains without a vector and is not searchable: {e}"
+            )));
         }
 
         debug!(id = %id, "Synced insight applied");
@@ -3671,27 +3962,14 @@ impl PulseDB {
 
     /// Applies a synced collective from a remote peer.
     ///
-    /// Writes to storage and creates HNSW indexes for the collective.
+    /// Writes to storage; derived indexes are created by the first indexed write.
     /// Caller must hold `SyncApplyGuard` to suppress WAL recording.
     #[cfg(feature = "sync")]
     #[allow(dead_code)] // Called by sync applier (Phase 3)
     pub fn apply_synced_collective(&self, collective: Collective) -> Result<()> {
         let id = collective.id;
-        let dimension = collective.embedding_dimension as usize;
 
         self.storage.save_collective(&collective)?;
-
-        // Create HNSW indexes (same as create_collective)
-        let exp_index = crate::vector::HnswIndex::new(dimension, &self.config.hnsw);
-        let insight_index = crate::vector::HnswIndex::new(dimension, &self.config.hnsw);
-        self.vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Vectors lock poisoned"))?
-            .insert(id, exp_index);
-        self.insight_vectors
-            .write()
-            .map_err(|_| PulseDBError::vector("Insight vectors lock poisoned"))?
-            .insert(id, insight_index);
 
         debug!(id = %id, "Synced collective applied");
         Ok(())
@@ -5348,5 +5626,730 @@ mod provider_identity_persistence {
             ),
         }
         db.close().unwrap();
+    }
+}
+
+/// Tests for the synced-create index repair (#96 residual, r1.s5.w3).
+///
+/// Both live here rather than in an integration test because the repair entry
+/// points are `pub(crate)`: the crate's own tests are the only place that can
+/// call `ensure_synced_experience_indexed` and read the error it returns.
+#[cfg(all(test, feature = "sync"))]
+mod synced_index_repair_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn exp_in(cid: CollectiveId) -> NewExperience {
+        NewExperience {
+            collective_id: cid,
+            content: "record with an embedding".to_string(),
+            embedding: Some(vec![0.1f32; 384]),
+            ..Default::default()
+        }
+    }
+
+    // Omitting sidecar cleanup on the empty-open path must fail these tests:
+    // a stale deleted mark would hide an acknowledged re-create after a crash.
+    fn apply_recreated(
+        db: Arc<PulseDB>,
+        cid: CollectiveId,
+        payload: crate::sync::types::SyncPayload,
+    ) {
+        use crate::sync::applier::RemoteChangeApplier;
+        use crate::sync::config::SyncConfig;
+        use crate::sync::types::{InstanceId, SyncChange, SyncEntityType, SyncPayload};
+
+        let entity_type = match &payload {
+            SyncPayload::ExperienceCreated(_) => SyncEntityType::Experience,
+            SyncPayload::InsightCreated(_) => SyncEntityType::Insight,
+            _ => unreachable!(),
+        };
+        let result = RemoteChangeApplier::new(db, SyncConfig::default())
+            .apply_batch(vec![SyncChange {
+                sequence: 1,
+                source_instance: InstanceId::new(),
+                collective_id: cid,
+                entity_type,
+                payload,
+                timestamp: Timestamp::now(),
+            }])
+            .unwrap();
+        assert_eq!(result.applied, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(
+            result.safe_through,
+            Some(1),
+            "the re-create is acknowledged"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_of_emptied_collective_cannot_hide_resynced_experience() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-experience-sidecar").unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        let record = db.get_experience(id).unwrap().unwrap();
+        db.delete_experience(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_experience(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::ExperienceCreated(record.into()),
+        );
+        assert!(db
+            .search_similar(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.experience.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_experience(id).unwrap().is_some());
+        assert!(
+            db.search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.experience.id == id),
+            "a stale sidecar must not hide the acknowledged experience"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_of_emptied_collective_cannot_hide_resynced_insight() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-insight-sidecar").unwrap();
+        let source = db.record_experience(exp_in(cid)).unwrap();
+        let id = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "insight with an embedding".to_string(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        let record = db.get_insight(id).unwrap().unwrap();
+        db.delete_insight(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_insight(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::InsightCreated(record),
+        );
+        assert!(db
+            .get_insights(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|(hit, _)| hit.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(
+            db.get_insights(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|(hit, _)| hit.id == id),
+            "a stale sidecar must not hide the acknowledged insight"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_of_populated_collective_cannot_hide_resynced_experience() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-experience-sidecar").unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        let record = db.get_experience(id).unwrap().unwrap();
+        let pending = db.record_experience(exp_in(cid)).unwrap();
+        crate::storage::redb::fail_next_delete_for_test("experience");
+        assert!(db.apply_synced_experience_delete(pending).is_err());
+        db.delete_experience(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_experience(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::ExperienceCreated(record.into()),
+        );
+        assert!(db
+            .search_similar(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.experience.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_experience(id).unwrap().is_some());
+        assert!(db.get_experience(pending).unwrap().is_some());
+        assert!(
+            !db.search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|h| h.experience.id == pending),
+            "re-creating one id must retain another row's pending-delete mark"
+        );
+        assert!(
+            db.search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.experience.id == id),
+            "a stale sidecar must not hide the acknowledged experience"
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_of_populated_collective_cannot_hide_resynced_insight() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("stale-insight-sidecar").unwrap();
+        let source = db.record_experience(exp_in(cid)).unwrap();
+        let id = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "insight with an embedding".to_string(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        let record = db.get_insight(id).unwrap().unwrap();
+        let pending = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "surviving insight".to_string(),
+                embedding: Some(vec![0.2; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        crate::storage::redb::fail_next_delete_for_test("insight");
+        assert!(db.apply_synced_insight_delete(pending).is_err());
+        db.delete_insight(id).unwrap();
+        db.close().unwrap(); // Persist the deleted mark for X.
+
+        let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+        assert!(db.get_insight(id).unwrap().is_none());
+        apply_recreated(
+            Arc::clone(&db),
+            cid,
+            crate::sync::types::SyncPayload::InsightCreated(record),
+        );
+        assert!(db
+            .get_insights(cid, &vec![0.1; 384], 5)
+            .unwrap()
+            .iter()
+            .any(|(hit, _)| hit.id == id));
+        drop(db); // Crash-shaped: no close(), so no new sidecar is written.
+
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(db.get_insight(pending).unwrap().is_some());
+        assert!(
+            !db.get_insights(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|(h, _)| h.id == pending),
+            "re-creating one insight must retain another row's pending-delete mark"
+        );
+        assert!(
+            db.get_insights(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .iter()
+                .any(|(hit, _)| hit.id == id),
+            "a stale sidecar must not hide the acknowledged insight"
+        );
+    }
+
+    #[test]
+    fn empty_sidecars_preserved_on_read_only_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("read-only").unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        db.delete_experience(id).unwrap();
+        db.close().unwrap();
+        let sidecars = dir.path().join("test.db.hnsw");
+        let exp_meta = sidecars.join(format!("{cid}.hnsw.meta"));
+        let insight_meta = sidecars.join(format!("{cid}_insights.hnsw.meta"));
+        std::fs::copy(&exp_meta, &insight_meta).unwrap();
+        let before = std::fs::read(&exp_meta).unwrap();
+        let db = PulseDB::open(
+            &path,
+            Config {
+                read_only: true,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&exp_meta).unwrap(), before);
+        assert_eq!(std::fs::read(&insight_meta).unwrap(), before);
+        drop(db);
+    }
+
+    #[test]
+    fn empty_sidecar_cleanup_failure_does_not_prevent_writable_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("cleanup-failure").unwrap();
+        db.close().unwrap();
+        let sidecars = dir.path().join("test.db.hnsw");
+        std::fs::create_dir_all(&sidecars).unwrap();
+        // A directory at each metadata path makes remove_file fail on all OSes.
+        for name in [cid.to_string(), format!("{cid}_insights")] {
+            std::fs::create_dir(sidecars.join(format!("{name}.hnsw.meta"))).unwrap();
+        }
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let id = db.record_experience(exp_in(cid)).unwrap();
+        assert!(db
+            .search_similar(cid, &vec![0.1; 384], 1)
+            .unwrap()
+            .iter()
+            .any(|h| h.experience.id == id));
+    }
+
+    #[test]
+    fn populated_sidecar_invalid_deleted_uuid_remains_an_error() {
+        for insight in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            let cid = db.create_collective("corrupt-mark").unwrap();
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            db.store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "insight".to_string(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+            db.close().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            let meta_path = dir
+                .path()
+                .join("test.db.hnsw")
+                .join(format!("{name}.hnsw.meta"));
+            let mut meta: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            meta["deleted"] = serde_json::json!(["not-a-uuid"]);
+            std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            let error =
+                PulseDB::open(&path, Config::default()).expect_err("invalid mark must fail open");
+            assert!(error.to_string().contains("Invalid UUID in deleted set"));
+        }
+    }
+
+    #[test]
+    fn nf02_pending_experience_delete_stays_excluded_after_reopen() {
+        for boundary in ["relations", "experience"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            let cid = db.create_collective("pending-experience-delete").unwrap();
+            let id = db.record_experience(exp_in(cid)).unwrap();
+            crate::storage::redb::fail_next_delete_for_test(boundary);
+            let error = db.apply_synced_experience_delete(id).unwrap_err();
+            assert!(error.to_string().contains("injected"));
+            assert!(db.get_experience(id).unwrap().is_some());
+            assert!(db
+                .search_similar(cid, &vec![0.1; 384], 5)
+                .unwrap()
+                .is_empty());
+            db.with_vector_index(cid, |index| {
+                index.save_to_dir(&db.hnsw_dir().unwrap(), &cid.to_string())
+            })
+            .unwrap()
+            .unwrap();
+            drop(db); // Crash-shaped: keep the persisted mark without close().
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            assert!(db.get_experience(id).unwrap().is_some());
+            assert!(db.search_similar(cid, &vec![0.1; 384], 5).unwrap().is_empty(),
+                "a durable experience still awaiting {boundary} deletion must stay excluded after reopen");
+            db.apply_synced_experience_delete(id).unwrap();
+            assert!(db.get_experience(id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn nf02_pending_insight_delete_stays_excluded_after_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        let cid = db.create_collective("pending-insight-delete").unwrap();
+        let source = db.record_experience(exp_in(cid)).unwrap();
+        let id = db
+            .store_insight(NewDerivedInsight {
+                collective_id: cid,
+                content: "pending insight".into(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            })
+            .unwrap();
+        crate::storage::redb::fail_next_delete_for_test("insight");
+        let error = db.apply_synced_insight_delete(id).unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(db.get_insights(cid, &vec![0.1; 384], 5).unwrap().is_empty());
+        db.with_insight_vector_index(cid, |index| {
+            index.save_to_dir(&db.hnsw_dir().unwrap(), &format!("{cid}_insights"))
+        })
+        .unwrap()
+        .unwrap();
+        drop(db); // Crash-shaped after the failed row deletion.
+        let db = PulseDB::open(&path, Config::default()).unwrap();
+        assert!(db.get_insight(id).unwrap().is_some());
+        assert!(
+            db.get_insights(cid, &vec![0.1; 384], 5).unwrap().is_empty(),
+            "a durable insight still awaiting deletion must stay excluded after reopen"
+        );
+        db.apply_synced_insight_delete(id).unwrap();
+        assert!(db.get_insight(id).unwrap().is_none());
+    }
+
+    // Open ignores an unparseable sidecar, so a create must not refuse on it.
+    #[test]
+    fn nf08_torn_sidecar_does_not_block_synced_create() {
+        for (insight, torn) in [(false, true), (true, true), (false, false), (true, false)] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let db = PulseDB::open(&path, Config::default()).unwrap();
+            let cid = db.create_collective("torn-sidecar").unwrap();
+            let new_insight = |source| NewDerivedInsight {
+                collective_id: cid,
+                content: "insight".into(),
+                embedding: Some(vec![0.1; 384]),
+                source_experience_ids: vec![source],
+                insight_type: crate::insight::InsightType::Pattern,
+                confidence: 0.9,
+                domain: vec![],
+            };
+            let kept = db.record_experience(exp_in(cid)).unwrap();
+            db.store_insight(new_insight(kept)).unwrap(); // Keep both kinds populated.
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            let iid = db.store_insight(new_insight(source)).unwrap();
+            let exp = db.get_experience(source).unwrap().unwrap();
+            let record = db.get_insight(iid).unwrap().unwrap();
+            if insight {
+                db.delete_insight(iid).unwrap();
+            } else {
+                db.delete_experience(source).unwrap();
+            }
+            db.close().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            let meta_path = dir
+                .path()
+                .join("test.db.hnsw")
+                .join(format!("{name}.hnsw.meta"));
+            if torn {
+                let bytes = std::fs::read(&meta_path).unwrap();
+                std::fs::write(&meta_path, &bytes[..bytes.len() / 2]).unwrap();
+                assert!(HnswIndex::load_metadata(meta_path.parent().unwrap(), &name).is_err());
+            }
+
+            let db = Arc::new(PulseDB::open(&path, Config::default()).unwrap());
+            let payload = if insight {
+                assert!(db.get_insight(iid).unwrap().is_none());
+                crate::sync::types::SyncPayload::InsightCreated(record)
+            } else {
+                assert!(db.get_experience(source).unwrap().is_none());
+                crate::sync::types::SyncPayload::ExperienceCreated(exp.into())
+            };
+            apply_recreated(Arc::clone(&db), cid, payload);
+            if insight {
+                assert!(db
+                    .get_insights(cid, &vec![0.1; 384], 5)
+                    .unwrap()
+                    .iter()
+                    .any(|(hit, _)| hit.id == iid));
+            } else {
+                assert!(db
+                    .search_similar(cid, &vec![0.1; 384], 5)
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.experience.id == source));
+            }
+        }
+    }
+
+    // A read error may be transient: the stale mark may be readable at the
+    // next open, so the create must refuse rather than save unrepaired.
+    #[test]
+    fn nf11_unreadable_sidecar_refuses_synced_create() {
+        use crate::sync::applier::RemoteChangeApplier;
+        use crate::sync::config::SyncConfig;
+        use crate::sync::types::{InstanceId, SyncChange, SyncEntityType, SyncPayload};
+        for insight in [false, true] {
+            let dir = tempdir().unwrap();
+            let db =
+                Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap());
+            let cid = db.create_collective("unreadable-sidecar").unwrap();
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            let exp = db.get_experience(source).unwrap().unwrap();
+            let iid = db
+                .store_insight(NewDerivedInsight {
+                    collective_id: cid,
+                    content: "insight".into(),
+                    embedding: Some(vec![0.1; 384]),
+                    source_experience_ids: vec![source],
+                    insight_type: crate::insight::InsightType::Pattern,
+                    confidence: 0.9,
+                    domain: vec![],
+                })
+                .unwrap();
+            let record = db.get_insight(iid).unwrap().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            if insight {
+                db.delete_insight(iid).unwrap();
+            } else {
+                db.delete_experience(source).unwrap();
+            }
+            // A directory at the sidecar path fails the read on every platform.
+            let meta_path = db.hnsw_dir().unwrap().join(format!("{name}.hnsw.meta"));
+            let _ = std::fs::remove_file(&meta_path);
+            std::fs::create_dir_all(&meta_path).unwrap();
+            let payload = if insight {
+                SyncPayload::InsightCreated(record)
+            } else {
+                SyncPayload::ExperienceCreated(exp.into())
+            };
+            let result = RemoteChangeApplier::new(db.clone(), SyncConfig::default())
+                .apply_batch(vec![SyncChange {
+                    sequence: 1,
+                    source_instance: InstanceId::new(),
+                    collective_id: cid,
+                    entity_type: if insight {
+                        SyncEntityType::Insight
+                    } else {
+                        SyncEntityType::Experience
+                    },
+                    payload,
+                    timestamp: Timestamp::now(),
+                }])
+                .unwrap();
+            assert_eq!(result.applied, 0);
+            assert_eq!(result.failed, 1);
+            assert_eq!(
+                result.safe_through, None,
+                "an unreadable sidecar must not let the re-create be acknowledged"
+            );
+            if insight {
+                assert!(db.get_insight(iid).unwrap().is_none());
+            } else {
+                assert!(db.get_experience(source).unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn stale_mark_corruption_refuses_recreate_before_durable_save() {
+        use crate::sync::applier::RemoteChangeApplier;
+        use crate::sync::config::SyncConfig;
+        use crate::sync::types::{InstanceId, SyncChange, SyncEntityType, SyncPayload};
+        for insight in [false, true] {
+            let dir = tempdir().unwrap();
+            let db =
+                Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap());
+            let cid = db.create_collective("corrupt-recreate-mark").unwrap();
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            let exp = db.get_experience(source).unwrap().unwrap();
+            let iid = db
+                .store_insight(NewDerivedInsight {
+                    collective_id: cid,
+                    content: "insight".into(),
+                    embedding: Some(vec![0.1; 384]),
+                    source_experience_ids: vec![source],
+                    insight_type: crate::insight::InsightType::Pattern,
+                    confidence: 0.9,
+                    domain: vec![],
+                })
+                .unwrap();
+            let record = db.get_insight(iid).unwrap().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            let sidecars = db.hnsw_dir().unwrap();
+            if insight {
+                db.with_insight_vector_index(cid, |index| index.save_to_dir(&sidecars, &name))
+                    .unwrap()
+                    .unwrap();
+                db.delete_insight(iid).unwrap();
+            } else {
+                db.with_vector_index(cid, |index| index.save_to_dir(&sidecars, &name))
+                    .unwrap()
+                    .unwrap();
+                db.delete_experience(source).unwrap();
+            }
+            let meta_path = sidecars.join(format!("{name}.hnsw.meta"));
+            let mut meta: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            meta["deleted"] = serde_json::json!(["invalid-mark"]);
+            std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            let payload = if insight {
+                SyncPayload::InsightCreated(record)
+            } else {
+                SyncPayload::ExperienceCreated(exp.into())
+            };
+            let result = RemoteChangeApplier::new(db.clone(), SyncConfig::default())
+                .apply_batch(vec![SyncChange {
+                    sequence: 1,
+                    source_instance: InstanceId::new(),
+                    collective_id: cid,
+                    entity_type: if insight {
+                        SyncEntityType::Insight
+                    } else {
+                        SyncEntityType::Experience
+                    },
+                    payload,
+                    timestamp: Timestamp::now(),
+                }])
+                .unwrap();
+            assert_eq!(result.failed, 1);
+            assert_eq!(
+                result.safe_through, None,
+                "a failed sidecar repair must not be acknowledged"
+            );
+            if insight {
+                assert!(db.get_insight(iid).unwrap().is_none());
+            } else {
+                assert!(db.get_experience(source).unwrap().is_none());
+            }
+            let still_corrupt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            assert_eq!(
+                still_corrupt["deleted"],
+                serde_json::json!(["invalid-mark"])
+            );
+        }
+    }
+
+    /// C6: a stored record with no stored embedding is a store-consistency
+    /// error, never a silent pass — and it repeats rather than being one-shot.
+    ///
+    /// A record and its embedding commit in one transaction, so this state can
+    /// only mean the store was altered outside PulseDB. It is built here
+    /// through the storage port, which is the same `storage_for_test()`
+    /// construction the spec's sync tests use.
+    #[test]
+    fn ensure_synced_experience_indexed_refuses_a_record_with_no_stored_embedding() {
+        let dir = tempdir().unwrap();
+        let db = PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap();
+
+        let cid = db.create_collective("store-consistency").unwrap();
+        let exp_id = db.record_experience(exp_in(cid)).unwrap();
+
+        // Rewrite the row with an empty vector: the record is in redb, the
+        // embedding it committed with is not.
+        let mut stripped = db.get_experience(exp_id).unwrap().unwrap();
+        stripped.embedding = Vec::new();
+        db.storage_for_test().save_experience(&stripped).unwrap();
+
+        for attempt in 1..=2 {
+            let error = db
+                .ensure_synced_experience_indexed(exp_id)
+                .expect_err("a record with no stored embedding must never be repaired silently");
+            let message = error.to_string();
+            assert!(
+                message.contains(&exp_id.to_string()),
+                "attempt {attempt}: the error must name the id, got: {message}"
+            );
+            assert!(
+                message.contains("store-consistency violation"),
+                "attempt {attempt}: the error must call this what it is, got: {message}"
+            );
+        }
+    }
+
+    /// A repair that joins an insert still in flight publishes nothing, so it
+    /// must not be reported as a repair: the id is not searchable yet and the
+    /// change must not be acknowledged (grill A1 — ack only once the id is
+    /// searchable).
+    ///
+    /// The window is the one the two verifiers named: the other thread's insert
+    /// holds the claim and has not published, this call joins it and returns,
+    /// and if the claim holder then unwinds the create would be acknowledged
+    /// unsearchable. The claim is taken directly here because it is otherwise
+    /// reachable only with a second thread and a timing window; the panic hook
+    /// cannot hold it, since a panic releases the claim by design.
+    #[test]
+    fn a_repair_that_joins_an_in_flight_claim_is_not_reported_as_repaired() {
+        let dir_source = tempdir().unwrap();
+        let dir_target = tempdir().unwrap();
+        let source = PulseDB::open(dir_source.path().join("source.db"), Config::default()).unwrap();
+        let target = PulseDB::open(dir_target.path().join("target.db"), Config::default()).unwrap();
+
+        // The target holds durable data but no published index entry: the
+        // state a failed index insert leaves behind.
+        let cid = source.create_collective("in-flight-claim").unwrap();
+        let exp_id = source.record_experience(exp_in(cid)).unwrap();
+        let collective = source.get_collective(cid).unwrap().unwrap();
+        target.apply_synced_collective(collective).unwrap();
+        let stored = source.get_experience(exp_id).unwrap().unwrap();
+        target.storage_for_test().save_experience(&stored).unwrap();
+
+        target.with_or_create_vector_index(cid, |_| Ok(())).unwrap();
+
+        // Another thread's insert for this id is in flight.
+        target
+            .with_vector_index(cid, |index| {
+                index.claim_for_test(exp_id);
+                Ok(())
+            })
+            .unwrap()
+            .expect("the helper must arrange the index before the claim");
+
+        let error = target
+            .ensure_synced_experience_indexed(exp_id)
+            .expect_err("a repair that published nothing is not a repair");
+        let message = error.to_string();
+        assert!(
+            message.contains(&exp_id.to_string()),
+            "the error must name the id, got: {message}"
+        );
+        assert!(
+            message.contains("not") && message.contains("searchable"),
+            "the error must say the id is not searchable yet, got: {message}"
+        );
     }
 }
