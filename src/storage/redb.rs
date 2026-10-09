@@ -349,7 +349,7 @@ fn quarantine_invalid_sidecar(backup_path: &Path) -> Result<PathBuf> {
             candidate.push(format!(".invalid-{seconds}-{attempt}"));
         }
         let candidate = PathBuf::from(candidate);
-        if candidate.try_exists().map_err(PulseDBError::Io)? {
+        if path_is_occupied(&candidate)? {
             continue;
         }
         match std::fs::rename(backup_path, &candidate) {
@@ -366,6 +366,114 @@ fn quarantine_invalid_sidecar(backup_path: &Path) -> Result<PathBuf> {
         backup_path.display()
     ))
     .into())
+}
+
+/// Whether `path` names a directory entry of any kind, judged WITHOUT following
+/// a symlink: a dangling symlink occupies its path (LF3, PR #119), where
+/// `try_exists` would report it absent. An I/O error other than "not found"
+/// is a typed refusal.
+fn path_is_occupied(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PulseDBError::Io(error)),
+    }
+}
+
+/// What occupies a sidecar path, judged without following a symlink
+/// (LF3/LF4, PR #119).
+#[derive(Debug)]
+enum SidecarOccupant {
+    /// Nothing at the path.
+    Absent,
+    /// A regular file proven to be a different file from the source
+    /// (Unix: device + inode). Still needs [`validate_sidecar_image`].
+    Distinct,
+    /// A regular file whose identity cannot be read: stable std exposes no file
+    /// identity on Windows. It cannot be proven distinct from the source, so it
+    /// is never kept as proof.
+    #[cfg_attr(unix, allow(dead_code))]
+    Unproven,
+    /// Never a rollback image: a symlink (dangling or not), a non-regular
+    /// entry, or a hard link to the source itself.
+    Unusable(&'static str),
+}
+
+/// Inspects the entry at `backup_path` against `source` without following a
+/// symlink. A sidecar that aliases the source reads as a valid pre-migration
+/// image, yet the migration rewrites that same file, so content validation
+/// alone cannot accept it (LF4). An identity that cannot be READ (an I/O error)
+/// is a typed refusal: nothing is quarantined and the migration does not run.
+fn inspect_sidecar_occupant(source: &Path, backup_path: &Path) -> Result<SidecarOccupant> {
+    let occupant = match std::fs::symlink_metadata(backup_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SidecarOccupant::Absent)
+        }
+        Err(error) => return Err(PulseDBError::Io(error)),
+    };
+    let file_type = occupant.file_type();
+    if file_type.is_symlink() {
+        return Ok(SidecarOccupant::Unusable("a symlink"));
+    }
+    if !file_type.is_file() {
+        return Ok(SidecarOccupant::Unusable("not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source = std::fs::metadata(source).map_err(PulseDBError::Io)?;
+        if (source.dev(), source.ino()) == (occupant.dev(), occupant.ino()) {
+            return Ok(SidecarOccupant::Unusable("a hard link to the live store"));
+        }
+        Ok(SidecarOccupant::Distinct)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        Ok(SidecarOccupant::Unproven)
+    }
+}
+
+/// Why an [`SidecarOccupant::Unproven`] sidecar is quarantined.
+const UNPROVEN_SIDECAR: &str = "its file identity cannot be read on this platform, so it \
+                                cannot be proven distinct from the live store";
+
+/// Quarantines an occupant of `backup_path` that cannot be kept as proof
+/// ([`quarantine_invalid_sidecar`]: the entry itself is renamed — a symlink's
+/// target is never followed, a hard link's other names stay intact).
+fn quarantine_sidecar_occupant(backup_path: &Path, reason: &dyn std::fmt::Display) -> Result<()> {
+    let quarantined = quarantine_invalid_sidecar(backup_path)?;
+    warn!(
+        invalid = %backup_path.display(),
+        quarantined = %quarantined.display(),
+        reason = %reason,
+        "unusable pre-migration sidecar quarantined (never deleted); \
+         a fresh image will be published"
+    );
+    Ok(())
+}
+
+/// Judges an existing occupant of `backup_path`: `Ok(None)` when it is a
+/// distinct, valid image to keep, `Ok(Some(reason))` when it must be
+/// quarantined. The outer `Err` (identity or image could not be checked)
+/// refuses the migration with nothing quarantined.
+fn judge_sidecar_occupant(
+    source: &Path,
+    backup_path: &Path,
+    expected_schema_version: u32,
+) -> Result<Option<String>> {
+    match inspect_sidecar_occupant(source, backup_path)? {
+        SidecarOccupant::Absent => Ok(Some("the occupant vanished".to_owned())),
+        SidecarOccupant::Unusable(reason) => Ok(Some(reason.to_owned())),
+        SidecarOccupant::Unproven => Ok(Some(UNPROVEN_SIDECAR.to_owned())),
+        SidecarOccupant::Distinct => {
+            match validate_sidecar_image(backup_path, expected_schema_version)? {
+                Ok(()) => Ok(None),
+                Err(error) => Ok(Some(error.to_string())),
+            }
+        }
+    }
 }
 
 /// Proves a sidecar image at `path` is a whole, readable pre-migration store at
@@ -717,8 +825,13 @@ fn read_known_multimap_entries(read_txn: &::redb::ReadTransaction, name: &str) -
 /// staged temp: a `sync_all` failure, a staged copy that fails validation, and
 /// a failed hard-link/copy publication all leave the store
 /// untouched at its pre-migration schema. A loser's `AlreadyExists` is the
-/// preserve branch, not a failure: the sidecar already at the final path wins
-/// and this call's staged copy is discarded.
+/// preserve branch, not a failure, but only for an occupant that
+/// [`judge_sidecar_occupant`] accepts — a distinct regular file that validates
+/// as a whole image; then the sidecar already at the final path wins and this
+/// call's staged copy is discarded. Any other occupant (a symlink, an alias of
+/// `source`, an invalid image, or on Windows any regular file) is quarantined
+/// and the publish retried ONCE; a second one refuses the migration (LF3/LF4,
+/// PR #119).
 ///
 /// Publication uses `hard_link`, or an exclusive copy on link-less volumes.
 /// An interrupted fallback copy is invalid evidence that the next migrating
@@ -749,8 +862,8 @@ fn publish_durable_sidecar_with(
     source: &Path,
     backup_path: &Path,
     expected_schema_version: u32,
-    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-    copy_and_sync: impl FnOnce(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()>,
+    mut link: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    mut copy_and_sync: impl FnMut(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()>,
 ) -> Result<()> {
     let temp_path = sidecar_staging_temp_path(backup_path);
     // Symlink-safe staging (same posture as `backup_once`): unlink any stale
@@ -794,35 +907,69 @@ fn publish_durable_sidecar_with(
             return Err(error);
         }
     }
-    // Keep the validated stage until either publish path has finished. Only
-    // exclusive destination creation grants ownership for failure cleanup.
-    let published = (|| -> std::io::Result<()> {
-        match link(&temp_path, backup_path) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                debug!("pre-migration backup already exists; preserving it");
+    // Keep the validated stage until the publish has finished. Only exclusive
+    // destination creation grants ownership for failure cleanup.
+    let published = (|| -> Result<()> {
+        let mut retried = false;
+        loop {
+            // `Ok(true)`: the final path was already occupied.
+            let occupied = (|| -> std::io::Result<bool> {
+                match link(&temp_path, backup_path) {
+                    Ok(()) => return Ok(false),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(true)
+                    }
+                    Err(_) => {} // Link-less volume: exclusive copy below.
+                }
+                let mut destination = match create_sidecar_file(source, backup_path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(true)
+                    }
+                    Err(error) => return Err(error), // We own no output; never unlink.
+                };
+                let result = (|| {
+                    let mut staged = std::fs::File::open(&temp_path)?;
+                    copy_and_sync(&mut staged, &mut destination)
+                })();
+                // Close both handles before removing our failed output on Windows.
+                drop(destination);
+                if result.is_err() {
+                    let _ = std::fs::remove_file(backup_path);
+                }
+                result.map(|()| false)
+            })()
+            .map_err(PulseDBError::Io)?;
+            if !occupied {
                 return Ok(());
             }
-            Err(_) => {} // Link-less volume: exclusive copy below.
+            // LF3/LF4 (PR #119): an occupant is preserved only when it is a
+            // distinct regular file that validates as a whole image. Anything
+            // else is quarantined and the publish retried ONCE; a second
+            // unusable occupant refuses the migration. `?`: an occupant that
+            // could not be checked refuses, never counts as success.
+            let Some(reason) =
+                judge_sidecar_occupant(source, backup_path, expected_schema_version)?
+            else {
+                debug!("pre-migration backup already exists and validates; preserving it");
+                return Ok(());
+            };
+            if retried {
+                return Err(StorageError::corrupted(format!(
+                    "the sidecar path {} is occupied again after a quarantine ({reason}); \
+                     refusing the migration",
+                    backup_path.display()
+                ))
+                .into());
+            }
+            if path_is_occupied(backup_path)? {
+                quarantine_sidecar_occupant(backup_path, &reason)?;
+            }
+            retried = true;
         }
-        let mut destination = match create_sidecar_file(source, backup_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(error) => return Err(error), // We own no output; never unlink.
-        };
-        let result = (|| {
-            let mut staged = std::fs::File::open(&temp_path)?;
-            copy_and_sync(&mut staged, &mut destination)
-        })();
-        // Close both handles before removing our failed output on Windows.
-        drop(destination);
-        if result.is_err() {
-            let _ = std::fs::remove_file(backup_path);
-        }
-        result
     })();
     let _ = std::fs::remove_file(&temp_path);
-    published.map_err(PulseDBError::Io)?;
+    published?;
     sync_schema_sidecar_directory(backup_path)
 }
 
@@ -872,9 +1019,13 @@ fn sync_schema_sidecar_directory_with(
 /// Ensures the pre-migration sidecar for a store still at `schema_version`,
 /// under the migration lock (spec §2 + §3, r1.s6.w1 / #89 + #25).
 ///
-/// An EXISTING sidecar is proof only after [`validate_sidecar_image`] (both
-/// stages, including redb's checksum-verifying integrity check on a disposable
-/// copy). A sidecar that cannot be checked refuses the migration and is left in
+/// An EXISTING sidecar is proof only after [`inspect_sidecar_occupant`] proves
+/// it a regular file distinct from `source` and [`validate_sidecar_image`]
+/// accepts it (both stages, including redb's checksum-verifying integrity check
+/// on a disposable copy). A symlink (dangling or not), a non-regular entry, a
+/// hard link to `source` and — on Windows, where stable std reads no file
+/// identity — any regular file are quarantined like an invalid image (LF3/LF4,
+/// PR #119); an identity that cannot be read refuses the migration. A sidecar that cannot be checked refuses the migration and is left in
 /// place, neither kept as proof nor quarantined. A valid
 /// one is kept, but its contents must sync successfully before the directory
 /// barrier. Opening it for sync requires write access (including on Windows);
@@ -890,10 +1041,16 @@ fn ensure_schema_backup(source: &Path, schema_version: u32) -> Result<()> {
             "no pre-migration sidecar is defined for schema v{schema_version}"
         )))
     })?;
-    if backup_path.try_exists().map_err(PulseDBError::Io)? {
-        // `?`: an image that could not be CHECKED (no integrity copy) refuses
-        // the migration and is neither kept nor quarantined.
-        match validate_sidecar_image(&backup_path, schema_version)? {
+    // Symlink-aware (LF3/LF4, PR #119): a symlink, a non-regular entry, a hard
+    // link to the store and (Windows) an unproven identity are quarantined;
+    // only a distinct regular file goes on to content validation. `?`: an
+    // identity or image that could not be CHECKED refuses the migration and
+    // is neither kept nor quarantined.
+    match inspect_sidecar_occupant(source, &backup_path)? {
+        SidecarOccupant::Absent => {}
+        SidecarOccupant::Unusable(reason) => quarantine_sidecar_occupant(&backup_path, &reason)?,
+        SidecarOccupant::Unproven => quarantine_sidecar_occupant(&backup_path, &UNPROVEN_SIDECAR)?,
+        SidecarOccupant::Distinct => match validate_sidecar_image(&backup_path, schema_version)? {
             Ok(()) => {
                 debug!(
                     backup = %backup_path.display(),
@@ -917,17 +1074,8 @@ fn ensure_schema_backup(source: &Path, schema_version: u32) -> Result<()> {
                 drop(sidecar);
                 return sync_schema_sidecar_directory(&backup_path);
             }
-            Err(error) => {
-                let quarantined = quarantine_invalid_sidecar(&backup_path)?;
-                warn!(
-                    invalid = %backup_path.display(),
-                    quarantined = %quarantined.display(),
-                    error = %error,
-                    "invalid pre-migration sidecar quarantined (never deleted); \
-                     a fresh image will be published"
-                );
-            }
-        }
+            Err(error) => quarantine_sidecar_occupant(&backup_path, &error)?,
+        },
     }
     publish_durable_sidecar(source, &backup_path, schema_version)
 }
@@ -1006,7 +1154,9 @@ enum BackupOutcome {
 ///
 /// 1. If `backup_path` already holds a published sidecar, preserve it untouched
 ///    and return `Preserved` — an idempotent no-op (even if `src` has since
-///    diverged).
+///    diverged). The check does not follow a symlink: a symlink or a hard link
+///    to `src` at `backup_path` is quarantined, never preserved (LF3/LF4,
+///    PR #119).
 /// 2. Otherwise stage the copy at a sibling temp path ([`backup_temp_path`]),
 ///    `sync_all` its bytes (#53c durability), then **atomically `rename`** it onto
 ///    `backup_path` and return `Created`. `rename` is atomic on POSIX and Windows,
@@ -1041,10 +1191,19 @@ enum BackupOutcome {
 fn backup_once(src: &Path, backup_path: &Path) -> Result<BackupOutcome> {
     // (1) Idempotent preserve: a genuine sidecar already published at the final path
     // is kept untouched (never re-copied, even if `src` has since diverged). Sidecar-
-    // space op ⇒ plain `Io` (never redb lock contention).
-    if backup_path.try_exists().map_err(PulseDBError::Io)? {
-        debug!("backup sidecar already exists; preserving it");
-        return Ok(BackupOutcome::Preserved);
+    // space op ⇒ plain `Io` (never redb lock contention). Judged without following
+    // a symlink (LF3/LF4, PR #119): a symlink, a non-regular entry or a hard link to
+    // `src` is never a rollback point, so it is quarantined and a fresh copy staged.
+    // A regular file whose identity std cannot read (Windows) is still preserved:
+    // `src` may already have diverged from the pristine bytes (a crash after the
+    // redb upgrade), so a fresh copy could not stand in for it.
+    match inspect_sidecar_occupant(src, backup_path)? {
+        SidecarOccupant::Absent => {}
+        SidecarOccupant::Distinct | SidecarOccupant::Unproven => {
+            debug!("backup sidecar already exists; preserving it");
+            return Ok(BackupOutcome::Preserved);
+        }
+        SidecarOccupant::Unusable(reason) => quarantine_sidecar_occupant(backup_path, &reason)?,
     }
 
     // (2) Stage at a sibling temp, then atomically rename onto the final path.
@@ -2038,7 +2197,7 @@ impl RedbStorage {
             }
             if needs_v3_migration || needs_v4_migration || needs_v5_migration {
                 let sidecar_present = pending_sidecar_path(&path, metadata.schema_version)
-                    .map(|backup_path| backup_path.try_exists().unwrap_or(false))
+                    .map(|backup_path| path_is_occupied(&backup_path).unwrap_or(false))
                     .unwrap_or(false);
                 // A held lock whose caller did not run the ensure (the re-peek under
                 // the lock failed) must still validate an existing sidecar.
@@ -5714,6 +5873,277 @@ mod tests {
         assert!(leftover_sidecar_temps(&backup_path).is_empty());
     }
 
+    /// Entries quarantined beside `dir`'s sidecars whose name carries `marker`
+    /// (e.g. `.pre-v5.bak.invalid-`).
+    fn quarantined_entries(dir: &Path, marker: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(marker)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// LF3 (PR #119): a dangling symlink at the sidecar path is not a rollback
+    /// image. `try_exists` reported it absent and the publish's `AlreadyExists`
+    /// then counted it as a preserved sidecar. It must be quarantined (the
+    /// entry itself — its missing target is never created) and replaced.
+    #[cfg(unix)]
+    #[test]
+    fn test_dangling_symlink_sidecar_is_quarantined_and_replaced() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let backup_path = pre_v5_backup_path(&path);
+        let missing = dir.path().join("missing-target");
+        std::os::unix::fs::symlink(&missing, &backup_path).unwrap();
+
+        ensure_schema_backup(&path, 4).expect("a fresh sidecar replaces the dangling symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&backup_path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the sidecar must be a regular file, not the dangling symlink"
+        );
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        let quarantined = quarantined_entries(dir.path(), ".pre-v5.bak.invalid-");
+        assert_eq!(quarantined.len(), 1, "the symlink entry is quarantined");
+        assert_eq!(std::fs::read_link(&quarantined[0]).unwrap(), missing);
+        assert!(!missing.exists(), "the symlink's target is never created");
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// LF3: the publish's `AlreadyExists` branch must re-check its occupant,
+    /// never count a dangling symlink as a preserved sidecar.
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_never_preserves_a_dangling_symlink_occupant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let backup_path = pre_v5_backup_path(&path);
+        let missing = dir.path().join("missing-target");
+        std::os::unix::fs::symlink(&missing, &backup_path).unwrap();
+
+        publish_durable_sidecar(&path, &backup_path, 4)
+            .expect("the occupant is quarantined and the publish retried once");
+
+        assert!(std::fs::symlink_metadata(&backup_path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        assert_eq!(
+            quarantined_entries(dir.path(), ".pre-v5.bak.invalid-").len(),
+            1
+        );
+        assert!(!missing.exists());
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// LF4 (PR #119): a hard link to the live store at the sidecar path reads
+    /// as a valid pre-migration image, but the migration would rewrite that
+    /// same inode. It must be quarantined (renaming a link name leaves the
+    /// store intact) and replaced by a sidecar with its own identity.
+    #[cfg(unix)]
+    #[test]
+    fn test_hard_link_alias_sidecar_is_quarantined_and_replaced() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let store_bytes = std::fs::read(&path).unwrap();
+        let backup_path = pre_v5_backup_path(&path);
+        std::fs::hard_link(&path, &backup_path).unwrap();
+
+        ensure_schema_backup(&path, 4).expect("a fresh sidecar replaces the alias");
+
+        assert_ne!(
+            inode(&backup_path),
+            inode(&path),
+            "the sidecar must not share the live store's inode"
+        );
+        assert_eq!(std::fs::read(&backup_path).unwrap(), store_bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), store_bytes, "store intact");
+        let quarantined = quarantined_entries(dir.path(), ".pre-v5.bak.invalid-");
+        assert_eq!(quarantined.len(), 1, "the alias is quarantined");
+        assert_eq!(inode(&quarantined[0]), inode(&path));
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// LF4: a (non-dangling) symlink to the live store is quarantined as an
+    /// entry; its target — the store — is neither followed nor touched.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_alias_sidecar_is_quarantined_and_replaced() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let store_bytes = std::fs::read(&path).unwrap();
+        let backup_path = pre_v5_backup_path(&path);
+        std::os::unix::fs::symlink(&path, &backup_path).unwrap();
+
+        ensure_schema_backup(&path, 4).expect("a fresh sidecar replaces the symlink");
+
+        assert!(std::fs::symlink_metadata(&backup_path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_ne!(inode(&backup_path), inode(&path));
+        assert_eq!(std::fs::read(&backup_path).unwrap(), store_bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), store_bytes, "store intact");
+        let quarantined = quarantined_entries(dir.path(), ".pre-v5.bak.invalid-");
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(std::fs::read_link(&quarantined[0]).unwrap(), path);
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// LF4: the publish's `AlreadyExists` branch must reject an occupant that
+    /// aliases the live store, never preserve it.
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_never_preserves_an_aliasing_occupant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let backup_path = pre_v5_backup_path(&path);
+        std::fs::hard_link(&path, &backup_path).unwrap();
+
+        publish_durable_sidecar(&path, &backup_path, 4)
+            .expect("the alias is quarantined and the publish retried once");
+
+        assert_ne!(inode(&backup_path), inode(&path));
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        assert_eq!(
+            quarantined_entries(dir.path(), ".pre-v5.bak.invalid-").len(),
+            1
+        );
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// LF3/LF4: the publish retries once after a quarantine. A second unusable
+    /// occupant is a typed refusal, never success.
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_refuses_a_second_unusable_occupant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let backup_path = pre_v5_backup_path(&path);
+        let store = path.clone();
+
+        let error = publish_durable_sidecar_with(
+            &path,
+            &backup_path,
+            4,
+            |_, to| {
+                // An occupant aliasing the store appears at every attempt.
+                std::os::unix::fs::symlink(&store, to)?;
+                Err(std::io::ErrorKind::AlreadyExists.into())
+            },
+            |_, _| panic!("an occupied path must never be copied into"),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, PulseDBError::Storage(StorageError::Corrupted(_))),
+            "a second occupant is a typed refusal, got {error:?}"
+        );
+        assert_eq!(
+            quarantined_entries(dir.path(), ".pre-v5.bak.invalid-").len(),
+            1,
+            "only the first occupant is quarantined"
+        );
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// Windows posture (LF4, PR #119): stable std reads no file identity on
+    /// Windows, so an existing regular sidecar cannot be proven distinct from
+    /// the store. It is quarantined (never deleted) and a fresh sidecar is
+    /// published from the store, which reads at the pre-migration schema.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_unproven_regular_sidecar_is_quarantined_and_replaced() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let backup_path = pre_v5_backup_path(&path);
+        std::fs::copy(&path, &backup_path).unwrap();
+        let earlier = std::fs::read(&backup_path).unwrap();
+
+        ensure_schema_backup(&path, 4).expect("a fresh sidecar replaces the unproven one");
+
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        let quarantined = quarantined_entries(dir.path(), ".pre-v5.bak.invalid-");
+        assert_eq!(quarantined.len(), 1, "the unproven sidecar is quarantined");
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            earlier,
+            "quarantine keeps the earlier bytes"
+        );
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// LF3/LF4 for the substrate sidecar: a symlink or a hard link to the
+    /// source at `.pre-substrate.bak` is not preserved as the rollback point.
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_once_quarantines_symlink_and_alias_occupants() {
+        for plant in ["symlink", "hard_link", "dangling"] {
+            let dir = tempdir().unwrap();
+            let src = dir.path().join("data.db");
+            std::fs::write(&src, b"pristine-v2-bytes").unwrap();
+            let backup_path = pre_substrate_backup_path(&src);
+            match plant {
+                "symlink" => std::os::unix::fs::symlink(&src, &backup_path).unwrap(),
+                "hard_link" => std::fs::hard_link(&src, &backup_path).unwrap(),
+                _ => std::os::unix::fs::symlink(dir.path().join("missing"), &backup_path).unwrap(),
+            }
+
+            assert_eq!(
+                backup_once(&src, &backup_path).unwrap(),
+                BackupOutcome::Created,
+                "{plant}: the occupant is not preserved"
+            );
+            assert!(std::fs::symlink_metadata(&backup_path)
+                .unwrap()
+                .file_type()
+                .is_file());
+            assert_ne!(inode(&backup_path), inode(&src), "{plant}");
+            assert_eq!(std::fs::read(&backup_path).unwrap(), b"pristine-v2-bytes");
+            assert_eq!(std::fs::read(&src).unwrap(), b"pristine-v2-bytes");
+            assert_eq!(
+                quarantined_entries(dir.path(), ".pre-substrate.bak.invalid-").len(),
+                1,
+                "{plant}: the occupant is quarantined"
+            );
+        }
+    }
+
     /// The staging temp must be unique per CALL, not per process.
     ///
     /// A crashed run's staged temp is left behind by design (never
@@ -5948,6 +6378,16 @@ mod tests {
             .close()
             .unwrap();
         let backup = pre_v5_backup_path(&path);
+        let winner_planted = Cell::new(false);
+        // Unix proves the winner distinct and preserves it. Windows cannot read
+        // its identity, so it is quarantined and the publish retried once
+        // (LF4, PR #119), which then copies this call's stage.
+        #[cfg(unix)]
+        let copy: fn(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()> =
+            |_, _| panic!("a preserved winner must not be copied into");
+        #[cfg(not(unix))]
+        let copy: fn(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()> =
+            copy_and_sync_sidecar;
         publish_durable_sidecar_with(
             &path,
             &backup,
@@ -5955,16 +6395,20 @@ mod tests {
             |from, to| {
                 // A winner appears only after staging/validation, before the
                 // fallback's exclusive destination creation.
-                std::fs::copy(from, to)?;
+                if !winner_planted.replace(true) {
+                    std::fs::copy(from, to)?;
+                }
                 unsupported_sidecar_link(from, to)
             },
-            |_, _| panic!("a preserved winner must not be copied into"),
+            copy,
         )
         .unwrap();
         assert_eq!(
             std::fs::read(&backup).unwrap(),
             std::fs::read(&path).unwrap()
         );
+        let quarantined = quarantined_entries(dir.path(), ".pre-v5.bak.invalid-");
+        assert_eq!(quarantined.len(), usize::from(cfg!(not(unix))));
         assert!(leftover_sidecar_temps(&backup).is_empty());
     }
 

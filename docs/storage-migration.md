@@ -141,7 +141,21 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    `<db>.pre-v5.bak.invalid-<unix-seconds>` (`-<n>` if taken) — logged at `warn` with both paths,
    never deleted — and a fresh image is published. An existing sidecar that cannot be checked (its
    integrity copy cannot be made, or redb hits an I/O error on the copy) refuses the migration and is left in place — neither kept nor
-   quarantined. (The same rules cover `.pre-v4.bak` for redb-v3
+   quarantined. The existing entry is judged **without following a symlink**: a symlink at the
+   sidecar path (dangling or not), a non-regular entry, or a hard link to the live store itself is
+   never proof — the migration would rewrite the very file it points at — and is quarantined the
+   same way (the entry is renamed; a symlink's target is never followed or touched, and renaming a
+   hard link leaves the store intact), then a fresh image is published. Identity is device + inode
+   on Unix; if it cannot be read (an I/O error) the migration is refused and nothing is quarantined.
+   On Windows, stable Rust exposes no file identity, so an existing regular-file sidecar cannot be
+   proven distinct from the store: it is always quarantined and replaced by a fresh image from the
+   store (which still reads at the pre-migration schema), never reused — one extra store-sized
+   `.invalid-<unix-seconds>` file per crash recovery. If the create-if-absent publish finds its
+   path occupied, the occupant gets the same check: a distinct, valid image is kept; anything else
+   is quarantined and the publish retried once, and a second unusable occupant refuses the
+   migration. (`.pre-substrate.bak` quarantines a symlink or a hard link to the store the same
+   way, but keeps a Windows regular file: its source may already have left the pristine bytes.)
+   (The same rules cover `.pre-v4.bak` for redb-v3
    schema-3 stores; redb-v2 stores keep `.pre-substrate.bak` as their pristine copy.)
    A crash between the staged copy and the publish leaves a store-sized
    `<db>.pre-vN.bak.<pid>.<nonce>.sidecar.tmp`, and a crash during the integrity check leaves a
