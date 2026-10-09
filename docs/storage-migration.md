@@ -102,8 +102,10 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    first writable redb open** (a redb read-only open peeks at `schema_version`; a writable open would
    already rewrite the file's allocator pages). Because no writer lock is held that early, the copy is
    staged at a sibling temp, validated by re-opening the staged file read-only and reading
-   `schema_version` back off it, and published by an atomic rename only if it validates — a copy torn
-   by a concurrent writer's commit is discarded, never published. If the peek cannot run or the staged
+   `schema_version` back off it, and published by an atomic create-if-absent hard link only if it
+   validates — a copy whose `schema_version` cannot be read back is discarded, never published. That
+   check reads `schema_version` only, so a copy torn by a concurrent writer's commit can still pass it
+   and be published (#89; see the 0.8.0 Known Limitations in the CHANGELOG). If the peek cannot run or the staged
    copy fails validation (crashed session, locked file, concurrent writer), the copy is taken after the
    open instead — a valid store, but not byte-identical. The sidecar is never overwritten once it
    exists. (The same pre-open claim now covers `.pre-v4.bak` for redb-v3
@@ -129,6 +131,10 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
 - **Events compacted before the upgrade are not recoverable.** If a pre-0.8.0 compaction already
   deleted unpushed events (the #9 failure), the migration cannot restore them; the resync covers only
   what is still in the WAL.
+- **Run the first writable open with no other process accessing the store.** The sidecar is a
+  clean rollback image only when that open has the store to itself: neither the pre-open nor the
+  post-open copy is serialized against a concurrent writer or migration, and neither is fsync'd
+  (#89).
 - **Rollback** (ADR-011): reinstall 0.7.x and restore `<db>.pre-v5.bak` over the store. A 0.7.x
   binary refuses a schema-5 store with `SchemaVersionMismatch`, so a downgrade without the restore
   fails loud rather than misreading cursors.

@@ -196,7 +196,7 @@ Run benchmarks yourself: `cargo bench`
 
 ### Collective
 
-A **collective** is an isolated namespace for experiences, typically one per project. Each collective gets its own HNSW vector index, created on its first indexed write. All collectives in a database share the database's configured embedding dimension.
+A **collective** is an isolated namespace for experiences, typically one per project. Each collective gets two independent HNSW vector indexes, one for experiences and one for derived insights; each is created on the first indexed write of its own kind. All collectives in a database share the database's configured embedding dimension.
 
 ### Experience
 

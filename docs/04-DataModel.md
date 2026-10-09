@@ -795,6 +795,12 @@ pub const SCHEMA_VERSION: u32 = 5;
 fn check_schema_version(db: &Database) -> Result<()> {
     let stored_version = db.get_metadata("schema_version")?;
     
+    if stored_version == 0 {
+        return Err(StorageError::SchemaVersionMismatch {
+            expected: SCHEMA_VERSION,
+            found: stored_version,
+        });
+    }
     match stored_version.cmp(&SCHEMA_VERSION) {
         Ordering::Equal => Ok(()),
         Ordering::Less => migrate_schema(db, stored_version, SCHEMA_VERSION),
@@ -818,9 +824,16 @@ fn check_schema_version(db: &Database) -> Result<()> {
 
 ### 8.3 Backup Before Migration
 
-Before a schema migration, the first writable open claims a pristine `<db>.pre-vN.bak`
-sidecar (`.pre-v3.bak`, `.pre-v4.bak`, `.pre-v5.bak`; `.pre-substrate.bak` for a redb-v2
-file). An existing sidecar is never overwritten. See
+Before a schema migration, the first writable open claims a `<db>.pre-vN.bak` backup
+sidecar (`.pre-v3.bak`, `.pre-v4.bak`, `.pre-v5.bak`). A redb-v2 file gets a separate
+`.pre-substrate.bak`, taken before the redb file-format upgrade. An existing sidecar is
+never overwritten.
+
+The sidecar is a clean rollback image only when the first writable open has the store to
+itself. The pre-open copy holds no writer lock and is validated by
+`schema_version` only, the post-open fallback copy is not byte-identical, and neither copy
+is fsync'd (#89; see the 0.8.0 Known Limitations in `CHANGELOG.md`). Run the first
+writable open after an upgrade with no other process accessing the store. See
 [storage-migration.md](storage-migration.md) for the full procedure and rollback.
 
 ---

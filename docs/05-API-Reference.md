@@ -71,7 +71,8 @@ pub fn open(path: impl AsRef<Path>, config: Config) -> Result<PulseDB, PulseDBEr
 |-------|-----------|
 | `PulseDBError::Io` | File system error |
 | `StorageError::Corrupted` | Database file corrupted |
-| `StorageError::SchemaVersionMismatch` | On-disk schema version is newer than this build supports (> 5) or invalid (0). Older schemas (1–4) migrate on a writable open; see [storage-migration.md](storage-migration.md) |
+| `StorageError::SchemaVersionMismatch` | On-disk schema version is newer than this build supports (> 5) or invalid (0). Older schemas (1–4) migrate on a writable open, except as below; see [storage-migration.md](storage-migration.md) |
+| `StorageError::SubstrateMigrationRequiresSync` | A build without the `sync` feature opened a bincode-era store that holds sync cursor rows; open it with the `sync` feature to migrate it |
 | `ValidationError::DimensionMismatch` | Config dimension doesn't match existing |
 
 **Example:**

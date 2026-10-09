@@ -415,7 +415,12 @@ impl PulseDB {
 Schema migrations run automatically; there is no migration call to make.
 
 - Opening an older store (schema 1–4) migrates it in place on the first **writable** open,
-  after claiming a pristine `<db>.pre-vN.bak` sidecar.
+  after claiming a `<db>.pre-vN.bak` backup sidecar. Run that open with no other process
+  accessing the store: the sidecar is not guaranteed to be a clean rollback image under
+  a concurrent writer or migration (#89; see the 0.8.0 Known Limitations in `CHANGELOG.md`).
+- A non-`sync` build refuses to migrate a store written before the postcard re-encode
+  (bincode era) that holds sync cursor rows, with
+  `StorageError::SubstrateMigrationRequiresSync`. Open it once with the `sync` feature.
 - A read-only open of a not-yet-migrated store returns a typed `ReadOnly` error instead of
   migrating.
 - A store written by a newer build returns `StorageError::SchemaVersionMismatch`.
