@@ -81,7 +81,10 @@ use crate::insight::{validate_new_insight, DerivedInsight, NewDerivedInsight};
 #[cfg(feature = "sync")]
 use crate::relation::ExperienceRelation;
 use crate::search::rerank::{self, is_legacy_recall, resolve_recall_weights};
-use crate::search::{ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult};
+use crate::search::{
+    ContextCandidates, ContextRequest, ReadMode, ReadOptions, SearchFilter, SearchOptions,
+    SearchResult,
+};
 use crate::storage::{open_storage, DatabaseMetadata, StorageEngine};
 #[cfg(feature = "sync")]
 use crate::types::InstanceId;
@@ -90,6 +93,29 @@ use crate::types::RelationId;
 use crate::types::{CollectiveId, ExperienceId, InsightId, Timestamp};
 use crate::vector::HnswIndex;
 use crate::watch::{WatchEvent, WatchEventType, WatchFilter, WatchService, WatchStream};
+
+/// Refuses [`ReadMode::Exact`] in every `*_with` read until exact retrieval is
+/// implemented: the refusal is typed, precedes all other validation (so no
+/// other error can mask it), and never falls back to approximate results.
+fn refuse_exact(mode: ReadMode) -> Result<()> {
+    match mode {
+        ReadMode::Approximate => Ok(()),
+        ReadMode::Exact => {
+            Err(ValidationError::invalid_field("mode", "exact mode is not implemented").into())
+        }
+    }
+}
+
+/// Refuses a query vector containing a non-finite value (NaN or ±infinity) on
+/// the `*_with` search entries (grill A6). The legacy entries keep their
+/// existing validation unchanged.
+fn validate_finite_query(query: &[f32], field: &str) -> Result<()> {
+    if query.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(ValidationError::invalid_field(field, "must contain only finite values").into())
+    }
+}
 
 /// The main PulseDB database handle.
 ///
@@ -1686,8 +1712,37 @@ impl PulseDB {
     /// # Errors
     ///
     /// Returns [`NotFoundError::Experience`] if the experience doesn't exist.
+    ///
+    /// For a caller-pinned time see [`energy_with()`](Self::energy_with); this
+    /// method reads the wall clock once at entry.
     #[instrument(skip(self))]
     pub fn energy(&self, id: ExperienceId) -> Result<f32> {
+        // One resolved read-time for the whole call (r1.s7.w1): this legacy
+        // entry reads the clock once at its own boundary.
+        let now = Timestamp::now();
+        self.energy_at(id, now)
+    }
+
+    /// Computes the temporal energy for an experience at a pinned time.
+    ///
+    /// The `*_with` form of [`energy()`](Self::energy): identical behaviour,
+    /// except that the energy is evaluated at one resolved time — `read.now()`
+    /// when pinned, the wall clock read once at entry otherwise. A past `now`
+    /// is accepted and clamps the elapsed time to zero; it is not an as-of
+    /// storage read, and no stored field is rewound.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`energy()`](Self::energy).
+    #[instrument(skip(self, read))]
+    pub fn energy_with(&self, id: ExperienceId, read: &ReadOptions) -> Result<f32> {
+        refuse_exact(read.mode())?;
+        let now = read.now().unwrap_or_else(Timestamp::now);
+        self.energy_at(id, now)
+    }
+
+    /// The shared energy read with one already-resolved `now`.
+    fn energy_at(&self, id: ExperienceId, now: Timestamp) -> Result<f32> {
         let experience = self
             .storage
             .get_experience(id)?
@@ -1701,7 +1756,7 @@ impl PulseDB {
             experience.importance,
             experience.applications(),
             experience.last_reinforced,
-            Timestamp::now(),
+            now,
             &decay_config,
         ))
     }
@@ -1713,6 +1768,10 @@ impl PulseDB {
     /// energy is `< below` **and** that is **not already archived**
     /// (`energy < below && !archived`). Results are sorted ascending by energy
     /// (coldest first) and truncated to `limit`.
+    ///
+    /// For a caller-pinned time see
+    /// [`list_cold_experiences_with()`](Self::list_cold_experiences_with); this
+    /// method reads the wall clock once at entry.
     ///
     /// This is a **human-triggered review tool**, not an automatic actuator: it
     /// merely *surfaces* candidates a consumer may choose to archive/prune. It
@@ -1772,6 +1831,45 @@ impl PulseDB {
         below: f32,
         limit: usize,
     ) -> Result<Vec<(ExperienceId, f32)>> {
+        // One resolved read-time for the whole call (r1.s7.w1): this legacy
+        // entry reads the clock once at its own boundary and hands the instant
+        // to the shared cold-list scan.
+        let now = Timestamp::now();
+        self.cold_experiences_at(collective_id, below, limit, now)
+    }
+
+    /// Surfaces prune-eligible cold experiences at a pinned time.
+    ///
+    /// The `*_with` form of [`list_cold_experiences()`](Self::list_cold_experiences):
+    /// identical behaviour, except that every record's energy is evaluated at
+    /// one resolved time — `read.now()` when pinned, the wall clock read once
+    /// at entry otherwise. A past `now` is accepted and freezes the staleness
+    /// time only; stored fields are never rewound.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`list_cold_experiences()`](Self::list_cold_experiences).
+    #[instrument(skip(self, read))]
+    pub fn list_cold_experiences_with(
+        &self,
+        collective_id: CollectiveId,
+        below: f32,
+        limit: usize,
+        read: &ReadOptions,
+    ) -> Result<Vec<(ExperienceId, f32)>> {
+        refuse_exact(read.mode())?;
+        let now = read.now().unwrap_or_else(Timestamp::now);
+        self.cold_experiences_at(collective_id, below, limit, now)
+    }
+
+    /// The shared cold-list scan with one already-resolved `now`.
+    fn cold_experiences_at(
+        &self,
+        collective_id: CollectiveId,
+        below: f32,
+        limit: usize,
+        now: Timestamp,
+    ) -> Result<Vec<(ExperienceId, f32)>> {
         // Validate limit (mirror get_recent_experiences_filtered).
         if limit == 0 || limit > 1000 {
             return Err(
@@ -1791,13 +1889,13 @@ impl PulseDB {
             .get_collective(collective_id)?
             .ok_or_else(|| PulseDBError::from(NotFoundError::collective(collective_id)))?;
 
-        // Resolve decay config ONCE and capture `now` ONCE for the whole scan
-        // (hot-path rule: never re-resolve per item via self.energy(id)).
+        // Resolve decay config ONCE for the whole scan (hot-path rule: never
+        // re-resolve per item via self.energy(id)). The `now` comes in
+        // already resolved from the calling entry (r1.s7.w1).
         let decay_config = self
             .storage
             .get_decay_config(collective_id)?
             .unwrap_or_else(|| self.config.decay.clone());
-        let now = Timestamp::now();
 
         // Single-pass full-collective scan. Stream every experience ID in ONE
         // index iteration (limit = usize::MAX, offset = 0) — offset-restart
@@ -2036,6 +2134,10 @@ impl PulseDB {
     /// similarity path. Positive energy weights over-fetch vector candidates,
     /// blend similarity with temporal energy, then sort and truncate.
     ///
+    /// For a caller-pinned time and retrieval mode see
+    /// [`search_with()`](Self::search_with); this method reads the wall clock
+    /// once at entry.
+    ///
     /// # Arguments
     ///
     /// * `collective_id` - The collective to search within
@@ -2054,6 +2156,55 @@ impl PulseDB {
         collective_id: CollectiveId,
         query: &[f32],
         options: SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        // One resolved read-time for the whole call (r1.s7.w1): this legacy
+        // entry reads the clock once at its own boundary and hands the instant
+        // to the shared inner read.
+        let now = Timestamp::now();
+        self.search_inner(collective_id, query, options, now)
+    }
+
+    /// Searches for experiences with optional recall weighting at a pinned time.
+    ///
+    /// The `*_with` form of [`search()`](Self::search): identical behaviour,
+    /// except that every energy-dependent evaluation uses one resolved time —
+    /// `read.now()` when pinned, the wall clock read once at entry otherwise —
+    /// so two calls with the same pinned `now` return the same ranking
+    /// whatever the wall clock says. A past `now` is accepted and freezes the
+    /// scoring only; stored fields are never rewound.
+    ///
+    /// # Arguments
+    ///
+    /// * `collective_id` - The collective to search within
+    /// * `query` - Query embedding vector (must match collective's dimension)
+    /// * `options` - Result limit, filter, and optional recall weights
+    /// * `read` - Pinned time and retrieval mode ([`ReadOptions`])
+    ///
+    /// # Errors
+    ///
+    /// Same as [`search()`](Self::search).
+    #[instrument(skip(self, query, options, read))]
+    pub fn search_with(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        options: SearchOptions,
+        read: &ReadOptions,
+    ) -> Result<Vec<SearchResult>> {
+        refuse_exact(read.mode())?;
+        validate_finite_query(query, "query")?;
+        let now = read.now().unwrap_or_else(Timestamp::now);
+        self.search_inner(collective_id, query, options, now)
+    }
+
+    /// The shared search body: resolves recall weights and routes to the
+    /// weighted or legacy path with one already-resolved `now`.
+    fn search_inner(
+        &self,
+        collective_id: CollectiveId,
+        query: &[f32],
+        options: SearchOptions,
+        now: Timestamp,
     ) -> Result<Vec<SearchResult>> {
         // Effective per-collective decay config: a stored per-collective override
         // wins; otherwise fall back to the global `Config.decay` — matching the
@@ -2091,9 +2242,14 @@ impl PulseDB {
             options.filter,
             weights,
             decay_config,
+            now,
         )
     }
 
+    // The weighted-search helper carries one resolved `now` plus the already
+    // resolved weights and decay config; every parameter is load-bearing, so
+    // the argument count is allowed rather than bundled (r1.s7.w1).
+    #[allow(clippy::too_many_arguments)]
     fn search_similar_weighted(
         &self,
         collective_id: CollectiveId,
@@ -2102,6 +2258,7 @@ impl PulseDB {
         filter: SearchFilter,
         weights: RecallWeights,
         decay_config: DecayConfig,
+        now: Timestamp,
     ) -> Result<Vec<SearchResult>> {
         if k == 0 || k > 1000 {
             return Err(ValidationError::invalid_field("k", "must be between 1 and 1000").into());
@@ -2119,7 +2276,6 @@ impl PulseDB {
 
         let over_fetch = std::cmp::max(k.saturating_mul(4), k.saturating_add(16)).min(2000);
         let ef_search = self.config.hnsw.ef_search.max(over_fetch);
-        let now = Timestamp::now();
 
         // Resolve tag predicate → allowed set (filtered ANN, not post-filter).
         let allowed: Option<HashSet<ExperienceId>> = match &filter.tags_all {
@@ -2918,8 +3074,47 @@ impl PulseDB {
     /// # Errors
     ///
     /// - [`NotFoundError::Collective`] if the collective doesn't exist
+    ///
+    /// For a caller-pinned time see
+    /// [`get_active_agents_with()`](Self::get_active_agents_with); this method
+    /// reads the wall clock once at entry.
     #[instrument(skip(self))]
     pub fn get_active_agents(&self, collective_id: CollectiveId) -> Result<Vec<Activity>> {
+        // One resolved read-time for the whole call (r1.s7.w1): this legacy
+        // entry reads the clock once at its own boundary.
+        let now = Timestamp::now();
+        self.active_agents_at(collective_id, now)
+    }
+
+    /// Returns all agents active at a pinned time in a collective.
+    ///
+    /// The `*_with` form of [`get_active_agents()`](Self::get_active_agents):
+    /// identical behaviour, except that staleness is judged at one resolved
+    /// time — `read.now()` when pinned, the wall clock read once at entry
+    /// otherwise. A past `now` is accepted and freezes the staleness cutoff
+    /// only; `last_heartbeat` is never rewound. Any [`Timestamp`] is accepted,
+    /// the extremes included.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`get_active_agents()`](Self::get_active_agents).
+    #[instrument(skip(self, read))]
+    pub fn get_active_agents_with(
+        &self,
+        collective_id: CollectiveId,
+        read: &ReadOptions,
+    ) -> Result<Vec<Activity>> {
+        refuse_exact(read.mode())?;
+        let now = read.now().unwrap_or_else(Timestamp::now);
+        self.active_agents_at(collective_id, now)
+    }
+
+    /// The shared active-agent filter with one already-resolved `now`.
+    fn active_agents_at(
+        &self,
+        collective_id: CollectiveId,
+        now: Timestamp,
+    ) -> Result<Vec<Activity>> {
         // Verify collective exists
         self.storage
             .get_collective(collective_id)?
@@ -2927,10 +3122,10 @@ impl PulseDB {
 
         let all_activities = self.storage.list_activities_in_collective(collective_id)?;
 
-        // Filter stale activities
-        let now = Timestamp::now();
+        // Filter stale activities. The cutoff saturates so an extreme `now`
+        // (i64::MIN / i64::MAX) is accepted without an overflow (grill A5).
         let threshold_ms = self.config.activity.stale_threshold.as_millis() as i64;
-        let cutoff = now.as_millis() - threshold_ms;
+        let cutoff = now.as_millis().saturating_sub(threshold_ms);
 
         let mut active: Vec<Activity> = all_activities
             .into_iter()
@@ -2955,6 +3150,11 @@ impl PulseDB {
     /// 3. Insight search ([`get_insights`](Self::get_insights)) — if requested
     /// 4. Relation collection ([`get_related_experiences`](Self::get_related_experiences)) — if requested
     /// 5. Active agents ([`get_active_agents`](Self::get_active_agents)) — if requested
+    ///
+    /// For a caller-pinned time see
+    /// [`get_context_candidates_with()`](Self::get_context_candidates_with);
+    /// this method reads the wall clock once at entry and passes the same
+    /// instant to both the weighted search and the agent filter.
     ///
     /// # Arguments
     ///
@@ -3001,6 +3201,47 @@ impl PulseDB {
     /// ```
     #[instrument(skip(self, request), fields(collective_id = %request.collective_id))]
     pub fn get_context_candidates(&self, request: ContextRequest) -> Result<ContextCandidates> {
+        // One resolved read-time for the whole call (r1.s7.w1): this legacy
+        // entry reads the clock once at its own boundary and hands the same
+        // instant to both the weighted search and the active-agent filter.
+        let now = Timestamp::now();
+        self.context_candidates_inner(request, now)
+    }
+
+    /// Retrieves unified context candidates at a pinned time.
+    ///
+    /// The `*_with` form of
+    /// [`get_context_candidates()`](Self::get_context_candidates): identical
+    /// behaviour, except that **one** resolved time — `read.now()` when
+    /// pinned, the wall clock read once at entry otherwise — is passed to both
+    /// the weighted similarity search and the active-agent filter, so the
+    /// assembled candidates are consistent with a single instant. A past `now`
+    /// is accepted and freezes the scoring and staleness time only; no stored
+    /// field is rewound.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`get_context_candidates()`](Self::get_context_candidates).
+    #[instrument(skip(self, request, read), fields(collective_id = %request.collective_id))]
+    pub fn get_context_candidates_with(
+        &self,
+        request: ContextRequest,
+        read: &ReadOptions,
+    ) -> Result<ContextCandidates> {
+        refuse_exact(read.mode())?;
+        validate_finite_query(&request.query_embedding, "query_embedding")?;
+        let now = read.now().unwrap_or_else(Timestamp::now);
+        self.context_candidates_inner(request, now)
+    }
+
+    /// The shared context-candidate assembly with one already-resolved `now`,
+    /// passed unchanged to both the weighted search and the active-agent
+    /// filter.
+    fn context_candidates_inner(
+        &self,
+        request: ContextRequest,
+        now: Timestamp,
+    ) -> Result<ContextCandidates> {
         // ── Validate limits ──────────────────────────────────────
         if request.max_similar == 0 || request.max_similar > 1000 {
             return Err(ValidationError::invalid_field(
@@ -3031,7 +3272,7 @@ impl PulseDB {
         }
 
         // ── 1. Similar experiences (HNSW vector search) ──────────
-        let similar_experiences = self.search(
+        let similar_experiences = self.search_inner(
             request.collective_id,
             &request.query_embedding,
             SearchOptions {
@@ -3039,6 +3280,7 @@ impl PulseDB {
                 filter: request.filter.clone(),
                 weights: request.recall_weights,
             },
+            now,
         )?;
 
         // ── 2. Recent experiences (timestamp index scan) ─────────
@@ -3094,7 +3336,7 @@ impl PulseDB {
 
         // ── 5. Active agents (staleness-filtered activity records) ─
         let active_agents = if request.include_active_agents {
-            self.get_active_agents(request.collective_id)?
+            self.active_agents_at(request.collective_id, now)?
         } else {
             vec![]
         };

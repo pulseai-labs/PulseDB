@@ -14,7 +14,7 @@ use crate::error::PulseDBError;
 use crate::experience::{Experience, NewExperience};
 use crate::insight::{DerivedInsight, NewDerivedInsight};
 use crate::relation::{ExperienceRelation, NewExperienceRelation, RelationDirection};
-use crate::search::{ContextCandidates, ContextRequest};
+use crate::search::{ContextCandidates, ContextRequest, ReadOptions, SearchOptions};
 use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId};
 use crate::watch::WatchEvent;
 
@@ -100,6 +100,11 @@ impl SubstrateProvider for PulseDBSubstrate {
         blocking(move || db.energy(id)).await
     }
 
+    async fn energy_with(&self, id: ExperienceId, read: ReadOptions) -> Result<f32, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.energy_with(id, &read)).await
+    }
+
     async fn search_similar(
         &self,
         collective: CollectiveId,
@@ -116,6 +121,28 @@ impl SubstrateProvider for PulseDBSubstrate {
                     .map(|r| (r.experience, r.similarity))
                     .collect()
             })
+        })
+        .await
+    }
+
+    async fn search_with(
+        &self,
+        collective: CollectiveId,
+        embedding: &[f32],
+        options: SearchOptions,
+        read: ReadOptions,
+    ) -> Result<Vec<(Experience, f32)>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        // Must clone the slice — spawn_blocking requires 'static
+        let embedding = embedding.to_vec();
+        blocking(move || {
+            db.search_with(collective, &embedding, options, &read)
+                .map(|results| {
+                    results
+                        .into_iter()
+                        .map(|r| (r.experience, r.similarity))
+                        .collect()
+                })
         })
         .await
     }
@@ -166,12 +193,30 @@ impl SubstrateProvider for PulseDBSubstrate {
         blocking(move || db.get_active_agents(collective)).await
     }
 
+    async fn get_activities_with(
+        &self,
+        collective: CollectiveId,
+        read: ReadOptions,
+    ) -> Result<Vec<Activity>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.get_active_agents_with(collective, &read)).await
+    }
+
     async fn get_context_candidates(
         &self,
         request: ContextRequest,
     ) -> Result<ContextCandidates, PulseDBError> {
         let db = Arc::clone(&self.db);
         blocking(move || db.get_context_candidates(request)).await
+    }
+
+    async fn get_context_candidates_with(
+        &self,
+        request: ContextRequest,
+        read: ReadOptions,
+    ) -> Result<ContextCandidates, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.get_context_candidates_with(request, &read)).await
     }
 
     async fn watch(
@@ -247,5 +292,16 @@ impl SubstrateProvider for PulseDBSubstrate {
     ) -> Result<Vec<(ExperienceId, f32)>, PulseDBError> {
         let db = Arc::clone(&self.db);
         blocking(move || db.list_cold_experiences(collective, below, limit)).await
+    }
+
+    async fn list_cold_experiences_with(
+        &self,
+        collective: CollectiveId,
+        below: f32,
+        limit: usize,
+        read: ReadOptions,
+    ) -> Result<Vec<(ExperienceId, f32)>, PulseDBError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || db.list_cold_experiences_with(collective, below, limit, &read)).await
     }
 }

@@ -5,10 +5,12 @@
 
 mod context;
 mod filter;
+mod read;
 pub(crate) mod rerank;
 
 pub use context::{ContextCandidates, ContextRequest};
 pub use filter::SearchFilter;
+pub use read::{ReadMode, ReadOptions};
 
 use crate::config::RecallWeights;
 use crate::experience::Experience;
