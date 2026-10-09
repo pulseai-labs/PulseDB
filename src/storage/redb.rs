@@ -1291,6 +1291,9 @@ impl RedbStorage {
         // a locked file, an unreadable header) leaves the whole ensure to
         // `open_existing`'s post-open discovery (B4).
         let mut migration_lock: Option<MigrationLock> = None;
+        // True only when `ensure_schema_backup` ran (and so validated any existing
+        // sidecar) under the lock; `open_existing` must ensure it otherwise.
+        let mut sidecar_ensured = false;
         if db_exists && !config.read_only {
             if let Some(schema_version) = Self::peek_schema_version(path) {
                 if schema_version < SCHEMA_VERSION {
@@ -1300,6 +1303,7 @@ impl RedbStorage {
                     match Self::peek_schema_version(path) {
                         Some(version) if version < SCHEMA_VERSION => {
                             ensure_schema_backup(path, version)?;
+                            sidecar_ensured = true;
                             info!(
                                 schema_version = version,
                                 "claimed the pre-migration sidecar under the migration \
@@ -1327,7 +1331,13 @@ impl RedbStorage {
 
         if db_exists {
             // Validate existing database
-            Self::open_existing(db, path.to_path_buf(), config, migration_lock.as_ref())
+            Self::open_existing(
+                db,
+                path.to_path_buf(),
+                config,
+                migration_lock.as_ref(),
+                sidecar_ensured,
+            )
         } else {
             // Initialize new database
             Self::initialize_new(db, path.to_path_buf(), config)
@@ -1776,6 +1786,7 @@ impl RedbStorage {
         path: PathBuf,
         config: &Config,
         held: Option<&MigrationLock>,
+        sidecar_ensured: bool,
     ) -> Result<Self> {
         info!("Opening existing database");
 
@@ -1825,7 +1836,9 @@ impl RedbStorage {
                 let sidecar_present = pending_sidecar_path(&path, metadata.schema_version)
                     .map(|backup_path| backup_path.try_exists().unwrap_or(false))
                     .unwrap_or(false);
-                if !sidecar_present || peek_was_unavailable {
+                // A held lock whose caller did not run the ensure (the re-peek under
+                // the lock failed) must still validate an existing sidecar.
+                if !sidecar_present || peek_was_unavailable || !sidecar_ensured {
                     if peek_was_unavailable {
                         info!(
                             schema_version = metadata.schema_version,
@@ -5255,6 +5268,45 @@ mod tests {
         assert!(
             !pre_v3_backup_path(&path).exists(),
             "read-only refusal must happen before migration backup/write work"
+        );
+    }
+
+    /// CR-1 (r1.s6 close): when `open`'s re-peek under the migration lock fails,
+    /// `open` holds the lock but never ran `ensure_schema_backup`. An existing
+    /// sidecar must then still be validated (w1 §3: "an existing sidecar is
+    /// proof only after validation"), not kept on existence alone.
+    #[test]
+    fn test_open_existing_validates_existing_sidecar_when_the_ensure_did_not_run() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v2_store(&path);
+
+        let backup_path = pre_v3_backup_path(&path);
+        std::fs::write(&backup_path, b"not a valid pre-v3 store image").unwrap();
+
+        let config = default_config();
+        let lock = MigrationLock::acquire_exclusive(&path).unwrap();
+        let db = RedbStorage::create_database(&path, &config).unwrap();
+        let storage = RedbStorage::open_existing(db, path.clone(), &config, Some(&lock), false)
+            .expect("the migration succeeds once a valid sidecar is published");
+        drop(storage);
+
+        validate_sidecar_image(&backup_path, 2)
+            .expect("the kept sidecar must be a validated pre-migration image");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".pre-v3.bak.invalid-")
+            })
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the invalid sidecar must be quarantined, never kept as the rollback point"
         );
     }
 
