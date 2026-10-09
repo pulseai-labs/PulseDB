@@ -449,7 +449,7 @@ impl PulseDB {
     ///
     /// The injected embedder bypasses [`EmbeddingProvider`] / [`Config`]
     /// entirely — it is passed in, not encoded in `Config`. Validation,
-    /// storage open, and HNSW index load behave identically to [`open`].
+    /// storage open, and HNSW index load behave identically to [`open`](Self::open).
     ///
     /// **Work 1.03 safety guard (the cross-provider-mixing refusal for
     /// `pulseai-labs/PulseDB#61`):** this constructor persists the injected
@@ -457,7 +457,7 @@ impl PulseDB {
     /// path, and refuses a reopen whose persisted identity differs from the
     /// injected embedder's on `(provider, model_id)`. The comparison is
     /// READ-only and runs BEFORE the stamp write; if the persisted identity is
-    /// absent (a pre-1.03 store, or a store opened via [`open`] which does not
+    /// absent (a pre-1.03 store, or a store opened via [`open`](Self::open) which does not
     /// stamp), the first `open_with_embedder` silently adopts the injected
     /// identity — safe because no production users carry pre-existing stores,
     /// and documented as the 0.7.0 release-notes caveat.
@@ -476,7 +476,7 @@ impl PulseDB {
     ///
     /// # Errors
     ///
-    /// Same failure modes as [`open`] (invalid config, corrupted file, lock
+    /// Same failure modes as [`open`](Self::open) (invalid config, corrupted file, lock
     /// contention, schema mismatch) plus
     /// [`PulseDBError::EmbeddingProviderMismatch`] when the persisted identity
     /// does not match the injected embedder on `(provider, model_id)`.
@@ -767,7 +767,7 @@ impl PulseDB {
     /// (VS-4.3.1 — embedding injection seam; VS-4.3.3 — both constructors stamp).
     ///
     /// Reads the **persisted** identity stamped into redb metadata by
-    /// [`open_with_embedder`] (work item 1.03) and [`open`] (work item 1.01),
+    /// [`open_with_embedder`](Self::open_with_embedder) (work item 1.03) and [`open`](Self::open) (work item 1.01),
     /// so the value reflects whatever provider *actually* embedded the store's
     /// contents and survives a process restart — not whatever embedder happens
     /// to be wired this session. The signature is stable across the 1.02→1.03
@@ -3585,7 +3585,7 @@ impl PulseDB {
     ///   embedding — and nothing undoes the save. The error says so and is
     ///   logged at `error!`; the row is left with no vector, and the next sync
     ///   of the same create repairs it from redb rather than skipping it
-    ///   ([`ensure_synced_experience_indexed`](Self::ensure_synced_experience_indexed)).
+    ///   (`ensure_synced_experience_indexed`).
     /// - a collective with no index gets one on the first indexed write. Its
     ///   existence is re-checked under the map write guard; if it disappeared
     ///   after the save, indexing fails and the change is not acknowledged.
@@ -3870,7 +3870,7 @@ impl PulseDB {
     /// mismatch from any other source leaving a record behind with no vector.
     ///
     /// After the save, the record is made searchable through
-    /// [`ensure_synced_insight_indexed`](Self::ensure_synced_insight_indexed)'s
+    /// `ensure_synced_insight_indexed`'s
     /// step — the entry is built from the stored insight, and a mapped but
     /// soft-deleted id has its mark cleared rather than no-opping. That is what
     /// lets a later sync repair a row this call left without an index entry.

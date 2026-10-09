@@ -612,6 +612,13 @@ pub enum WisdomCategory {
 │  Value: Activity (bincode serialized)                                        │
 │  Purpose: One active activity per agent per collective                       │
 │                                                                              │
+│  TABLE: sync_cursors (feature `sync`)                                        │
+│  ───────────────────                                                         │
+│  Key:   Peer InstanceId (16 bytes)                                           │
+│  Value: SyncCursor { instance_id, push_sequence, pull_sequence }             │
+│         (postcard serialized; push/pull split in schema v5)                  │
+│  Purpose: Per-peer sync positions; compact_wal trusts min(push_sequence)     │
+│                                                                              │
 │  TABLE: metadata                                                             │
 │  ──────────────                                                              │
 │  Key:   String                                                               │
@@ -783,17 +790,23 @@ let embedding: Vec<f32> = bytemuck::cast_slice(emb_bytes).to_vec();
 ### 8.1 Schema Versioning
 
 ```rust
-const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 5;
 
 fn check_schema_version(db: &Database) -> Result<()> {
     let stored_version = db.get_metadata("schema_version")?;
     
+    if stored_version == 0 {
+        return Err(StorageError::SchemaVersionMismatch {
+            expected: SCHEMA_VERSION,
+            found: stored_version,
+        });
+    }
     match stored_version.cmp(&SCHEMA_VERSION) {
         Ordering::Equal => Ok(()),
         Ordering::Less => migrate_schema(db, stored_version, SCHEMA_VERSION),
-        Ordering::Greater => Err(PulseDBError::IncompatibleVersion {
-            stored: stored_version,
+        Ordering::Greater => Err(StorageError::SchemaVersionMismatch {
             expected: SCHEMA_VERSION,
+            found: stored_version,
         }),
     }
 }
@@ -811,13 +824,17 @@ fn check_schema_version(db: &Database) -> Result<()> {
 
 ### 8.3 Backup Before Migration
 
-```rust
-fn backup_database(path: &Path) -> Result<PathBuf> {
-    let backup_path = path.with_extension("db.backup");
-    std::fs::copy(path, &backup_path)?;
-    Ok(backup_path)
-}
-```
+Before a schema migration, the first writable open claims a `<db>.pre-vN.bak` backup
+sidecar (`.pre-v3.bak`, `.pre-v4.bak`, `.pre-v5.bak`). A redb-v2 file gets a separate
+`.pre-substrate.bak`, taken before the redb file-format upgrade. An existing sidecar is
+never overwritten.
+
+The sidecar is a clean rollback image only when the first writable open has the store to
+itself. The pre-open copy holds no writer lock and is validated by
+`schema_version` only, the post-open fallback copy is not byte-identical, and neither copy
+is fsync'd (#89; see the 0.8.0 Known Limitations in `CHANGELOG.md`). Run the first
+writable open after an upgrade with no other process accessing the store. See
+[storage-migration.md](storage-migration.md) for the full procedure and rollback.
 
 ---
 

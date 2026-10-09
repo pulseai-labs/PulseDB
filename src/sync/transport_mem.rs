@@ -2,7 +2,7 @@
 //!
 //! [`InMemorySyncTransport`] is an in-process double for the wire, not a
 //! shortcut around it. Every request and reply is framed, encoded and decoded
-//! through [`wire`](super::wire) exactly as an HTTP body would be, so a test
+//! through [`wire`] exactly as an HTTP body would be, so a test
 //! running on it exercises the same serialization, the same byte cap and the
 //! same route checks. What it skips is the network, not the protocol.
 //!

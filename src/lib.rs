@@ -70,7 +70,7 @@
 //! Key components:
 //! - `SyncManager` — Orchestrates sync lifecycle (start/stop/sync_once)
 //! - `SyncTransport` — Pluggable transport trait (HTTP, in-memory, custom)
-//! - `SyncServer` — Server-side handler for Axum consumers (`sync-http`)
+//! - `SyncServer` — Framework-agnostic server-side handler (`sync`)
 //! - `PulseDB::compact_wal()` — WAL compaction for disk space reclamation
 //!
 //! ## Thread Safety

@@ -289,7 +289,7 @@ impl HnswIndex {
     /// unwinds leaves nothing behind, and a later insert of the same id
     /// succeeds and becomes searchable. A claim that is abandoned (the graph
     /// insert unwound) is released by
-    /// [`PendingClaim`]'s `Drop`, so it can never wedge the id.
+    /// `PendingClaim`'s `Drop`, so it can never wedge the id.
     ///
     /// The state lock is released around the graph insert, which keeps the
     /// lock order the search paths already use (`state` then the graph's own

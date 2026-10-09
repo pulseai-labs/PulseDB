@@ -65,7 +65,7 @@ use super::wire::{self, WireOperation};
 /// | GET | `/sync/health` | (none) | 200 OK |
 ///
 /// Every request and response body is a framed message (see
-/// [`wire`](super::wire)); `/sync/health` carries no body at all and is
+/// [`wire`]); `/sync/health` carries no body at all and is
 /// liveness only.
 pub struct HttpSyncTransport {
     client: Client,
@@ -359,7 +359,7 @@ impl SyncTransport for HttpSyncTransport {
     }
 
     /// The client's ACTUAL bounded-reader limit — the same number
-    /// [`read_body_bounded`](Self::read_body_bounded) enforces, not a separate
+    /// `read_body_bounded` enforces, not a separate
     /// configured guess.
     fn receive_limit_bytes(&self) -> usize {
         self.max_response_bytes

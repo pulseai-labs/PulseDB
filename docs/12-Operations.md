@@ -45,21 +45,23 @@ PulseDB is an embedded library, not a standalone service:
 ### 2.1 Add Dependency
 
 ```toml
-# Cargo.toml
+# Cargo.toml — external embeddings only (no default features)
 [dependencies]
-pulsedb = "0.1"
+pulsehive-db = "0.8"
 
-# Without ONNX (smaller binary)
+# With built-in ONNX embeddings (larger binary)
 [dependencies]
-pulsedb = { version = "0.1", default-features = false }
+pulsehive-db = { version = "0.8", features = ["builtin-embeddings"] }
 ```
+
+The crate is published as `pulsehive-db` and imported as `pulsedb`.
 
 ### 2.2 Binary Size
 
 | Configuration | Size | Trade-off |
 |---------------|------|-----------|
-| Default (with ONNX) | ~18 MB | Full functionality |
-| No default features | ~5 MB | External embeddings only |
+| `builtin-embeddings` (with ONNX) | ~18 MB | Built-in embedding generation |
+| Default (no features) | ~5 MB | External embeddings only |
 | Release + LTO | -20% | Longer build time |
 
 ### 2.3 Build Configuration
@@ -410,29 +412,20 @@ impl PulseDB {
 
 ### 7.4 Database Upgrade
 
-```rust
-// Handle schema migrations on open
-impl PulseDB {
-    fn check_and_migrate(&self) -> Result<()> {
-        let version = self.get_schema_version()?;
-        
-        match version {
-            0 => {
-                // Initial version, no migration needed
-            }
-            1 => {
-                // Migrate from v1 to v2
-                self.migrate_v1_to_v2()?;
-            }
-            _ => {
-                return Err(PulseDBError::UnsupportedVersion(version));
-            }
-        }
-        
-        Ok(())
-    }
-}
-```
+Schema migrations run automatically; there is no migration call to make.
+
+- Opening an older store (schema 1–4) migrates it in place on the first **writable** open,
+  after claiming a `<db>.pre-vN.bak` backup sidecar. Run that open with no other process
+  accessing the store: the sidecar is not guaranteed to be a clean rollback image under
+  a concurrent writer or migration (#89; see the 0.8.0 Known Limitations in `CHANGELOG.md`).
+- A non-`sync` build refuses to migrate a store written before the postcard re-encode
+  (bincode era) that holds sync cursor rows, with
+  `StorageError::SubstrateMigrationRequiresSync`. Open it once with the `sync` feature.
+- A read-only open of a not-yet-migrated store returns a typed `ReadOnly` error instead of
+  migrating.
+- A store written by a newer build returns `StorageError::SchemaVersionMismatch`.
+
+See [storage-migration.md](storage-migration.md) for each version step and for rollback.
 
 ---
 

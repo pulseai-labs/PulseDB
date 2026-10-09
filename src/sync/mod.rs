@@ -21,8 +21,8 @@
 //!
 //! | Feature | Description |
 //! |---------|-------------|
-//! | `sync` | Core types, transport trait, sync engine, in-memory transport |
-//! | `sync-http` | HTTP transport (reqwest) + server helper for Axum consumers |
+//! | `sync` | Core types, transport trait, sync engine, `SyncServer` handler, in-memory transport |
+//! | `sync-http` | HTTP transport (reqwest `HttpSyncTransport`) |
 //! | `sync-websocket` | WebSocket transport (tokio-tungstenite, future) |
 //!
 //! # Module Overview
@@ -60,21 +60,21 @@
 //! ones it owns, and a consumer's framework limits stack on top of them.
 //!
 //! **Framing (protocol v5).** Every body — handshake, push and pull, request
-//! and reply — carries the [`SYNC_WIRE_PREAMBLE_LEN`]-byte frame header, and
+//! and reply — carries the [`SYNC_WIRE_PREAMBLE_LEN`](crate::sync::SYNC_WIRE_PREAMBLE_LEN)-byte frame header, and
 //! every byte-level handler validates it by raw byte-slicing before any decode:
-//! byte cap, then magic, then [`WIRE_FORMAT_VERSION`], then the operation
+//! byte cap, then magic, then [`WIRE_FORMAT_VERSION`](crate::sync::WIRE_FORMAT_VERSION), then the operation
 //! discriminator, then an exact postcard decode that refuses trailing bytes.
 //! Route and metadata validation runs next, and only then may anything be
 //! applied or any cursor persisted. A protocol-v4 body is unframed on the data
-//! endpoints and is refused as [`SyncError::WireFormatMismatch`]; v5 offers no
+//! endpoints and is refused as [`SyncError::WireFormatMismatch`](crate::sync::SyncError::WireFormatMismatch); v5 offers no
 //! fallback.
 //!
 //! **Request byte cap (#26, #98).** Every byte-level server handler
 //! (`SyncServer::handle_{handshake,push,pull}_bytes`) compares `bytes.len()`
-//! against [`SyncConfig::max_request_bytes`] (default 64 MiB) **before** the
+//! against [`SyncConfig::max_request_bytes`](crate::sync::SyncConfig::max_request_bytes) (default 64 MiB) **before** the
 //! frame header is read and before any postcard decode. An oversized body is
-//! refused with the typed [`SyncError::PayloadTooLarge`]`{ size, max }` — never
-//! a decode error, never a partial decode; [`SyncError::is_payload_too_large`]
+//! refused with the typed [`SyncError::PayloadTooLarge`](crate::sync::SyncError::PayloadTooLarge)`{ size, max }` — never
+//! a decode error, never a partial decode; [`SyncError::is_payload_too_large`](crate::sync::SyncError::is_payload_too_large)
 //! is the hook for a `413 Payload Too Large` mapping. The HTTP transport client
 //! applies the same cap to response bodies (a `Content-Length` above the cap is
 //! refused unread, a chunked body is read bounded).
@@ -82,13 +82,13 @@
 //! Senders no longer *guess* whether a body will fit. The estimated
 //! per-experience byte floor that `SyncConfig::validate` used to impose is
 //! gone: both packers size the **complete candidate frame** with pinned
-//! postcard's own `serialized_size` ([`wire::encoded_len`]) and send the
+//! postcard's own `serialized_size` ([`wire::encoded_len`](crate::sync::wire::encoded_len)) and send the
 //! longest ordered prefix that fits the effective cap — `min(local policy, peer
 //! inbound limit)` on a push, `min(request limit, server policy)` on a pull
 //! reply. `SyncConfig::batch_size` stays a ceiling on the batch's **count**; it
 //! makes no claim about encoded bytes. A single change that cannot fit a body
 //! on its own is a deterministic dead end, so it is reported as the typed
-//! [`SyncError::ChangeTooLarge`] with its cursor unadvanced, and the background
+//! [`SyncError::ChangeTooLarge`](crate::sync::SyncError::ChangeTooLarge) with its cursor unadvanced, and the background
 //! loop stops retrying it instead of rebuilding the same refused body forever.
 //!
 //! **Send and receive budgets are different numbers.**
@@ -123,16 +123,16 @@
 //!
 //! **Protocol version and capabilities (#12).** The handshake carries a
 //! `protocol_version` that is *checked*: a mismatch reaches the client as the
-//! typed [`SyncError::ProtocolVersion`]`{ local, remote }`, never as a reason
+//! typed [`SyncError::ProtocolVersion`](crate::sync::SyncError::ProtocolVersion)`{ local, remote }`, never as a reason
 //! string inside `SyncError::Handshake`. The handshake's capability list, by
 //! contrast, is **informational only** — see
-//! [`SYNC_CAPABILITY_GCOUNTER_APPLICATIONS`]. Peers advertise capabilities;
+//! [`SYNC_CAPABILITY_GCOUNTER_APPLICATIONS`](crate::sync::SYNC_CAPABILITY_GCOUNTER_APPLICATIONS). Peers advertise capabilities;
 //! nothing is negotiated from them and nothing is refused because of them.
 //!
 //! **Reinforcement clock skew (#13).** An incoming `last_reinforced` beyond
-//! `now + `[`SyncConfig::max_clock_skew_ms`] (default 5 minutes) is logged at
+//! `now + `[`SyncConfig::max_clock_skew_ms`](crate::sync::SyncConfig::max_clock_skew_ms) (default 5 minutes) is logged at
 //! `warn` with the peer, the experience id and the skew, and counted in the
-//! local-only [`SyncStats::skewed_timestamps`] (`SyncManager::stats()`,
+//! local-only [`SyncStats::skewed_timestamps`](crate::sync::SyncStats::skewed_timestamps) (`SyncManager::stats()`,
 //! `SyncServer::stats()`). It is **never** clamped, rejected or re-timestamped:
 //! FR-031's max-merge stores the value byte-for-byte, so convergence is
 //! untouched. The bound stays **advisory**: correcting a skewed value needs a

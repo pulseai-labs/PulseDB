@@ -5,7 +5,7 @@
 //! during [`SyncManager::initial_sync()`](super::manager::SyncManager::initial_sync),
 //! typically for driving a loading bar in the UI.
 //!
-//! [`next_progress`] is the other half: one rule, used by the pull side and the
+//! `next_progress` is the other half: one rule, used by the pull side and the
 //! push side alike, for how far a cursor may move after an exchange.
 
 /// Callback for reporting sync progress during initial catchup.
