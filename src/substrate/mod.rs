@@ -57,7 +57,7 @@ use crate::error::PulseDBError;
 use crate::experience::{Experience, NewExperience};
 use crate::insight::{DerivedInsight, NewDerivedInsight};
 use crate::relation::{ExperienceRelation, NewExperienceRelation};
-use crate::search::{ContextCandidates, ContextRequest};
+use crate::search::{ContextCandidates, ContextRequest, ReadOptions, SearchOptions};
 use crate::types::{CollectiveId, ExperienceId, InsightId, RelationId};
 use crate::watch::WatchEvent;
 
@@ -108,6 +108,23 @@ pub trait SubstrateProvider: Send + Sync {
         ))
     }
 
+    /// Computes the temporal energy for an experience at a pinned time.
+    ///
+    /// The pinned-time form of [`energy`](Self::energy), backed by
+    /// [`PulseDB::energy_with`](crate::PulseDB::energy_with). The default
+    /// implementation returns an unsupported-operation error so existing custom
+    /// providers remain source-compatible without inventing a misleading energy
+    /// value.
+    async fn energy_with(
+        &self,
+        _id: ExperienceId,
+        _read: ReadOptions,
+    ) -> Result<f32, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::energy_with is not supported by this implementation",
+        ))
+    }
+
     /// Searches for experiences similar to the given embedding.
     ///
     /// Returns up to `k` results as `(Experience, similarity_score)` tuples,
@@ -118,6 +135,28 @@ pub trait SubstrateProvider: Send + Sync {
         embedding: &[f32],
         k: usize,
     ) -> Result<Vec<(Experience, f32)>, PulseDBError>;
+
+    /// Searches for experiences with optional recall weighting at a pinned
+    /// time.
+    ///
+    /// The pinned-time form of the search read, backed by
+    /// [`PulseDB::search_with`](crate::PulseDB::search_with): every
+    /// energy-dependent evaluation uses one resolved time, so two calls with
+    /// the same pinned `now` return the same ranking whatever the wall clock
+    /// says. The default implementation returns an unsupported-operation error
+    /// so existing custom providers remain source-compatible without
+    /// inventing a misleading ranking.
+    async fn search_with(
+        &self,
+        _collective: CollectiveId,
+        _embedding: &[f32],
+        _options: SearchOptions,
+        _read: ReadOptions,
+    ) -> Result<Vec<(Experience, f32)>, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::search_with is not supported by this implementation",
+        ))
+    }
 
     /// Retrieves the most recent experiences from a collective.
     ///
@@ -157,6 +196,24 @@ pub trait SubstrateProvider: Send + Sync {
     async fn get_activities(&self, collective: CollectiveId)
         -> Result<Vec<Activity>, PulseDBError>;
 
+    /// Retrieves agents active at a pinned time in a collective.
+    ///
+    /// The pinned-time form of [`get_activities`](Self::get_activities),
+    /// backed by
+    /// [`PulseDB::get_active_agents_with`](crate::PulseDB::get_active_agents_with):
+    /// staleness is judged at one resolved time. The default implementation
+    /// returns an unsupported-operation error so existing custom providers
+    /// remain source-compatible without inventing a misleading active set.
+    async fn get_activities_with(
+        &self,
+        _collective: CollectiveId,
+        _read: ReadOptions,
+    ) -> Result<Vec<Activity>, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::get_activities_with is not supported by this implementation",
+        ))
+    }
+
     /// Assembles context candidates from all retrieval primitives.
     ///
     /// Orchestrates similarity search, recent experiences, insights,
@@ -165,6 +222,25 @@ pub trait SubstrateProvider: Send + Sync {
         &self,
         request: ContextRequest,
     ) -> Result<ContextCandidates, PulseDBError>;
+
+    /// Assembles context candidates at a pinned time.
+    ///
+    /// The pinned-time form of
+    /// [`get_context_candidates`](Self::get_context_candidates), backed by
+    /// [`PulseDB::get_context_candidates_with`](crate::PulseDB::get_context_candidates_with):
+    /// **one** resolved time feeds both the weighted search and the
+    /// active-agent filter. The default implementation returns an
+    /// unsupported-operation error so existing custom providers remain
+    /// source-compatible without inventing a misleading candidate set.
+    async fn get_context_candidates_with(
+        &self,
+        _request: ContextRequest,
+        _read: ReadOptions,
+    ) -> Result<ContextCandidates, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::get_context_candidates_with is not supported by this implementation",
+        ))
+    }
 
     /// Subscribes to real-time experience change events in a collective.
     ///
@@ -247,6 +323,28 @@ pub trait SubstrateProvider: Send + Sync {
     ) -> Result<Vec<(ExperienceId, f32)>, PulseDBError> {
         Err(PulseDBError::internal(
             "SubstrateProvider::list_cold_experiences is not supported by this implementation",
+        ))
+    }
+
+    /// Lists cold (prune-eligible) experiences at a pinned time,
+    /// coldest-first.
+    ///
+    /// The pinned-time form of
+    /// [`list_cold_experiences`](Self::list_cold_experiences), backed by
+    /// [`PulseDB::list_cold_experiences_with`](crate::PulseDB::list_cold_experiences_with):
+    /// every record's energy is evaluated at one resolved time. The default
+    /// implementation returns an unsupported-operation error so existing custom
+    /// providers remain source-compatible without inventing a misleading
+    /// candidate list.
+    async fn list_cold_experiences_with(
+        &self,
+        _collective: CollectiveId,
+        _below: f32,
+        _limit: usize,
+        _read: ReadOptions,
+    ) -> Result<Vec<(ExperienceId, f32)>, PulseDBError> {
+        Err(PulseDBError::internal(
+            "SubstrateProvider::list_cold_experiences_with is not supported by this implementation",
         ))
     }
 }

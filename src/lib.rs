@@ -174,7 +174,10 @@ pub use insight::{DerivedInsight, InsightType, NewDerivedInsight};
 pub use activity::{Activity, NewActivity};
 
 // Search & Context
-pub use search::{ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult};
+pub use search::{
+    ContextCandidates, ContextRequest, ReadMode, ReadOptions, SearchFilter, SearchOptions,
+    SearchResult,
+};
 
 // Watch (real-time notifications + cross-process change detection)
 pub use watch::{ChangePoller, WatchEvent, WatchEventType, WatchFilter, WatchLock, WatchStream};
@@ -200,7 +203,8 @@ pub mod prelude {
     pub use crate::error::{PulseDBError, Result};
     pub use crate::experience::{Experience, ExperienceType, NewExperience};
     pub use crate::search::{
-        ContextCandidates, ContextRequest, SearchFilter, SearchOptions, SearchResult,
+        ContextCandidates, ContextRequest, ReadMode, ReadOptions, SearchFilter, SearchOptions,
+        SearchResult,
     };
     pub use crate::substrate::{PulseDBSubstrate, SubstrateProvider};
     pub use crate::types::{CollectiveId, ExperienceId, Timestamp};

@@ -4,12 +4,18 @@
 //! Uses External embedding provider (default), so all experiences must provide
 //! pre-computed embeddings of the correct dimension (384 for D384).
 
-use futures::StreamExt;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 
 use pulsedb::{
-    CollectiveId, Config, ContextRequest, InsightType, NewActivity, NewDerivedInsight,
-    NewExperience, NewExperienceRelation, PulseDB, PulseDBSubstrate, RelationType, SearchFilter,
-    SubstrateProvider,
+    Activity, Collective, CollectiveId, Config, ContextCandidates, ContextRequest, DerivedInsight,
+    Experience, ExperienceId, ExperienceRelation, InsightId, InsightType, NewActivity,
+    NewDerivedInsight, NewExperience, NewExperienceRelation, PulseDB, PulseDBError,
+    PulseDBSubstrate, ReadOptions, RecallWeights, RelationId, RelationType, SearchFilter,
+    SearchOptions, SubstrateProvider, Timestamp, WatchEvent,
 };
 use tempfile::tempdir;
 
@@ -574,4 +580,271 @@ async fn test_substrate_get_or_create_then_store_experience() {
     let exp = provider.get_experience(exp_id).await.unwrap().unwrap();
     assert_eq!(exp.collective_id, cid);
     assert_eq!(exp.content, "Test experience through substrate");
+}
+
+// ============================================================================
+// r1.s7.w1 — pinned-time `*_with` reads across the async edge
+// ============================================================================
+
+/// AC-10a: the concrete provider's `*_with` reads delegate through the async
+/// edge and agree with the synchronous `PulseDB` calls at a fixed `now`.
+#[tokio::test]
+async fn substrate_read_with_methods_agree_with_sync_at_fixed_now() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap());
+    let substrate = PulseDBSubstrate::new(Arc::clone(&db));
+    let cid = db.create_collective("substrate-with").unwrap();
+
+    let embedding = dummy_embedding();
+    let exp_id = db
+        .record_experience(NewExperience {
+            collective_id: cid,
+            content: "pinned read".to_string(),
+            embedding: Some(embedding.clone()),
+            importance: 0.5,
+            ..Default::default()
+        })
+        .unwrap();
+    let last = db.get_experience(exp_id).unwrap().unwrap().last_reinforced;
+    db.register_activity(NewActivity {
+        agent_id: "substrate-agent".to_string(),
+        collective_id: cid,
+        current_task: None,
+        context_summary: None,
+    })
+    .unwrap();
+
+    let pinned = Timestamp::from_millis(last.as_millis() + 365 * 24 * 60 * 60 * 1000);
+    let read = ReadOptions::new().at(pinned);
+
+    // energy_with
+    let via_substrate = substrate.energy_with(exp_id, read.clone()).await.unwrap();
+    let via_sync = db.energy_with(exp_id, &read).unwrap();
+    assert_eq!(via_substrate, via_sync, "energy_with must agree");
+
+    // search_with
+    let options = SearchOptions {
+        k: 5,
+        filter: SearchFilter::default(),
+        weights: Some(RecallWeights::new(0.5, 0.5)),
+    };
+    let via_substrate = substrate
+        .search_with(cid, &embedding, options.clone(), read.clone())
+        .await
+        .unwrap();
+    let via_sync = db.search_with(cid, &embedding, options, &read).unwrap();
+    assert_eq!(
+        via_substrate.len(),
+        via_sync.len(),
+        "search_with must agree"
+    );
+    for (pairs, result) in via_substrate.iter().zip(via_sync.iter()) {
+        assert_eq!(pairs.0.id, result.experience.id);
+        assert_eq!(pairs.1.to_bits(), result.similarity.to_bits());
+    }
+
+    // get_activities_with (active agents) — stale at the far-future now...
+    let via_substrate = substrate
+        .get_activities_with(cid, read.clone())
+        .await
+        .unwrap();
+    let via_sync = db.get_active_agents_with(cid, &read).unwrap();
+    assert!(via_substrate.is_empty() && via_sync.is_empty());
+
+    // ...and active at the record's own time, both sides agreeing.
+    let early = ReadOptions::new().at(last);
+    let via_substrate = substrate
+        .get_activities_with(cid, early.clone())
+        .await
+        .unwrap();
+    let via_sync = db.get_active_agents_with(cid, &early).unwrap();
+    assert_eq!(via_substrate.len(), via_sync.len());
+    assert_eq!(via_substrate.len(), 1);
+    assert_eq!(via_substrate[0].agent_id, via_sync[0].agent_id);
+
+    // get_context_candidates_with
+    let request = ContextRequest {
+        collective_id: cid,
+        query_embedding: embedding.clone(),
+        max_similar: 5,
+        max_recent: 5,
+        ..Default::default()
+    };
+    let via_substrate = substrate
+        .get_context_candidates_with(request.clone(), read.clone())
+        .await
+        .unwrap();
+    let via_sync = db.get_context_candidates_with(request, &read).unwrap();
+    assert_eq!(
+        via_substrate.similar_experiences.len(),
+        via_sync.similar_experiences.len()
+    );
+    assert!(via_substrate.active_agents.is_empty() && via_sync.active_agents.is_empty());
+
+    // list_cold_experiences_with — the far-future pinned now makes the record cold.
+    let via_substrate = substrate
+        .list_cold_experiences_with(cid, 0.05, 10, read.clone())
+        .await
+        .unwrap();
+    let via_sync = db.list_cold_experiences_with(cid, 0.05, 10, &read).unwrap();
+    assert_eq!(via_substrate.len(), via_sync.len());
+    assert_eq!(
+        via_substrate.len(),
+        1,
+        "the record is cold at the pinned now"
+    );
+}
+
+/// A provider implementing ONLY the required trait methods, so every defaulted
+/// `*_with` read reaches its trait default.
+struct MinimalProvider;
+
+#[async_trait]
+impl SubstrateProvider for MinimalProvider {
+    async fn store_experience(&self, _exp: NewExperience) -> Result<ExperienceId, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_experience(&self, _id: ExperienceId) -> Result<Option<Experience>, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn search_similar(
+        &self,
+        _collective: CollectiveId,
+        _embedding: &[f32],
+        _k: usize,
+    ) -> Result<Vec<(Experience, f32)>, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_recent(
+        &self,
+        _collective: CollectiveId,
+        _limit: usize,
+    ) -> Result<Vec<Experience>, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn store_relation(
+        &self,
+        _rel: NewExperienceRelation,
+    ) -> Result<RelationId, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_related(
+        &self,
+        _exp_id: ExperienceId,
+    ) -> Result<Vec<(Experience, ExperienceRelation)>, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn store_insight(&self, _insight: NewDerivedInsight) -> Result<InsightId, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_insights(
+        &self,
+        _collective: CollectiveId,
+        _embedding: &[f32],
+        _k: usize,
+    ) -> Result<Vec<(DerivedInsight, f32)>, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_activities(
+        &self,
+        _collective: CollectiveId,
+    ) -> Result<Vec<Activity>, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_context_candidates(
+        &self,
+        _request: ContextRequest,
+    ) -> Result<ContextCandidates, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn watch(
+        &self,
+        _collective: CollectiveId,
+    ) -> Result<Pin<Box<dyn Stream<Item = WatchEvent> + Send>>, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn create_collective(&self, _name: &str) -> Result<CollectiveId, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_or_create_collective(&self, _name: &str) -> Result<CollectiveId, PulseDBError> {
+        unimplemented!("stub")
+    }
+
+    async fn list_collectives(&self) -> Result<Vec<Collective>, PulseDBError> {
+        unimplemented!("stub")
+    }
+    // NOTE: every `*_with` read is intentionally NOT overridden — the test
+    // exercises the trait DEFAULTS.
+}
+
+/// AC-10b: a provider without overrides gets the explicit not-supported error
+/// from every defaulted `*_with` read, through a trait object.
+#[tokio::test]
+async fn substrate_read_with_methods_default_to_not_supported() {
+    let provider: Box<dyn SubstrateProvider> = Box::new(MinimalProvider);
+    let read = ReadOptions::new();
+
+    let results: Vec<(&str, Result<String, PulseDBError>)> = vec![
+        (
+            "energy_with",
+            provider
+                .energy_with(ExperienceId::new(), read.clone())
+                .await
+                .map(|value| value.to_string()),
+        ),
+        (
+            "search_with",
+            provider
+                .search_with(
+                    CollectiveId::nil(),
+                    &dummy_embedding(),
+                    SearchOptions::default(),
+                    read.clone(),
+                )
+                .await
+                .map(|results| results.len().to_string()),
+        ),
+        (
+            "get_activities_with",
+            provider
+                .get_activities_with(CollectiveId::nil(), read.clone())
+                .await
+                .map(|activities| activities.len().to_string()),
+        ),
+        (
+            "get_context_candidates_with",
+            provider
+                .get_context_candidates_with(ContextRequest::default(), read.clone())
+                .await
+                .map(|candidates| candidates.similar_experiences.len().to_string()),
+        ),
+        (
+            "list_cold_experiences_with",
+            provider
+                .list_cold_experiences_with(CollectiveId::nil(), 0.5, 10, read.clone())
+                .await
+                .map(|candidates| candidates.len().to_string()),
+        ),
+    ];
+
+    for (name, result) in results {
+        let err = result.expect_err(name);
+        assert!(
+            err.to_string()
+                .contains("not supported by this implementation"),
+            "{name}: expected the explicit not-supported error, got: {err}"
+        );
+    }
 }
