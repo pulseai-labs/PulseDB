@@ -71,7 +71,7 @@ pub fn open(path: impl AsRef<Path>, config: Config) -> Result<PulseDB, PulseDBEr
 |-------|-----------|
 | `PulseDBError::Io` | File system error |
 | `StorageError::Corrupted` | Database file corrupted |
-| `StorageError::SchemaVersionMismatch` | On-disk schema version differs from expected |
+| `StorageError::SchemaVersionMismatch` | On-disk schema version is newer than this build supports (> 5) or invalid (0). Older schemas (1–4) migrate on a writable open; see [storage-migration.md](storage-migration.md) |
 | `ValidationError::DimensionMismatch` | Config dimension doesn't match existing |
 
 **Example:**

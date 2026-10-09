@@ -4,7 +4,7 @@
 //! release builds, so the production migration path is byte-identical when the
 //! feature is off (each call site is a statement-level `#[cfg(...)]` that
 //! disappears entirely). This lets a test ARM a simulated crash at a specific
-//! migration boundary; the migration path calls [`maybe_inject`] at each of the
+//! migration boundary; the migration path calls `maybe_inject` at each of the
 //! five boundaries, which either `panic!`s (in-process — Drop runs, so the redb
 //! write-txn aborts gracefully / MVCC rolls back) or `raise(SIGKILL)`s (the one
 //! subprocess crash-fidelity test — no Drop, forcing redb's file-level recovery).

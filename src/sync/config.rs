@@ -206,7 +206,7 @@ pub struct SyncConfig {
     /// a guessed configuration value.
     ///
     /// Must be at least
-    /// [`MIN_CONTROL_FRAME_BYTES`](super::wire::MIN_CONTROL_FRAME_BYTES)
+    /// [`MIN_CONTROL_FRAME_BYTES`]
     /// (1 KiB): below that a peer could not exchange its own bounded control
     /// traffic, and no retry repairs that. Default: 64 MiB
     /// ([`DEFAULT_MAX_REQUEST_BYTES`]).
@@ -315,7 +315,7 @@ impl SyncConfig {
     /// - `push_interval_ms` is 0
     /// - `pull_interval_ms` is 0
     /// - `max_request_bytes` is below
-    ///   [`MIN_CONTROL_FRAME_BYTES`](super::wire::MIN_CONTROL_FRAME_BYTES)
+    ///   [`MIN_CONTROL_FRAME_BYTES`]
     ///
     /// # What this does not check
     ///

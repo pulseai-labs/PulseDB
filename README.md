@@ -54,21 +54,21 @@ db.close()?;
 
 ```toml
 [dependencies]
-pulsehive-db = "0.3"
+pulsehive-db = "0.8"
 ```
 
 With built-in embedding generation:
 
 ```toml
 [dependencies]
-pulsehive-db = { version = "0.3", features = ["builtin-embeddings"] }
+pulsehive-db = { version = "0.8", features = ["builtin-embeddings"] }
 ```
 
 With distributed sync (HTTP transport):
 
 ```toml
 [dependencies]
-pulsehive-db = { version = "0.3", features = ["sync-http"] }
+pulsehive-db = { version = "0.8", features = ["sync-http"] }
 ```
 
 > **Note:** The crate is published as `pulsehive-db` on crates.io but imported as `use pulsedb::...` in Rust code.
@@ -98,12 +98,12 @@ Desktop (Tauri)                    Server (Axum)
 │  PulseDB (local) │              │  PulseDB (server)│
 │  ┌─────────────┐ │   push/pull  │  ┌─────────────┐ │
 │  │ SyncManager │◄├─────────────►├──│ SyncServer  │ │
-│  │ (background)│ │  HTTP/bincode│  │ (Axum)      │ │
+│  │ (background)│ │ HTTP/postcard│  │ (Axum)      │ │
 │  └─────────────┘ │              │  └─────────────┘ │
 └──────────────────┘              └──────────────────┘
 ```
 
-**Feature flags:** `sync` (core engine), `sync-http` (HTTP transport + server helper)
+**Feature flags:** `sync` (core engine, framework-agnostic `SyncServer` handler, in-memory transport), `sync-http` (adds the reqwest `HttpSyncTransport` client). PulseDB builds no router: the server process mounts `SyncServer` in its own web framework.
 
 **Key capabilities:**
 - Background push/pull loops with configurable intervals
@@ -119,7 +119,8 @@ per-instance reinforcement counter. A file-level copy of a store — a backup
 restore, a snapshot, a plain `cp` — carries the *same* id, so if the original
 and the copy both keep syncing, their reinforcements collide and are silently
 lost. Give a restored copy its own identity **before its first reinforce and
-before constructing a `SyncManager`** over it:
+before constructing a `SyncManager` or `SyncServer`** over it. Both read the
+identity once, at construction; reminting a live instance is unsupported:
 
 ```rust,ignore
 let restored = PulseDB::open("restored-copy.db", Config::default())?;
@@ -195,7 +196,7 @@ Run benchmarks yourself: `cargo bench`
 
 ### Collective
 
-A **collective** is an isolated namespace for experiences, typically one per project. Each collective has its own vector index and can have different embedding dimensions.
+A **collective** is an isolated namespace for experiences, typically one per project. Each collective gets its own HNSW vector index, created on its first indexed write. All collectives in a database share the database's configured embedding dimension.
 
 ### Experience
 

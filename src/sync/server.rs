@@ -273,7 +273,7 @@ impl SyncServer {
     ///
     /// `has_more` is a claim about the WAL, not about the batch: it is false
     /// only when this pull proved the WAL exhausted, which one poll can only do
-    /// by coming back SHORT of [`PULL_PAGE_EVENT_LIMIT`].
+    /// by coming back SHORT of `PULL_PAGE_EVENT_LIMIT`.
     #[instrument(skip(self, request))]
     pub fn handle_pull(&self, request: PullRequest) -> Result<WireReply<PullPage>, SyncError> {
         if request.protocol_version != SYNC_PROTOCOL_VERSION {
