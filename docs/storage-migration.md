@@ -116,12 +116,18 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    copy is staged at a process-unique sibling temp, `fsync`ed, **validated as a whole image**
    (re-opened read-only: `schema_version` read back, then every table and multimap the image lists
    traversed and every entry read — a metadata-only check cannot see a copy torn by a concurrent
-   writer's commit), and published by an atomic create-if-absent hard link, which never replaces an
+   writer's commit; then redb's `check_integrity`, which verifies every page checksum, run on a
+   disposable sibling copy `<image>.<pid>.<nonce>.integrity.tmp` opened writable — the traversal
+   alone cannot see a flipped byte inside a stored value that still decodes, and the image itself
+   is never opened writable), and published by an atomic create-if-absent hard link, which never replaces an
    existing sidecar. On link-less volumes, an exclusive create-and-copy of the validated stage
    is synced before success; an interrupted copy is validated and quarantined on the next
-   migrating open. Any failure — a failed fsync, a torn image, a failed publish — **refuses the
-   migration** with a typed error; the store stays at its pre-migration schema and the temp is
-   removed. On Unix, parent-directory open and fsync must also succeed before migration,
+   migrating open. Any failure — a failed fsync, a torn image, a failed integrity check, an
+   integrity copy that cannot be made (disk full, permissions), a failed publish — **refuses the
+   migration** with a typed error; the store stays at its pre-migration schema and the temps are
+   removed. Cost: the integrity check makes one extra whole-store copy per validation, on migration
+   paths only — never on a steady-state open (measured: about 50 ms for a 34 MB store of 10k
+   384-d experiences on a local NVMe disk). On Unix, parent-directory open and fsync must also succeed before migration,
    including when an existing validated sidecar is kept on retry. On every platform,
    a kept sidecar's file contents must sync before the directory barrier; inability to open
    it with write access for sync (for example a read-only file on Windows), or a failed sync,
@@ -131,13 +137,16 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    migration, the copy is taken from the post-open bytes instead — a valid store, but not
    byte-identical; the open says so at `info!`. An **existing** sidecar is proof only after the same
    whole-image validation: a valid one is kept, and one that fails (does not open, wrong
-   `schema_version`, or fails the traversal) is renamed to
+   `schema_version`, fails the traversal, or fails the integrity check) is renamed to
    `<db>.pre-v5.bak.invalid-<unix-seconds>` (`-<n>` if taken) — logged at `warn` with both paths,
-   never deleted — and a fresh image is published. (The same rules cover `.pre-v4.bak` for redb-v3
+   never deleted — and a fresh image is published. An existing sidecar that cannot be checked (its
+   integrity copy cannot be made, or redb hits an I/O error on the copy) refuses the migration and is left in place — neither kept nor
+   quarantined. (The same rules cover `.pre-v4.bak` for redb-v3
    schema-3 stores; redb-v2 stores keep `.pre-substrate.bak` as their pristine copy.)
    A crash between the staged copy and the publish leaves a store-sized
-   `<db>.pre-vN.bak.<pid>.<nonce>.sidecar.tmp`. Nothing removes it; it is safe to delete when no
-   migration is running.
+   `<db>.pre-vN.bak.<pid>.<nonce>.sidecar.tmp`, and a crash during the integrity check leaves a
+   store-sized `….integrity.tmp` beside the image being checked. Nothing removes them; they are
+   safe to delete when no migration is running.
 2. **Cursor reset (single write transaction).** Every `sync_cursors` row is rewritten as
    `{ instance_id, push_sequence: 0, pull_sequence: 0 }`. The legacy `last_sequence` is **not** used
    to seed either side — it may hold a local *or* a remote sequence, and seeding from it could skip

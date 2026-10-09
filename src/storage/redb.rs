@@ -372,16 +372,37 @@ fn quarantine_invalid_sidecar(backup_path: &Path) -> Result<PathBuf> {
 /// `expected_schema_version` — the validation step of the durable publish
 /// (spec §2) and of the existing-sidecar check (spec §3, r1.s6.w1 / #89).
 ///
-/// Read-only throughout (zero writes), so a published image stays byte-identical
-/// to the source it copies. The work is
-/// [`RedbStorage::validate_sidecar_image_inner`]; a redb PANIC raised while
-/// parsing a torn page counts as "invalid" here, never as a crash of the
-/// migrating open (redb's page accessors `unwrap()` — e.g.
-/// `LeafAccessor::total_length` reached by `stats()`).
-fn validate_sidecar_image(path: &Path, expected_schema_version: u32) -> Result<()> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+/// Returns `Ok(Ok(()))` for a valid image and `Ok(Err(_))` for an invalid one
+/// (the caller refuses a staged copy, or quarantines an existing sidecar). The
+/// outer `Err` means the image could not be CHECKED — the integrity copy below
+/// could not be made, or redb hit an I/O error on it — and the caller refuses
+/// the migration without judging the image: fail closed, nothing quarantined.
+///
+/// Two stages, both required:
+/// 1. [`validate_sidecar_image_inner`] on `path`, read-only (zero writes), so a
+///    published image stays byte-identical to the source it copies.
+/// 2. [`check_sidecar_image_integrity`]: redb's `check_integrity` on a
+///    disposable sibling copy, which verifies every page checksum. Stage 1
+///    alone cannot see a byte flip inside a stored value that still
+///    deserializes (LF2, PR #119): redb 4.2 verifies checksums only on its
+///    integrity/repair path, and that path needs a writable handle — the image
+///    itself is never opened writable.
+///
+/// A redb PANIC raised while parsing a torn page, in either stage, counts as
+/// "invalid", never as a crash of the migrating open (redb's page accessors
+/// `unwrap()` — e.g. `LeafAccessor::total_length` reached by `stats()`).
+fn validate_sidecar_image(path: &Path, expected_schema_version: u32) -> Result<Result<()>> {
+    if let Err(invalid) = parse_guarded(path, || {
         validate_sidecar_image_inner(path, expected_schema_version)
-    })) {
+    }) {
+        return Ok(Err(invalid));
+    }
+    check_sidecar_image_integrity(path)
+}
+
+/// Runs `parse` and turns a redb panic into a `Corrupted` error naming `path`.
+fn parse_guarded(path: &Path, parse: impl FnOnce() -> Result<()>) -> Result<()> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse)) {
         Ok(result) => result,
         Err(_) => Err(StorageError::corrupted(format!(
             "sidecar image {} panicked redb's parser while being validated; \
@@ -392,7 +413,82 @@ fn validate_sidecar_image(path: &Path, expected_schema_version: u32) -> Result<(
     }
 }
 
-/// The work behind [`validate_sidecar_image`] (panic-guarded by its caller).
+#[cfg(test)]
+thread_local! {
+    static FAIL_SIDECAR_INTEGRITY_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sibling temp path for the disposable integrity copy of the image at `path`:
+/// `.<pid>.<nonce>.integrity.tmp`, unique per call like
+/// [`sidecar_staging_temp_path`] (same nonce counter). A crash during the check
+/// leaves this store-sized file behind; it is safe to delete when no migration
+/// is running.
+fn sidecar_integrity_temp_path(path: &Path) -> PathBuf {
+    let nonce = SIDECAR_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".{}.{nonce}.integrity.tmp", std::process::id()));
+    PathBuf::from(temp)
+}
+
+/// Stage 2 of [`validate_sidecar_image`]: copy the image to a sibling temp,
+/// open the COPY writable and run redb's `check_integrity`, which verifies
+/// every page checksum. `Ok(true)` is valid; `Ok(false)` (redb had to repair
+/// the copy) or a non-I/O redb error is invalid. The image at `path` is only
+/// read. The temp is removed on every exit path.
+///
+/// The outer `Err` (refuse, never quarantine) covers a copy that cannot be made
+/// (disk full, permissions) and a redb I/O error on the copy: neither says
+/// anything about the image.
+fn check_sidecar_image_integrity(path: &Path) -> Result<Result<()>> {
+    let temp_path = sidecar_integrity_temp_path(path);
+    // Symlink-safe staging (same posture as `publish_durable_sidecar`): unlink
+    // any stale entry, then `create_new` a fresh regular file carrying the
+    // image's permission bits.
+    let _ = std::fs::remove_file(&temp_path);
+    let copied = (|| -> std::io::Result<()> {
+        let mut temp_file = create_sidecar_file(path, &temp_path)?;
+        #[cfg(test)]
+        if FAIL_SIDECAR_INTEGRITY_COPY.with(|fail| fail.replace(false)) {
+            return Err(std::io::Error::other("injected integrity copy failure"));
+        }
+        let mut image = std::fs::File::open(path)?;
+        std::io::copy(&mut image, &mut temp_file).map(|_| ())
+    })();
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(PulseDBError::Io(error));
+    }
+    let mut io_failure = None;
+    let verdict = parse_guarded(path, || {
+        let integrity = Database::builder()
+            .open(&temp_path)
+            .and_then(|mut db| db.check_integrity());
+        match integrity {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(StorageError::corrupted(format!(
+                "sidecar image {} fails redb's integrity check (its copy needed repair)",
+                path.display()
+            ))
+            .into()),
+            Err(::redb::DatabaseError::Storage(::redb::StorageError::Io(error))) => {
+                io_failure = Some(error);
+                Ok(())
+            }
+            Err(error) => Err(StorageError::corrupted(format!(
+                "sidecar image {} fails redb's integrity check: {error}",
+                path.display()
+            ))
+            .into()),
+        }
+    });
+    let _ = std::fs::remove_file(&temp_path);
+    match io_failure {
+        Some(error) => Err(PulseDBError::Io(error)),
+        None => Ok(verdict),
+    }
+}
+
+/// Stage 1 of [`validate_sidecar_image`] (panic-guarded by its caller).
 ///
 /// Steps: open `path` **read-only** (a torn image typically fails here); read
 /// `db_metadata` and require the expected `schema_version` — the check the
@@ -406,10 +502,12 @@ fn validate_sidecar_image(path: &Path, expected_schema_version: u32) -> Result<(
 /// is walked and logged at `debug!`, never invalid.
 ///
 /// Why both halves: redb 4.2 exposes no untyped ENTRY iteration
-/// (`ReadOnlyUntypedTable` has `len`/`stats` only) and verifies its page
-/// checksums only on the repair/integrity paths — ordinary reads do not — so
-/// the type-agnostic page walk covers every page of every listed table while
-/// the typed read parses every key/value pair of the tables this build knows.
+/// (`ReadOnlyUntypedTable` has `len`/`stats` only), so the type-agnostic page
+/// walk covers every page of every listed table while the typed read parses
+/// every key/value pair of the tables this build knows. Neither verifies page
+/// checksums — redb does that only on its repair/integrity path — so a flipped
+/// byte inside a value that still decodes passes this stage; stage 2
+/// ([`check_sidecar_image_integrity`]) catches it.
 /// A metadata-only check is not proof: a copy torn by a concurrent writer, or
 /// any external damage, can keep a readable `db_metadata` while experience,
 /// embedding or index pages are damaged (Codex P2 on PR #88).
@@ -685,11 +783,16 @@ fn publish_durable_sidecar_with(
     #[cfg(feature = "fault-injection")]
     crate::fault_injection::maybe_inject(crate::fault_injection::Boundary::MidSchemaBackup);
     // Spec §2/§3: the staged bytes are proof only once validated as a whole
-    // image. Validation is read-only, so the published bytes stay byte-identical
-    // to the source.
-    if let Err(error) = validate_sidecar_image(&temp_path, expected_schema_version) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
+    // image. Validation never writes the stage (the integrity check runs on a
+    // disposable copy), so the published bytes stay byte-identical to the
+    // source. An invalid stage and a stage that could not be checked both
+    // refuse the migration.
+    match validate_sidecar_image(&temp_path, expected_schema_version) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) | Err(error) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
     }
     // Keep the validated stage until either publish path has finished. Only
     // exclusive destination creation grants ownership for failure cleanup.
@@ -769,7 +872,10 @@ fn sync_schema_sidecar_directory_with(
 /// Ensures the pre-migration sidecar for a store still at `schema_version`,
 /// under the migration lock (spec §2 + §3, r1.s6.w1 / #89 + #25).
 ///
-/// An EXISTING sidecar is proof only after [`validate_sidecar_image`]. A valid
+/// An EXISTING sidecar is proof only after [`validate_sidecar_image`] (both
+/// stages, including redb's checksum-verifying integrity check on a disposable
+/// copy). A sidecar that cannot be checked refuses the migration and is left in
+/// place, neither kept as proof nor quarantined. A valid
 /// one is kept, but its contents must sync successfully before the directory
 /// barrier. Opening it for sync requires write access (including on Windows);
 /// access or sync failure refuses migration with a typed I/O error.
@@ -785,7 +891,9 @@ fn ensure_schema_backup(source: &Path, schema_version: u32) -> Result<()> {
         )))
     })?;
     if backup_path.try_exists().map_err(PulseDBError::Io)? {
-        match validate_sidecar_image(&backup_path, schema_version) {
+        // `?`: an image that could not be CHECKED (no integrity copy) refuses
+        // the migration and is neither kept nor quarantined.
+        match validate_sidecar_image(&backup_path, schema_version)? {
             Ok(()) => {
                 debug!(
                     backup = %backup_path.display(),
@@ -5388,6 +5496,7 @@ mod tests {
         drop(storage);
 
         validate_sidecar_image(&backup_path, 2)
+            .unwrap()
             .expect("the kept sidecar must be a validated pre-migration image");
         let quarantined: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -5422,11 +5531,187 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .filter(|entry| {
                 let name = entry.file_name().unwrap().to_string_lossy().to_string();
-                name.starts_with(&prefix) && name.ends_with(".sidecar.tmp")
+                name.starts_with(&prefix)
+                    && (name.ends_with(".sidecar.tmp") || name.ends_with(".integrity.tmp"))
             })
             .collect();
         found.sort();
         found
+    }
+
+    const PAYLOAD_MARKER: &str = "PAYLOAD-MARKER-QQQQQQQQQQQQQQQQ";
+
+    /// A valid schema-4 image at `path`: a current store holding one
+    /// experience whose content is [`PAYLOAD_MARKER`], its metadata rewritten
+    /// to `schema_version` 4.
+    fn seed_schema_v4_image_with_marker(path: &Path) -> ExperienceId {
+        let storage = RedbStorage::open(path, &default_config()).unwrap();
+        let collective = Collective::new("payload", 384);
+        storage.save_collective(&collective).unwrap();
+        let mut experience = test_experience(collective.id, 384);
+        experience.content = PAYLOAD_MARKER.into();
+        storage.save_experience(&experience).unwrap();
+        Box::new(storage).close().unwrap();
+
+        let db = Database::builder().open(path).unwrap();
+        let mut metadata = RedbStorage::read_metadata(&db).unwrap();
+        metadata.schema_version = 4;
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut meta_table = write_txn.open_table(METADATA_TABLE).unwrap();
+            let bytes = postcard::to_stdvec(&metadata).unwrap();
+            meta_table.insert(METADATA_KEY, bytes.as_slice()).unwrap();
+        }
+        write_txn.commit().unwrap();
+        experience.id
+    }
+
+    fn read_experience_content(path: &Path, id: ExperienceId) -> String {
+        let db = Database::builder().open_read_only(path).unwrap();
+        let read_txn = db.begin_read().unwrap();
+        let table = read_txn.open_table(EXPERIENCES_TABLE).unwrap();
+        let bytes = table.get(id.as_bytes()).unwrap().unwrap().value().to_vec();
+        postcard::from_bytes::<Experience>(&bytes).unwrap().content
+    }
+
+    /// Flips one byte inside the LIVE stored content of `id`, leaving every
+    /// page header and B-tree link intact: the typed read still deserializes,
+    /// now to the mutated string ('Q' -> 'R' keeps it UTF-8).
+    fn flip_one_stored_payload_byte(path: &Path, id: ExperienceId) {
+        let original = std::fs::read(path).unwrap();
+        let needle = PAYLOAD_MARKER.as_bytes();
+        let starts: Vec<usize> = original
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, window)| *window == needle)
+            .map(|(start, _)| start)
+            .collect();
+        for start in starts {
+            let mut bytes = original.clone();
+            bytes[start + needle.len() - 1] ^= 0x03;
+            std::fs::write(path, &bytes).unwrap();
+            let content = read_experience_content(path, id);
+            if content != PAYLOAD_MARKER {
+                assert!(
+                    content.ends_with('R'),
+                    "the flip must keep the value decodable"
+                );
+                return;
+            }
+        }
+        panic!("no occurrence of the marker was the live stored value");
+    }
+
+    /// LF2 (PR #119): redb verifies page checksums only on its integrity /
+    /// repair path, so a bit flip inside a stored value that still
+    /// deserializes passed the read-only traversal. Validation must reject it.
+    #[test]
+    fn test_sidecar_validation_rejects_a_payload_byte_flip_with_intact_pages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("image.db");
+        let id = seed_schema_v4_image_with_marker(&path);
+        validate_sidecar_image(&path, 4)
+            .expect("the pristine image can be checked")
+            .expect("the pristine image is valid");
+
+        flip_one_stored_payload_byte(&path, id);
+        let flipped = std::fs::read(&path).unwrap();
+
+        let verdict = validate_sidecar_image(&path, 4).expect("the image can be checked");
+        assert!(
+            matches!(
+                verdict,
+                Err(PulseDBError::Storage(StorageError::Corrupted(_)))
+            ),
+            "a payload byte flip must make the image invalid, got {verdict:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            flipped,
+            "validation must never write the image it checks"
+        );
+        assert!(
+            leftover_sidecar_temps(&path).is_empty(),
+            "the integrity copy must be removed"
+        );
+    }
+
+    /// LF2: an existing sidecar whose payload byte flipped is quarantined —
+    /// never kept as the rollback point — and a fresh image is published.
+    #[test]
+    fn test_existing_sidecar_with_payload_byte_flip_is_quarantined() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let id = seed_schema_v4_image_with_marker(&path);
+        let backup_path = pre_v5_backup_path(&path);
+        std::fs::copy(&path, &backup_path).unwrap();
+        flip_one_stored_payload_byte(&backup_path, id);
+        let flipped = std::fs::read(&backup_path).unwrap();
+
+        ensure_schema_backup(&path, 4).expect("a fresh sidecar replaces the invalid one");
+
+        assert_eq!(
+            std::fs::read(&backup_path).unwrap(),
+            std::fs::read(&path).unwrap(),
+            "the published sidecar must be a fresh copy of the store"
+        );
+        assert_eq!(read_experience_content(&backup_path, id), PAYLOAD_MARKER);
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".pre-v5.bak.invalid-")
+            })
+            .collect();
+        assert_eq!(quarantined.len(), 1, "the flipped image is quarantined");
+        assert_eq!(
+            std::fs::read(&quarantined[0]).unwrap(),
+            flipped,
+            "quarantine keeps the invalid bytes unchanged"
+        );
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
+    }
+
+    /// LF2 fail closed: when the integrity copy cannot be made, the migration
+    /// is refused with a typed I/O error; the existing sidecar is neither kept
+    /// as proof nor quarantined, and no temp survives.
+    #[test]
+    fn test_sidecar_integrity_copy_failure_refuses_without_quarantine() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v4_image_with_marker(&path);
+        let backup_path = pre_v5_backup_path(&path);
+        std::fs::copy(&path, &backup_path).unwrap();
+        let before = std::fs::read(&backup_path).unwrap();
+        let entries_before = std::fs::read_dir(dir.path()).unwrap().count();
+
+        FAIL_SIDECAR_INTEGRITY_COPY.with(|fail| fail.set(true));
+        let error = ensure_schema_backup(&path, 4).unwrap_err();
+        assert!(
+            matches!(error, PulseDBError::Io(_)),
+            "an uncheckable sidecar refuses with a typed I/O error, got {error:?}"
+        );
+        assert_eq!(std::fs::read(&backup_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            entries_before,
+            "nothing quarantined, no temp left behind"
+        );
+
+        // The staged-copy path refuses the same way and publishes nothing.
+        std::fs::remove_file(&backup_path).unwrap();
+        FAIL_SIDECAR_INTEGRITY_COPY.with(|fail| fail.set(true));
+        let error = publish_durable_sidecar(&path, &backup_path, 4).unwrap_err();
+        assert!(matches!(error, PulseDBError::Io(_)), "got {error:?}");
+        assert!(
+            !backup_path.exists(),
+            "an unchecked stage is never published"
+        );
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
     }
 
     /// The staging temp must be unique per CALL, not per process.
@@ -5641,7 +5926,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&backup).unwrap(), original);
-        validate_sidecar_image(&backup, SCHEMA_VERSION).unwrap();
+        validate_sidecar_image(&backup, SCHEMA_VERSION)
+            .unwrap()
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -5804,7 +6091,9 @@ mod tests {
                 matches!(error, PulseDBError::Io(ref e) if e.to_string() == "injected directory sync failure")
             );
             assert_eq!(RedbStorage::peek_schema_version(&path), Some(2));
-            validate_sidecar_image(&pre_v3_backup_path(&path), 2).unwrap();
+            validate_sidecar_image(&pre_v3_backup_path(&path), 2)
+                .unwrap()
+                .unwrap();
             assert!(leftover_sidecar_temps(&pre_v3_backup_path(&path)).is_empty());
         }
         Box::new(RedbStorage::open(&path, &default_config()).unwrap())
