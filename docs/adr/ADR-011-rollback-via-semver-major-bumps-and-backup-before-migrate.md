@@ -40,9 +40,13 @@ mechanics are unchanged.
   repair/integrity paths, which ordinary reads do not take.
 - **Durable before visible.** The staged copy is `fsync`ed (`File::sync_all`)
   before publication; a failed fsync refuses the migration with a typed error.
-  After the publish the parent directory is fsync'd best-effort, where the
-  platform supports it; an unsupported directory fsync is not fatal — the
-  file's own bytes are already durable.
+  After publication, the parent directory must open and sync successfully on
+  Unix before migration; failures refuse migration. Bare relative filenames
+  use `.` as their parent. On every platform, existing validated sidecars must
+  sync their file contents before the directory barrier on retry. Opening for
+  sync requires write access; access denial (including a read-only Windows
+  file) or sync failure refuses migration with a typed I/O error. On platforms without directory sync support (Windows), this step
+  remains best-effort; only the file's own bytes are guaranteed synced.
 - **Never replace.** Publication is a create-if-absent hard link, with an
   exclusive create-and-copy fallback on link-less volumes. The fallback copies
   the validated stage and syncs its destination before success. An interrupted

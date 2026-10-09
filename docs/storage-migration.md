@@ -121,7 +121,13 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    is synced before success; an interrupted copy is validated and quarantined on the next
    migrating open. Any failure — a failed fsync, a torn image, a failed publish — **refuses the
    migration** with a typed error; the store stays at its pre-migration schema and the temp is
-   removed. If the peek cannot run (crashed session, locked file) and the open discovers a pending
+   removed. On Unix, parent-directory open and fsync must also succeed before migration,
+   including when an existing validated sidecar is kept on retry. On every platform,
+   a kept sidecar's file contents must sync before the directory barrier; inability to open
+   it with write access for sync (for example a read-only file on Windows), or a failed sync,
+   refuses migration with a typed I/O error. Bare relative filenames use `.` as the parent. Windows cannot sync directories through this API; directory-entry
+   durability remains best-effort there, while the file contents are synced. If the peek cannot
+   run (crashed session, locked file) and the open discovers a pending
    migration, the copy is taken from the post-open bytes instead — a valid store, but not
    byte-identical; the open says so at `info!`. An **existing** sidecar is proof only after the same
    whole-image validation: a valid one is kept, and one that fails (does not open, wrong

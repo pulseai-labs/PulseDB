@@ -720,22 +720,60 @@ fn publish_durable_sidecar_with(
     })();
     let _ = std::fs::remove_file(&temp_path);
     published.map_err(PulseDBError::Io)?;
-    // Best-effort parent-directory fsync so the new entry is durable where the
-    // platform supports it (B3); an unsupported dir-fsync is not fatal — the
-    // sidecar's own bytes were already made durable before the publish.
-    if let Some(parent) = backup_path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+    sync_schema_sidecar_directory(backup_path)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static FAIL_SCHEMA_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_SCHEMA_FILE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn sync_schema_sidecar_directory(backup_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        sync_schema_sidecar_directory_with(backup_path, |parent| {
+            let directory = std::fs::File::open(parent)?;
+            #[cfg(test)]
+            if FAIL_SCHEMA_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            directory.sync_all()
+        })
     }
-    Ok(())
+    // Windows cannot sync directories through std::fs::File. The file's
+    // contents are synced, but directory-entry durability is best-effort.
+    #[cfg(not(unix))]
+    {
+        let _ = backup_path;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_schema_sidecar_directory_with(
+    backup_path: &Path,
+    sync: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let parent = backup_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync(parent).map_err(PulseDBError::Io)
 }
 
 /// Ensures the pre-migration sidecar for a store still at `schema_version`,
 /// under the migration lock (spec §2 + §3, r1.s6.w1 / #89 + #25).
 ///
 /// An EXISTING sidecar is proof only after [`validate_sidecar_image`]. A valid
-/// one is kept. An invalid one is renamed to `.pre-vN.bak.invalid-<unix-seconds>`
+/// one is kept, but its contents must sync successfully before the directory
+/// barrier. Opening it for sync requires write access (including on Windows);
+/// access or sync failure refuses migration with a typed I/O error.
+/// An invalid one is renamed to `.pre-vN.bak.invalid-<unix-seconds>`
 /// ([`quarantine_invalid_sidecar`] — never deleted; `warn!` with both paths) and
 /// a fresh image is published from `source`. A missing sidecar is published.
 /// Every failure refuses the migration: the store stays at its pre-migration
@@ -753,7 +791,23 @@ fn ensure_schema_backup(source: &Path, schema_version: u32) -> Result<()> {
                     backup = %backup_path.display(),
                     "existing pre-migration sidecar validated; keeping it"
                 );
-                return Ok(());
+                // An interrupted fallback may have copied a valid image without
+                // syncing it. Flush its contents before making the name durable.
+                // Windows FlushFileBuffers requires a writable handle; failure
+                // to obtain one (e.g. a read-only file) must refuse migration.
+                let sidecar = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&backup_path)
+                    .map_err(PulseDBError::Io)?;
+                #[cfg(test)]
+                if FAIL_SCHEMA_FILE_SYNC.with(|fail| fail.replace(false)) {
+                    return Err(PulseDBError::Io(std::io::Error::other(
+                        "injected sidecar file sync failure",
+                    )));
+                }
+                sidecar.sync_all().map_err(PulseDBError::Io)?;
+                drop(sidecar);
+                return sync_schema_sidecar_directory(&backup_path);
             }
             Err(error) => {
                 let quarantined = quarantine_invalid_sidecar(&backup_path)?;
@@ -5708,6 +5762,87 @@ mod tests {
         assert!(!backup.exists());
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(leftover_sidecar_temps(&backup).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_schema_directory_barrier_relative_filename() {
+        sync_schema_sidecar_directory_with(Path::new("store.redb.pre-v5.bak"), |parent| {
+            // The real relative directory must be openable, without changing
+            // the process working directory shared by parallel tests.
+            assert_eq!(parent, Path::new("."));
+            std::fs::File::open(parent)?.sync_all()
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_schema_directory_barrier_open_failure_propagates() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing").join("store.bak");
+        let error = sync_schema_sidecar_directory(&missing).unwrap_err();
+        assert!(
+            matches!(error, PulseDBError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_schema_directory_barrier_failure_refuses_migration_and_retry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v2_store(&path);
+        // First publish, then the existing-valid-image retry: both must cross
+        // the barrier, because an earlier sync failure left an unsynced name.
+        for _ in 0..2 {
+            FAIL_SCHEMA_DIRECTORY_SYNC.with(|fail| fail.set(true));
+            let result = RedbStorage::open(&path, &default_config());
+            FAIL_SCHEMA_DIRECTORY_SYNC.with(|fail| fail.set(false));
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, PulseDBError::Io(ref e) if e.to_string() == "injected directory sync failure")
+            );
+            assert_eq!(RedbStorage::peek_schema_version(&path), Some(2));
+            validate_sidecar_image(&pre_v3_backup_path(&path), 2).unwrap();
+            assert!(leftover_sidecar_temps(&pre_v3_backup_path(&path)).is_empty());
+        }
+        Box::new(RedbStorage::open(&path, &default_config()).unwrap())
+            .close()
+            .unwrap();
+        assert_eq!(
+            RedbStorage::peek_schema_version(&path),
+            Some(SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn test_schema_file_barrier_failure_refuses_migration() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        seed_schema_v2_store(&path);
+        let original = std::fs::read(&path).unwrap();
+        let backup = pre_v3_backup_path(&path);
+        // Model an interrupted fallback that finished copying but never synced
+        // its destination: validation alone is insufficient on the retry.
+        std::fs::copy(&path, &backup).unwrap();
+        FAIL_SCHEMA_FILE_SYNC.with(|fail| fail.set(true));
+        let result = RedbStorage::open(&path, &default_config());
+        FAIL_SCHEMA_FILE_SYNC.with(|fail| fail.set(false));
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, PulseDBError::Io(ref e) if e.to_string() == "injected sidecar file sync failure")
+        );
+        assert_eq!(RedbStorage::peek_schema_version(&path), Some(2));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        Box::new(RedbStorage::open(&path, &default_config()).unwrap())
+            .close()
+            .unwrap();
+        assert_eq!(
+            RedbStorage::peek_schema_version(&path),
+            Some(SCHEMA_VERSION)
+        );
     }
 
     /// A sidecar is a byte copy of the database, so it must never be more
