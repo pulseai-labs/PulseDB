@@ -116,3 +116,7 @@ The losing candidates each fail a hard requirement: **bitcode** disqualifies its
 - **Sync wire-format stability is unverified**: the sync tests serialize/deserialize with the *current* postcard on both sides (same-version round-trip), and `storage_format_upgrade.rs` exercises only on-disk redb fixtures — no frozen prior-release wire-byte fixture exists. A field reorder could change the wire layout while every test stays green. Mixed-release sync compatibility depends on catching that (protocol bump); frozen wire fixtures would close this.
 
 <!-- Appended at ossify adoption smoke pass, 2026-08-23 -->
+
+## Amendment 2026-10-09 — sync protocol v5
+
+**Context:** The r1.s1 recovery supersedes the earlier sync-version account above. **Decision:** Retain postcard, but use protocol v5/framing v4 and wire-only `SyncExperience` embeddings; the on-disk Experience encoding remains unchanged (`src/sync/mod.rs:167–180`, `src/sync/mod.rs:231`, `src/sync/types.rs:186–224`). **Consequences:** No v4 interoperability; both replicas upgrade. [ADR-014's amendment](ADR-014-layered-sync-core-with-port-traits.md#amendment-2026-10-09--sync-protocol-v5) records routing, exact byte packing, typed noncompletion and the approved capability-negotiation deviation.

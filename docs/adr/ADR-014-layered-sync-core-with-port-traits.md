@@ -29,3 +29,21 @@ Revisit when a second consumer runtime (bindings or server) forces a seam rethin
 ### Unverified claims
 
 - None.
+
+## Amendment 2026-10-09 — sync protocol v5
+
+### Context
+
+The r1.s1 recovery approved on 2026-09-08 replaced protocol-v4 compatibility and estimated byte floors; its completion contract added transport conformance and quiescent one-shot status.
+
+### Decision
+
+- Use sync protocol **v5** with framing **v4**. Reject v4 peers explicitly; there is no v4 interoperability or fallback, so both replicas must upgrade (`src/sync/mod.rs:167–180`, `src/sync/mod.rs:231`, `src/sync/wire.rs:90–110`).
+- Carry embeddings beside the record in wire-only `SyncExperience`; the on-disk `Experience` encoding still omits embeddings. Receiving restores the transmitted vector without implicit re-embedding (`src/sync/types.rs:186–224`).
+- Bind push and pull to the intended receiver identity; reject a wrong target before applying or serving changes. Replies identify the responder separately from the acknowledged WAL owner (`src/sync/server.rs:195–228`, `src/sync/server.rs:278–299`).
+- Pack a fitting ordered prefix using exact postcard sizes including the complete frame and preamble; count limits are ceilings, not byte estimates. Excluded eligible changes remain owed (`src/sync/wire.rs:112–149`, `src/sync/pusher.rs:127–183`).
+- Report noncompletion explicitly: `MissingDependency` for absent update targets, `CatchUpIncomplete` for unfinished initial catch-up, and typed terminal size refusals (`ChangeTooLarge`, `RequestTooLarge`, `PeerRejectedSize`). Returned one-shot operations leave current activity quiescent (`src/sync/error.rs:134–249`, `src/sync/error.rs:261–297`, `src/sync/manager.rs:1170–1176`; `tests/sync_engine.rs:4110–4170`, `tests/sync_http.rs:3974–4064`).
+
+### Consequences
+
+Protocol and disk-schema versions are independent; this wire change does not change the stored Experience format. The hard upgrade deliberately deviates from the sync-convergence gate's “capability negotiation” control (operator-approved 2026-09-08; r1.s1 retrospective C2). Capability advertisements remain informational, with compatibility determined by protocol and framing versions (`src/sync/mod.rs:182–190`). This amendment records the deviation rather than claiming the control is met. See [ADR-006](ADR-006-serializer-replacement.md) for the postcard decision.
