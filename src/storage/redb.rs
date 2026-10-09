@@ -49,7 +49,7 @@ use super::schema::{
     LEGACY_SUBSTRATE_FORMAT, METADATA_TABLE, PROVIDER_IDENTITY_KEY,
     PROVIDER_IDENTITY_STAMPED_AT_KEY, RELATIONS_BY_SOURCE_TABLE, RELATIONS_BY_TARGET_TABLE,
     RELATIONS_TABLE, SCHEMA_VERSION, SUBSTRATE_FORMAT_KEY, SUBSTRATE_MAGIC, SUBSTRATE_MARKER_LEN,
-    WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
+    SYNC_CURSORS_MIGRATION_TABLE, WAL_SEQUENCE_KEY, WATCH_EVENTS_TABLE,
 };
 use super::StorageEngine;
 use crate::config::{Config, EmbeddingDimension, RecallWeights};
@@ -303,77 +303,453 @@ fn create_sidecar_file(source: &Path, sidecar: &Path) -> std::io::Result<std::fs
     Ok(file)
 }
 
-/// Claims the logical-schema backup sidecar at `backup_path` as a plain file
-/// copy of `path` (the `.pre-v3.bak` / `.pre-v4.bak` / `.pre-v5.bak` family).
+/// The deterministic pre-migration sidecar for a store still at
+/// `schema_version` — the `.pre-v3.bak` / `.pre-v4.bak` / `.pre-v5.bak` family
+/// ([`pre_v3_backup_path`] / [`pre_v4_backup_path`] / [`pre_v5_backup_path`]).
 ///
-/// Uses `create_new` (O_EXCL) on the FINAL path: concurrent openers are
-/// serialized by the O_EXCL claim, and the one that lost the race sees
-/// `AlreadyExists` and preserves the genuine sidecar. Same crash-atomicity
-/// posture as the original `.pre-v3.bak` backup: a hard kill mid-copy leaves a
-/// truncated file that a later open's `AlreadyExists` branch preserves. (The
-/// `.pre-substrate.bak` uses the temp+rename [`backup_once`] pattern because it
-/// runs under the exclusive migration lock; the schema backup does not.)
+/// `None` for a current-schema store: it takes no schema sidecar, and no
+/// destructive reshape is pending.
 ///
-/// The sidecar is created through [`create_sidecar_file`], so it carries the
-/// SOURCE store's permission bits rather than the process default.
-///
-/// Returns `Ok(true)` when this call created the sidecar, `Ok(false)` when an
-/// existing one was preserved.
-fn claim_schema_backup_copy(path: &Path, backup_path: &Path) -> Result<bool> {
-    // r1.s3: temp+rename+fsync — this schema-sidecar copy path is the plain
-    // `create_new` + `io::copy` form; hardening it (#25) is r1.s3's.
-    match create_sidecar_file(path, backup_path) {
-        Ok(mut backup_file) => {
-            let copy_result = std::fs::File::open(path)
-                .and_then(|mut source| std::io::copy(&mut source, &mut backup_file).map(|_| ()));
-            if let Err(error) = copy_result {
-                drop(backup_file);
-                let _ = std::fs::remove_file(backup_path);
-                return Err(migration_io_error(error));
-            }
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            debug!("pre-migration backup already exists; preserving it");
-            Ok(false)
-        }
-        Err(error) => Err(migration_io_error(error)),
+/// Operator note (audit fold 5): a sidecar published by a 0.8.0-era binary was
+/// validated `schema_version`-only when it was written, and it is NOT
+/// re-validated later — a current-schema store takes no sidecar, so no open
+/// triggers a check (re-validating on every open would bring back the
+/// steady-state cost #95 removes). Check a rollback image **before** restoring
+/// it: open it read-only with the binary you are downgrading to (e.g. a 0.7.x
+/// `Config::read_only()` open of the schema-4 image) and confirm it reads.
+fn pending_sidecar_path(path: &Path, schema_version: u32) -> Option<PathBuf> {
+    match schema_version {
+        1..=2 => Some(pre_v3_backup_path(path)),
+        3 => Some(pre_v4_backup_path(path)),
+        4 => Some(pre_v5_backup_path(path)),
+        _ => None,
     }
 }
 
-/// Per-call discriminator for [`pristine_schema_backup_temp_path`]. Process-wide
-/// and monotonic, so no two calls in one process ever name the same temp.
-static PRISTINE_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+/// Renames an invalid existing sidecar out of the way — **never deleting it**:
+/// `<db>.pre-vN.bak.invalid-<unix-seconds>`, with `-<n>` appended when that name
+/// is taken (r1.s6.w1, #89).
+///
+/// A rename failure REFUSES the migration with a typed error (audit fold 4;
+/// e.g. on Windows another process holds the invalid sidecar open) — the caller
+/// then runs nothing destructive. Renaming rather than deleting keeps the bytes
+/// for the operator: an invalid image is still evidence.
+fn quarantine_invalid_sidecar(backup_path: &Path) -> Result<PathBuf> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let base = backup_path.as_os_str().to_owned();
+    for attempt in 0..1000u32 {
+        let mut candidate = base.clone();
+        if attempt == 0 {
+            candidate.push(format!(".invalid-{seconds}"));
+        } else {
+            candidate.push(format!(".invalid-{seconds}-{attempt}"));
+        }
+        let candidate = PathBuf::from(candidate);
+        if candidate.try_exists().map_err(PulseDBError::Io)? {
+            continue;
+        }
+        match std::fs::rename(backup_path, &candidate) {
+            Ok(()) => return Ok(candidate),
+            // Another process took that name between the existence check and
+            // the rename (Windows surfaces `AlreadyExists`; on POSIX the check
+            // above is the guard, since `rename` there replaces silently).
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(migration_io_error(error)),
+        }
+    }
+    Err(StorageError::corrupted(format!(
+        "could not find a free quarantine name beside {}",
+        backup_path.display()
+    ))
+    .into())
+}
 
-/// Sibling temp path where the PRISTINE schema-backup claim
-/// ([`RedbStorage::claim_pristine_schema_backup_copy`]) stages its copy before
+/// Proves a sidecar image at `path` is a whole, readable pre-migration store at
+/// `expected_schema_version` — the validation step of the durable publish
+/// (spec §2) and of the existing-sidecar check (spec §3, r1.s6.w1 / #89).
+///
+/// Read-only throughout (zero writes), so a published image stays byte-identical
+/// to the source it copies. The work is
+/// [`RedbStorage::validate_sidecar_image_inner`]; a redb PANIC raised while
+/// parsing a torn page counts as "invalid" here, never as a crash of the
+/// migrating open (redb's page accessors `unwrap()` — e.g.
+/// `LeafAccessor::total_length` reached by `stats()`).
+fn validate_sidecar_image(path: &Path, expected_schema_version: u32) -> Result<()> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_sidecar_image_inner(path, expected_schema_version)
+    })) {
+        Ok(result) => result,
+        Err(_) => Err(StorageError::corrupted(format!(
+            "sidecar image {} panicked redb's parser while being validated; \
+             treating it as invalid (torn image)",
+            path.display()
+        ))
+        .into()),
+    }
+}
+
+/// The work behind [`validate_sidecar_image`] (panic-guarded by its caller).
+///
+/// Steps: open `path` **read-only** (a torn image typically fails here); read
+/// `db_metadata` and require the expected `schema_version` — the check the
+/// 0.8.0-era claim performed, and proof that a later open would accept the
+/// image as a valid pre-migration store; then walk the table directory
+/// (`list_tables` + `list_multimap_tables`) and, for EVERY listed table, walk
+/// every page (the untyped table's `len()` + `stats()`, which parses each
+/// page's structure) and read EVERY entry through the table's schema definition
+/// when the name is one this build knows. A listed table that cannot be opened
+/// or read marks the image invalid (fail closed); an unknown-but-openable name
+/// is walked and logged at `debug!`, never invalid.
+///
+/// Why both halves: redb 4.2 exposes no untyped ENTRY iteration
+/// (`ReadOnlyUntypedTable` has `len`/`stats` only) and verifies its page
+/// checksums only on the repair/integrity paths — ordinary reads do not — so
+/// the type-agnostic page walk covers every page of every listed table while
+/// the typed read parses every key/value pair of the tables this build knows.
+/// A metadata-only check is not proof: a copy torn by a concurrent writer, or
+/// any external damage, can keep a readable `db_metadata` while experience,
+/// embedding or index pages are damaged (Codex P2 on PR #88).
+///
+/// No PulseDB table is created under a runtime (per-collective or prefixed)
+/// name — every table this build creates is a literal `TableDefinition::new`
+/// in `src/storage/schema.rs` — so the "known" set below is exactly that
+/// literal set.
+fn validate_sidecar_image_inner(path: &Path, expected_schema_version: u32) -> Result<()> {
+    use ::redb::{MultimapTableHandle as _, ReadableTableMetadata as _, TableHandle as _};
+
+    let db = Database::builder().open_read_only(path).map_err(|error| {
+        StorageError::corrupted(format!(
+            "sidecar image {} does not open as a database: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = RedbStorage::read_metadata(&db)?;
+    if metadata.schema_version != expected_schema_version {
+        return Err(StorageError::corrupted(format!(
+            "sidecar image {} reads schema_version {}, expected {}",
+            path.display(),
+            metadata.schema_version,
+            expected_schema_version
+        ))
+        .into());
+    }
+    let read_txn = db.begin_read().map_err(StorageError::from)?;
+    let tables: Vec<::redb::UntypedTableHandle> = read_txn
+        .list_tables()
+        .map_err(StorageError::from)?
+        .collect();
+    for handle in tables {
+        let name = handle.name().to_string();
+        let table = read_txn.open_untyped_table(handle).map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image table `{name}` does not open: {error}"
+            ))
+        })?;
+        table.len().map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image table `{name}` length unreadable: {error}"
+            ))
+        })?;
+        table.stats().map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image table `{name}` page walk failed: {error}"
+            ))
+        })?;
+        read_known_table_entries(&read_txn, &name)?;
+    }
+    let multimaps: Vec<::redb::UntypedMultimapTableHandle> = read_txn
+        .list_multimap_tables()
+        .map_err(StorageError::from)?
+        .collect();
+    for handle in multimaps {
+        let name = handle.name().to_string();
+        let table = read_txn
+            .open_untyped_multimap_table(handle)
+            .map_err(|error| {
+                StorageError::corrupted(format!(
+                    "sidecar image multimap `{name}` does not open: {error}"
+                ))
+            })?;
+        table.len().map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image multimap `{name}` length unreadable: {error}"
+            ))
+        })?;
+        table.stats().map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image multimap `{name}` page walk failed: {error}"
+            ))
+        })?;
+        read_known_multimap_entries(&read_txn, &name)?;
+    }
+    Ok(())
+}
+
+/// Read every entry of the normal table `name` when it is one this build knows
+/// (the literal `TableDefinition::new` set in `src/storage/schema.rs`); an
+/// unknown name is left to the caller's page walk, at `debug!` — never invalid.
+/// A KNOWN table that fails to open or iterate marks the image invalid.
+fn read_known_table_entries(read_txn: &::redb::ReadTransaction, name: &str) -> Result<()> {
+    use ::redb::{Key, Value};
+
+    fn read_all<K, V>(
+        read_txn: &::redb::ReadTransaction,
+        name: &str,
+        definition: ::redb::TableDefinition<'static, K, V>,
+    ) -> Result<()>
+    where
+        K: Key + 'static,
+        V: Value + 'static,
+    {
+        use ::redb::ReadableTable as _;
+        let table = read_txn.open_table(definition).map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image table `{name}` does not open: {error}"
+            ))
+        })?;
+        for entry in table.iter().map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image table `{name}` does not iterate: {error}"
+            ))
+        })? {
+            let (_key, _value) = entry.map_err(|error| {
+                StorageError::corrupted(format!(
+                    "sidecar image table `{name}` has an unreadable entry: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    match name {
+        "metadata" => read_all(read_txn, name, METADATA_TABLE),
+        "collectives" => read_all(read_txn, name, COLLECTIVES_TABLE),
+        "decay_configs" => read_all(read_txn, name, DECAY_CONFIGS_TABLE),
+        "experiences" => read_all(read_txn, name, EXPERIENCES_TABLE),
+        "embeddings" => read_all(read_txn, name, EMBEDDINGS_TABLE),
+        "relations" => read_all(read_txn, name, RELATIONS_TABLE),
+        "insights" => read_all(read_txn, name, INSIGHTS_TABLE),
+        "activities" => read_all(read_txn, name, ACTIVITIES_TABLE),
+        // Feature-independent mirror of the `sync`-gated table — same name and
+        // key/value types, so a build without `sync` can read it too.
+        "sync_cursors" => read_all(read_txn, name, SYNC_CURSORS_MIGRATION_TABLE),
+        "watch_events" => read_all(read_txn, name, WATCH_EVENTS_TABLE),
+        other => {
+            debug!(
+                table = other,
+                "sidecar image lists a table this build does not know; page walk only"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Read every entry (every group key and every value) of the multimap `name`
+/// when it is one this build knows; the normal-table rules of
+/// [`read_known_table_entries`] apply unchanged.
+fn read_known_multimap_entries(read_txn: &::redb::ReadTransaction, name: &str) -> Result<()> {
+    use ::redb::Key;
+
+    fn read_all<K, V>(
+        read_txn: &::redb::ReadTransaction,
+        name: &str,
+        definition: ::redb::MultimapTableDefinition<'static, K, V>,
+    ) -> Result<()>
+    where
+        K: Key + 'static,
+        V: Key + 'static,
+    {
+        use ::redb::ReadableMultimapTable as _;
+        let table = read_txn.open_multimap_table(definition).map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image multimap `{name}` does not open: {error}"
+            ))
+        })?;
+        for group in table.iter().map_err(|error| {
+            StorageError::corrupted(format!(
+                "sidecar image multimap `{name}` does not iterate: {error}"
+            ))
+        })? {
+            let (_key, values) = group.map_err(|error| {
+                StorageError::corrupted(format!(
+                    "sidecar image multimap `{name}` has an unreadable group: {error}"
+                ))
+            })?;
+            for value in values {
+                let _value = value.map_err(|error| {
+                    StorageError::corrupted(format!(
+                        "sidecar image multimap `{name}` has an unreadable value: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    match name {
+        "experiences_by_collective" => read_all(read_txn, name, EXPERIENCES_BY_COLLECTIVE_TABLE),
+        "experiences_by_type" => read_all(read_txn, name, EXPERIENCES_BY_TYPE_TABLE),
+        "experiences_by_tag" => read_all(read_txn, name, EXPERIENCES_BY_TAG_TABLE),
+        "relations_by_source" => read_all(read_txn, name, RELATIONS_BY_SOURCE_TABLE),
+        "relations_by_target" => read_all(read_txn, name, RELATIONS_BY_TARGET_TABLE),
+        "insights_by_collective" => read_all(read_txn, name, INSIGHTS_BY_COLLECTIVE_TABLE),
+        other => {
+            debug!(
+                multimap = other,
+                "sidecar image lists a multimap this build does not know; page walk only"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The durable publish of a schema sidecar (spec §2, r1.s6.w1 / #89 + #25).
+///
+/// Stage → copy → `sync_all` → whole-image validation → create-if-absent
+/// publish: all of it must succeed before anything destructive runs. `source`
+/// is the on-disk store — pristine when the caller ensured the sidecar before
+/// its first writable open, the post-open file on the B4 path (see
+/// `open_existing`).
+///
+/// Every failure REFUSES the migration with a typed error and removes the
+/// staged temp: a `sync_all` failure, a staged copy that fails validation, and
+/// a `hard_link` failure that is not `AlreadyExists` all leave the store
+/// untouched at its pre-migration schema. A loser's `AlreadyExists` is the
+/// preserve branch, not a failure: the sidecar already at the final path wins
+/// and this call's staged copy is discarded.
+///
+/// The publish is `hard_link`, NOT `rename` — `rename` replaces an existing
+/// destination on both Unix and Windows, which would make the preserve rule a
+/// check-then-act race that could overwrite another process's genuine rollback
+/// point.
+fn publish_durable_sidecar(
+    source: &Path,
+    backup_path: &Path,
+    expected_schema_version: u32,
+) -> Result<()> {
+    let temp_path = sidecar_staging_temp_path(backup_path);
+    // Symlink-safe staging (same posture as `backup_once`): unlink any stale
+    // temp or hostile symlink entry — `remove_file` removes the entry itself,
+    // never following a symlink — then `create_new` (O_EXCL) a fresh regular
+    // file carrying the SOURCE's permission bits.
+    let _ = std::fs::remove_file(&temp_path);
+    let mut temp_file = create_sidecar_file(source, &temp_path).map_err(PulseDBError::Io)?;
+    // Reads of the redb file are the lock-contention signal (Windows surfaces a
+    // concurrent holder as a raw sharing violation); writes to our own temp are
+    // sidecar space.
+    let copy_result = std::fs::File::open(source)
+        .and_then(|mut file| std::io::copy(&mut file, &mut temp_file).map(|_| ()));
+    if let Err(error) = copy_result {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(migration_io_error(error));
+    }
+    // Spec §2: the staged bytes must be DURABLE before they can be proven or
+    // published. A `sync_all` failure refuses the migration with a typed error.
+    if let Err(error) = temp_file.sync_all() {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(PulseDBError::Io(error));
+    }
+    drop(temp_file);
+    // Crash boundary (r1.s6.w1): the copy is complete and fsync'd, nothing is
+    // published yet — a crash here must leave the final sidecar path ABSENT and
+    // the store untouched. Compiled out unless `fault-injection` is on.
+    #[cfg(feature = "fault-injection")]
+    crate::fault_injection::maybe_inject(crate::fault_injection::Boundary::MidSchemaBackup);
+    // Spec §2/§3: the staged bytes are proof only once validated as a whole
+    // image. Validation is read-only, so the published bytes stay byte-identical
+    // to the source.
+    if let Err(error) = validate_sidecar_image(&temp_path, expected_schema_version) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    // Create-if-absent publish; never replaces.
+    let published = std::fs::hard_link(&temp_path, backup_path);
+    // The link does not consume the temp; remove it on every path.
+    let _ = std::fs::remove_file(&temp_path);
+    match published {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            debug!("pre-migration backup already exists; preserving it");
+            return Ok(());
+        }
+        Err(error) => return Err(PulseDBError::Io(error)),
+    }
+    // Best-effort parent-directory fsync so the new entry is durable where the
+    // platform supports it (B3); an unsupported dir-fsync is not fatal — the
+    // sidecar's own bytes were already made durable before the publish.
+    if let Some(parent) = backup_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Ensures the pre-migration sidecar for a store still at `schema_version`,
+/// under the migration lock (spec §2 + §3, r1.s6.w1 / #89 + #25).
+///
+/// An EXISTING sidecar is proof only after [`validate_sidecar_image`]. A valid
+/// one is kept. An invalid one is renamed to `.pre-vN.bak.invalid-<unix-seconds>`
+/// ([`quarantine_invalid_sidecar`] — never deleted; `warn!` with both paths) and
+/// a fresh image is published from `source`. A missing sidecar is published.
+/// Every failure refuses the migration: the store stays at its pre-migration
+/// schema and nothing destructive runs.
+fn ensure_schema_backup(source: &Path, schema_version: u32) -> Result<()> {
+    let backup_path = pending_sidecar_path(source, schema_version).ok_or_else(|| {
+        PulseDBError::Storage(StorageError::corrupted(format!(
+            "no pre-migration sidecar is defined for schema v{schema_version}"
+        )))
+    })?;
+    if backup_path.try_exists().map_err(PulseDBError::Io)? {
+        match validate_sidecar_image(&backup_path, schema_version) {
+            Ok(()) => {
+                debug!(
+                    backup = %backup_path.display(),
+                    "existing pre-migration sidecar validated; keeping it"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                let quarantined = quarantine_invalid_sidecar(&backup_path)?;
+                warn!(
+                    invalid = %backup_path.display(),
+                    quarantined = %quarantined.display(),
+                    error = %error,
+                    "invalid pre-migration sidecar quarantined (never deleted); \
+                     a fresh image will be published"
+                );
+            }
+        }
+    }
+    publish_durable_sidecar(source, &backup_path, schema_version)
+}
+
+/// Per-call discriminator for [`sidecar_staging_temp_path`]. Process-wide and
+/// monotonic, so no two calls in one process ever name the same temp.
+static SIDECAR_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Sibling temp path where [`publish_durable_sidecar`] stages its copy before
 /// validating it and publishing it onto `backup_path`.
 ///
-/// Unique per CALL (`.<pid>.<nonce>.pristine.tmp`), unlike [`backup_temp_path`]:
-/// that staging runs under the exclusive [`MigrationLock`], whereas the pristine
-/// claim runs BEFORE any writer lock exists, so nothing serialises the
-/// claimants and none of them may share a temp file.
-///
-/// The pid alone is not enough. It separates PROCESSES, and two processes
-/// staging the same sidecar at once was the case the pid was chosen for — but
-/// PulseDB is a library, so two THREADS calling `RedbStorage::open` on the same
-/// store inside one process is an ordinary situation, and they derive the
-/// identical pid. [`RedbStorage::stage_pristine_schema_backup`] then
-/// unconditionally `remove_file`s the temp before creating its own, so on Unix
-/// one thread unlinks and replaces the other's still-open staging file: the
-/// loser's `create_new` collides, or it validates and publishes bytes it did not
-/// write, and the claim fails where it should have produced the byte-identical
-/// ADR-011 rollback point. The nonce keeps every claimant on its own file,
-/// whichever process or thread it runs on; the pid stays in the name so a
+/// Unique per CALL (`.<pid>.<nonce>.sidecar.tmp`), unlike [`backup_temp_path`]:
+/// the durable publish runs under the exclusive [`MigrationLock`], but a crashed
+/// run's staged temp is left behind, and the per-call nonce (plus the unlink
+/// before every `create_new`) means a stale leftover can never wedge a retry or
+/// be mistaken for this attempt's own staging. The pid stays in the name so a
 /// crashed run's leftovers remain attributable.
 ///
 /// Each call therefore returns a NEW path — callers must keep the value they
 /// staged at rather than recomputing it, and a test asserting no temp survived
 /// looks for the suffix rather than reconstructing the name.
-fn pristine_schema_backup_temp_path(backup_path: &Path) -> PathBuf {
-    let nonce = PRISTINE_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+fn sidecar_staging_temp_path(backup_path: &Path) -> PathBuf {
+    let nonce = SIDECAR_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let mut temp = backup_path.as_os_str().to_owned();
-    temp.push(format!(".{}.{nonce}.pristine.tmp", std::process::id()));
+    temp.push(format!(".{}.{nonce}.sidecar.tmp", std::process::id()));
     PathBuf::from(temp)
 }
 
@@ -563,12 +939,14 @@ fn migration_lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(lock_path)
 }
 
-/// An exclusive advisory lock guarding the substrate migration, released on drop.
+/// An exclusive advisory lock guarding a destructive migration, released on drop.
 ///
 /// Mirrors the `fs2` advisory-lock seam used by `src/watch/lock.rs` (the
-/// `WatchLock`). Acquired **before** the backup + redb-v2 `upgrade()` and held
-/// until the redb-4.1 reopen completes, so two upgraders cannot race the
-/// destructive in-place upgrade (audit C2).
+/// `WatchLock`). It covers both destructive legs: it is acquired before the
+/// backup + redb-v2 `upgrade()` and held until the redb-4.1 reopen completes
+/// (audit C2), and — since r1.s6.w1 (#89/#25) — it is acquired before the
+/// logical-schema sidecar + reshape and held through the schema-migration
+/// commit, so two processes can no longer race the sidecar copy or the reshape.
 struct MigrationLock {
     // The locked file handle. Dropping it releases the OS advisory lock on all
     // platforms (POSIX + Windows); no explicit unlock (`unlock` needs Rust 1.89+,
@@ -576,8 +954,29 @@ struct MigrationLock {
     _file: std::fs::File,
 }
 
+/// Poll interval of the migration-lock wait. Blocking `lock_exclusive` cannot
+/// log while it waits, so the wait retries at this interval instead — small
+/// enough that a released lock is taken promptly.
+const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How often a blocked acquirer reports that it is still waiting (audit fold 6).
+const LOCK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a failed `try_lock_exclusive` means "held elsewhere" (retry) rather
+/// than a real error. Covers POSIX (`WouldBlock`) and the Windows sharing/
+/// lock violations mapped by [`is_lock_contention_io_error`].
+fn is_lock_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock || is_lock_contention_io_error(error)
+}
+
 impl MigrationLock {
-    /// Acquires the exclusive migration lock, blocking until it is available.
+    /// Acquires the exclusive migration lock, blocking — **without timeout** —
+    /// until it is available.
+    ///
+    /// There is deliberately no timeout: a legitimate multi-minute codec
+    /// re-encode must not fail its waiters. The wait is made visible instead
+    /// (audit fold 6): one `info!` when the first attempt is refused, then a
+    /// `warn!` with the lock path every 30 seconds until the lock is taken.
     fn acquire_exclusive(db_path: &Path) -> Result<Self> {
         use fs2::FileExt;
         let path = migration_lock_path(db_path);
@@ -588,8 +987,35 @@ impl MigrationLock {
             .truncate(false)
             .open(&path)
             .map_err(PulseDBError::Io)?;
-        file.lock_exclusive().map_err(PulseDBError::Io)?;
-        Ok(Self { _file: file })
+        // Fast path: uncontended.
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(Self { _file: file }),
+            Err(error) if !is_lock_busy(&error) => return Err(PulseDBError::Io(error)),
+            Err(_) => {}
+        }
+        info!(
+            lock = %path.display(),
+            "waiting for another process's migration"
+        );
+        let started = std::time::Instant::now();
+        let mut last_warn = started;
+        loop {
+            std::thread::sleep(LOCK_POLL_INTERVAL);
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(error) if is_lock_busy(&error) => {
+                    if last_warn.elapsed() >= LOCK_WARN_INTERVAL {
+                        warn!(
+                            lock = %path.display(),
+                            waited_secs = started.elapsed().as_secs(),
+                            "still waiting for another process's migration"
+                        );
+                        last_warn = std::time::Instant::now();
+                    }
+                }
+                Err(error) => return Err(PulseDBError::Io(error)),
+            }
+        }
     }
 }
 
@@ -844,18 +1270,46 @@ impl RedbStorage {
 
         debug!(db_exists = db_exists, "Opening storage engine");
 
-        // r1.s1.w1 / ADR-011 (backup-before-migrate): claim the logical-schema
-        // sidecar from the PRISTINE file, BEFORE the first writable redb open.
-        // redb 4.x rewrites the file on every writable open+close (it persists
-        // the allocator state on close), so a copy taken inside `open_existing`
-        // — after `create_or_migrate` — is a valid store but not byte-identical
-        // to what the operator had on disk. Best-effort: a redb-v2 file, a
-        // crashed session, a locked file or an unreadable header makes the
-        // read-only peek fail, and `open_existing`'s claim (same helper) is the
-        // fallback exactly as before. A read-only open performs zero writes
-        // (FR-035), so it never claims a sidecar.
+        // r1.s6.w1 (#89/#25) — one ownership rule: the migration lock is taken
+        // BEFORE any writable redb handle on the schema-migration path and held
+        // from the sidecar step through the schema-migration commit (dropped on
+        // every error path). It is taken only when the read-only peek reports a
+        // pending schema migration, so a current-schema open gains no lock
+        // (#95 is w2's). A read-only open never peeks here, so it never acquires
+        // — and never creates — `.migrate.lock` (FR-035: zero writes).
+        //
+        // The sidecar is ensured from the PRISTINE file, before the first
+        // writable open: redb 4.x rewrites the file on every writable
+        // open+close (it persists the allocator state), so a copy taken later is
+        // a valid store but not byte-identical to what the operator had on disk
+        // (ADR-011). A peek that cannot run (a redb-v2 file, a crashed session,
+        // a locked file, an unreadable header) leaves the whole ensure to
+        // `open_existing`'s post-open discovery (B4).
+        let mut migration_lock: Option<MigrationLock> = None;
         if db_exists && !config.read_only {
-            Self::claim_pristine_schema_backup(path);
+            if let Some(schema_version) = Self::peek_schema_version(path) {
+                if schema_version < SCHEMA_VERSION {
+                    let lock = MigrationLock::acquire_exclusive(path)?;
+                    // Re-peek under the lock: another process may have migrated
+                    // the store while we waited.
+                    match Self::peek_schema_version(path) {
+                        Some(version) if version < SCHEMA_VERSION => {
+                            ensure_schema_backup(path, version)?;
+                            info!(
+                                schema_version = version,
+                                "claimed the pre-migration sidecar under the migration \
+                                 lock, before the writable open"
+                            );
+                        }
+                        repeek => debug!(
+                            repeek = ?repeek,
+                            "store no longer needs a schema migration (or the re-peek \
+                             failed); proceeding under the migration lock"
+                        ),
+                    }
+                    migration_lock = Some(lock);
+                }
+            }
         }
 
         // Create or open the database under redb 4.1. A v2-format file (every
@@ -864,41 +1318,36 @@ impl RedbStorage {
         // codec/schema axes inside `open_existing`. `create_or_migrate` runs the
         // one-time redb v2->v3 upgrade-on-open (FR-035 read-only gate + lock +
         // backup) and returns a v3 handle. (upgrade-on-open design §2 step A.)
-        let db = Self::create_or_migrate(path, config)?;
+        let db = Self::create_or_migrate(path, config, migration_lock.as_ref())?;
 
         if db_exists {
             // Validate existing database
-            Self::open_existing(db, path.to_path_buf(), config)
+            Self::open_existing(db, path.to_path_buf(), config, migration_lock.as_ref())
         } else {
             // Initialize new database
             Self::initialize_new(db, path.to_path_buf(), config)
         }
     }
 
-    /// Best-effort claim of the logical-schema backup sidecar from the
-    /// **pristine** on-disk file, before any writable redb open touches it.
+    /// Best-effort read-only peek at a store's logical `schema_version`, before
+    /// ANY writable redb open (r1.s6.w1).
     ///
-    /// Peeks at `db_metadata.schema_version` through a redb **read-only** open
-    /// (zero writes; `ReadOnlyDatabase` never persists allocator state), maps it
-    /// to the sidecar the pending reshape takes (`≤ 2` → `.pre-v3.bak`, `3` →
-    /// `.pre-v4.bak`, `4` → `.pre-v5.bak`, current → none), drops the handle,
-    /// and copies through [`Self::claim_pristine_schema_backup_copy`] — which
-    /// stages, validates and only then publishes, because no writer lock is held
-    /// here. Every failure is
-    /// swallowed at `debug!`: a redb-v2 file (`UpgradeRequired`), a crashed
-    /// session (`RepairAborted`), a file another writer holds, or an unreadable
-    /// header all fall through to `open_existing`, which surfaces the real error
-    /// and claims the sidecar itself (same helper, post-open bytes) as before.
-    fn claim_pristine_schema_backup(path: &Path) {
+    /// Zero writes; `ReadOnlyDatabase` never persists allocator state (FR-035).
+    /// `None` means the peek could not run — a redb-v2 file (`UpgradeRequired`),
+    /// a crashed session (`RepairAborted`), a file another writer holds, or an
+    /// unreadable header — and the caller then falls back to `open_existing`'s
+    /// post-open discovery (B4), which surfaces the real error and ensures the
+    /// sidecar from post-open bytes.
+    fn peek_schema_version(path: &Path) -> Option<u32> {
         let read_only = match Database::builder().open_read_only(path) {
             Ok(db) => db,
             Err(error) => {
                 debug!(
                     error = %error,
-                    "pristine schema-backup peek skipped (read-only open failed); \
-                     open_existing claims the sidecar"
+                    "schema-version peek skipped (read-only open failed); \
+                     open_existing will discover the pending migration"
                 );
-                return;
+                return None;
             }
         };
         let schema_version = match Self::read_metadata(&read_only) {
@@ -906,170 +1355,14 @@ impl RedbStorage {
             Err(error) => {
                 debug!(
                     error = %error,
-                    "pristine schema-backup peek skipped (metadata unreadable); \
-                     open_existing claims the sidecar"
+                    "schema-version peek skipped (metadata unreadable); \
+                     open_existing will discover the pending migration"
                 );
-                return;
+                return None;
             }
         };
         drop(read_only);
-
-        let backup_path = match schema_version {
-            1..=2 => pre_v3_backup_path(path),
-            3 => pre_v4_backup_path(path),
-            4 => pre_v5_backup_path(path),
-            _ => return,
-        };
-        match Self::claim_pristine_schema_backup_copy(path, &backup_path, schema_version) {
-            Ok(true) => info!(
-                schema_version,
-                backup = %backup_path.display(),
-                "claimed pristine pre-migration backup before the writable open"
-            ),
-            Ok(false) => {}
-            Err(error) => warn!(
-                error = %error,
-                backup = %backup_path.display(),
-                "pristine schema-backup claim failed; open_existing will retry"
-            ),
-        }
-    }
-
-    /// The copy step of the PRISTINE claim: stage, validate, then publish.
-    ///
-    /// Same outcome contract as [`claim_schema_backup_copy`] — `Ok(true)` when
-    /// this call published the sidecar, `Ok(false)` when an existing one was
-    /// preserved — but the bytes are PROVEN before they are published.
-    ///
-    /// Why this path cannot use the plain `create_new` + `io::copy` form: it runs
-    /// before `create_or_migrate`, so no redb writer lock exists yet, and
-    /// `open_read_only` takes none. Another process can therefore be holding the
-    /// store open writable and committing while we copy, and the copy would be a
-    /// TORN image — which `create_new` publishes at the final path, where every
-    /// later open's `AlreadyExists` branch then preserves it as genuine. ADR-011's
-    /// rollback would restore a corrupt store, silently. So:
-    ///
-    /// 1. stage the copy at a sibling temp ([`pristine_schema_backup_temp_path`]);
-    /// 2. VALIDATE it by opening **the copy** read-only and reading
-    ///    `schema_version` back off it: it must equal the `schema_version` the
-    ///    peek already established for the source. A torn copy fails to open,
-    ///    fails the metadata read, or reads back a different version;
-    /// 3. publish by linking the validated temp onto the final path, so it
-    ///    transitions absent → fully-formed in one step.
-    ///
-    /// `create_new` semantics are preserved, and **enforced** rather than merely
-    /// checked. The publish is `hard_link`, NOT `rename`: `rename` REPLACES an
-    /// existing destination on both Unix and Windows, so two processes that both
-    /// saw the sidecar absent would let the second silently overwrite the first's
-    /// genuine, published rollback point. `hard_link` is create-if-absent — it
-    /// fails with `AlreadyExists`, which is the same preserve-it branch as the
-    /// pre-staging and pre-publish checks (`Ok(false)`, same logging). The temp
-    /// is removed on EVERY path, the success one included, since the link leaves
-    /// it behind.
-    ///
-    /// Any validation or I/O failure — a `hard_link` error that is not
-    /// `AlreadyExists` included (a filesystem without links, a cross-device
-    /// temp) — removes the temp, publishes NOTHING and returns `Err`, which the
-    /// best-effort caller only logs: `open_existing`'s post-lock claim (which
-    /// does hold the writer lock, via `claim_schema_backup_copy`) remains the
-    /// fallback, unchanged, and `open` still succeeds.
-    ///
-    /// Durability (fsync of the staged bytes and of the parent directory) is out
-    /// of scope here — issue #89 / r1.s3 own it for the whole sidecar family.
-    fn claim_pristine_schema_backup_copy(
-        path: &Path,
-        backup_path: &Path,
-        schema_version: u32,
-    ) -> Result<bool> {
-        if backup_path.try_exists().map_err(PulseDBError::Io)? {
-            debug!("pre-migration backup already exists; preserving it");
-            return Ok(false);
-        }
-
-        let temp_path = pristine_schema_backup_temp_path(backup_path);
-        if let Err(error) = Self::stage_pristine_schema_backup(path, &temp_path, schema_version) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(error);
-        }
-
-        // Same rule as the `create_new` claim, re-checked at publish time: another
-        // opener may have published the genuine sidecar while we staged ours. Keep
-        // theirs, discard the staged copy.
-        if backup_path.try_exists().unwrap_or(false) {
-            let _ = std::fs::remove_file(&temp_path);
-            debug!("pre-migration backup already exists; preserving it");
-            return Ok(false);
-        }
-
-        // Publish with a create-if-absent primitive, not `rename`: `rename`
-        // replaces an existing destination, so the check above would be a
-        // check-then-act race — two processes both find the sidecar absent and
-        // the second silently overwrites the first's genuine rollback point.
-        // `hard_link` fails closed with `AlreadyExists` instead.
-        let published = std::fs::hard_link(&temp_path, backup_path);
-        // The link does not consume the temp; remove it on every path, success
-        // included.
-        let _ = std::fs::remove_file(&temp_path);
-        match published {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                debug!("pre-migration backup already exists; preserving it");
-                Ok(false)
-            }
-            Err(error) => Err(PulseDBError::Io(error)),
-        }
-    }
-
-    /// Stages a copy of `path` at `temp_path` and proves the STAGED bytes are a
-    /// whole store carrying `schema_version` (the version the pristine peek read
-    /// off the source). The caller removes `temp_path` on `Err`.
-    ///
-    /// The temp is created through [`create_sidecar_file`], so it carries the
-    /// source store's permission bits from the first byte written — and the
-    /// publishing hard link keeps them, since it publishes this very inode.
-    fn stage_pristine_schema_backup(
-        path: &Path,
-        temp_path: &Path,
-        schema_version: u32,
-    ) -> Result<()> {
-        // Symlink-safe open, as in `backup_once`: `remove_file` unlinks the entry
-        // itself (never following a symlink), then `create_new` (O_EXCL) creates a
-        // fresh regular file — a stale temp from a crashed run never wedges the
-        // retry, and a hostile symlink is never written THROUGH.
-        let _ = std::fs::remove_file(temp_path);
-        let mut temp_file = create_sidecar_file(path, temp_path).map_err(PulseDBError::Io)?;
-        // Reads of the redb file are the lock-contention signal (Windows surfaces a
-        // concurrent holder as a raw sharing violation), so classify them; writes to
-        // our own temp are sidecar-space ⇒ plain `Io`. `io::copy` conflates the two,
-        // and this path is best-effort either way — the typed error only reaches a
-        // log line — so the copy takes the lock-classifying map.
-        let mut source = std::fs::File::open(path).map_err(migration_io_error)?;
-        std::io::copy(&mut source, &mut temp_file).map_err(migration_io_error)?;
-        drop(source);
-        // Close the temp before reopening it read-only: the validation must see the
-        // bytes as they will be published, not a handle we still hold open.
-        drop(temp_file);
-
-        // Validate the COPY, never the source. A read-only open performs zero
-        // writes, so the staged bytes reach the sidecar unaltered (the upgrade
-        // fixture asserts `.pre-v5.bak` is byte-identical to the pristine store).
-        let staged = Database::builder()
-            .open_read_only(temp_path)
-            .map_err(|error| {
-                StorageError::corrupted(format!(
-                    "staged pristine schema backup does not open as a database: {error}"
-                ))
-            })?;
-        let staged_version = Self::read_metadata(&staged)?.schema_version;
-        drop(staged);
-        if staged_version != schema_version {
-            return Err(StorageError::corrupted(format!(
-                "staged pristine schema backup reads schema_version {staged_version}, \
-                 expected {schema_version} (the source changed under the copy)"
-            ))
-            .into());
-        }
-        Ok(())
+        Some(schema_version)
     }
 
     /// Opens the redb-4.1 database, running the one-time redb file-format
@@ -1081,14 +1374,20 @@ impl RedbStorage {
     ///    - **FR-035 read-only gate** — a read-only open returns
     ///      [`PulseDBError::ReadOnly`] with **zero writes** (no lock, no backup, no
     ///      upgrade) *before* anything else.
-    ///    - acquire the exclusive migration lock (audit C2);
+    ///    - acquire the exclusive migration lock (audit C2) — or take the
+    ///      caller's already-held lock, passed down (`held`), and never
+    ///      re-acquire it;
     ///    - **re-try** `redb 4.1` create — another migrator may have finished while
     ///      we blocked on the lock; if so, release + proceed;
     ///    - back up the pristine `{redb-v2, bincode}` file to `.pre-substrate.bak`;
     ///    - run the redb-2.6 `upgrade()` (v2→v3, in place, values untouched), drop
     ///      the 2.6 handle to release its lock;
     ///    - release the migration lock, reopen under redb 4.1 (now v3).
-    fn create_or_migrate(path: &Path, config: &Config) -> Result<Database> {
+    fn create_or_migrate(
+        path: &Path,
+        config: &Config,
+        held: Option<&MigrationLock>,
+    ) -> Result<Database> {
         match Self::create_database(path, config) {
             Ok(db) => Ok(db),
             Err(PulseDBError::Storage(StorageError::SubstrateUpgradeRequired {
@@ -1111,10 +1410,19 @@ impl RedbStorage {
                      exempt from the <100ms open budget — values stay bincode)"
                 );
 
-                // Audit C2: serialize concurrent migrators so two processes cannot
-                // race the destructive in-place upgrade(). Hold the lock across the
-                // backup + upgrade + reopen.
-                let _migration_lock = MigrationLock::acquire_exclusive(path)?;
+                // Audit C2 + r1.s6.w1: serialize concurrent migrators so two
+                // processes cannot race the destructive in-place upgrade(). Hold
+                // the lock across the backup + upgrade + reopen — unless the caller
+                // already holds it (the schema-migration path acquires it before
+                // any writable handle), in which case ownership is passed down and
+                // NEVER re-acquired: a second `flock` on a fresh descriptor would
+                // self-deadlock.
+                let owned_lock = if held.is_none() {
+                    Some(MigrationLock::acquire_exclusive(path)?)
+                } else {
+                    None
+                };
+                let _migration_lock = held.or(owned_lock.as_ref());
 
                 // Re-check after acquiring the lock: another migrator may have
                 // completed the upgrade while we blocked. If `create` now succeeds,
@@ -1317,6 +1625,22 @@ impl RedbStorage {
         }
     }
 
+    /// The four schema-migration legs implied by a store's `schema_version`.
+    ///
+    /// `(needs_v2, needs_v3, needs_v4, needs_v5)`: each leg runs when the store
+    /// is at or below its source version (v1→v2 adds the WAL `entity_type`;
+    /// v2→v3 reshapes experiences; v3→v4 appends the tags map; v4→v5 splits the
+    /// sync cursor). Re-derived after every reopen on the migration path, since
+    /// another process may have migrated the store meanwhile.
+    fn schema_migration_flags(metadata: &DatabaseMetadata) -> (bool, bool, bool, bool) {
+        (
+            metadata.schema_version == 1,
+            metadata.schema_version <= 2,
+            metadata.schema_version <= 3,
+            metadata.schema_version <= 4,
+        )
+    }
+
     fn validate_existing_metadata(metadata: &DatabaseMetadata, config: &Config) -> Result<()> {
         if !matches!(metadata.schema_version, 1..=SCHEMA_VERSION) {
             warn!(
@@ -1425,75 +1749,92 @@ impl RedbStorage {
     }
 
     /// Opens and validates an existing database.
-    #[instrument(skip(db, config), fields(path = %path.display()))]
-    fn open_existing(db: Database, path: PathBuf, config: &Config) -> Result<Self> {
+    #[instrument(skip(db, config, held), fields(path = %path.display()))]
+    fn open_existing(
+        db: Database,
+        path: PathBuf,
+        config: &Config,
+        held: Option<&MigrationLock>,
+    ) -> Result<Self> {
         info!("Opening existing database");
 
+        let mut db = db;
         let mut metadata = Self::read_metadata(&db)?;
         Self::validate_existing_metadata(&metadata, config)?;
-        let mut needs_v2_migration = metadata.schema_version == 1;
-        let mut needs_v3_migration = metadata.schema_version <= 2;
-        let mut needs_v4_migration = metadata.schema_version <= 3;
-        let mut needs_v5_migration = metadata.schema_version <= 4;
+        let (
+            mut needs_v2_migration,
+            mut needs_v3_migration,
+            mut needs_v4_migration,
+            mut needs_v5_migration,
+        ) = Self::schema_migration_flags(&metadata);
 
         if (needs_v3_migration || needs_v4_migration || needs_v5_migration) && config.read_only {
             return Err(PulseDBError::ReadOnly);
         }
 
-        // The pre-v3 / pre-v4 backup is a plain file copy of the on-disk
-        // database. On Windows the live redb handle holds an OS file lock, so
-        // `fs::copy` fails with a lock violation (error 33) while `db` is open.
-        // Drop the handle to release the lock, copy, then re-open. Only runs on
-        // the one-time migration path; `db` has had read-only access (metadata
-        // read) up to here, so dropping and reopening loses no state.
+        // r1.s6.w1 (#89/#25): the schema migration runs under the migration lock
+        // with the sidecar ensured first. When the caller already holds the lock
+        // (`open`'s peek path), the sidecar was validated and durably published
+        // from the PRISTINE file before any writable handle existed — the only
+        // work left here is the defensive case of a sidecar that vanished.
         //
-        // Schema ≤ 2 stores take `.pre-v3.bak` (they run the v2→v3 reshape).
-        // Schema == 3 stores take `.pre-v4.bak` (v3→v4 tag-field append — no
-        // v3 backup exists for them).
-        // Schema == 4 stores take `.pre-v5.bak` (v4→v5 sync-cursor split — no
-        // earlier backup exists for them).
-        let db = if needs_v3_migration || needs_v4_migration || needs_v5_migration {
-            drop(db);
-            // Schema ≤ 2 stores take `.pre-v3.bak` (they run the v2→v3 reshape).
-            // Schema == 3 stores take `.pre-v4.bak` (v3→v4 tag-field append — no
-            // v3 backup exists for them).
-            // Schema == 4 stores take `.pre-v5.bak` (v4→v5 sync-cursor split).
-            //
-            // Uses `create_new` (O_EXCL) on the FINAL path: concurrent openers that
-            // both enter this block (the migration lock only covers `create_or_migrate`,
-            // not `open_existing`) are serialized by the O_EXCL claim. A concurrent
-            // upgrader that lost the race sees `AlreadyExists` and preserves the
-            // genuine sidecar. This has the same crash-atomicity posture as the
-            // pre-existing `.pre-v3.bak` backup: a hard kill mid-copy leaves a
-            // truncated file that a later open's `AlreadyExists` branch preserves.
-            // (The `.pre-substrate.bak` uses the temp+rename `backup_once` pattern
-            // because it runs under the exclusive migration lock; the schema backup
-            // does not.)
-            //
-            // In the common case `open()` already claimed this sidecar from the
-            // pristine file (before the first writable open) and this is the
-            // `AlreadyExists` → preserve branch; it is the real claim only when
-            // that read-only peek could not run.
-            let backup_path = if needs_v3_migration {
-                pre_v3_backup_path(&path)
-            } else if needs_v4_migration {
-                pre_v4_backup_path(&path)
-            } else {
-                pre_v5_backup_path(&path)
-            };
-            claim_schema_backup_copy(&path, &backup_path)?;
-            let reopened = Self::create_database(&path, config)?;
-            let reopened_metadata = Self::read_metadata(&reopened)?;
-            Self::validate_existing_metadata(&reopened_metadata, config)?;
-            metadata = reopened_metadata;
-            needs_v2_migration = metadata.schema_version == 1;
-            needs_v3_migration = metadata.schema_version <= 2;
-            needs_v4_migration = metadata.schema_version <= 3;
-            needs_v5_migration = metadata.schema_version <= 4;
-            reopened
-        } else {
-            db
-        };
+        // When the caller holds NO lock, the read-only peek could not run (B4: a
+        // redb-v2 file, a crashed session, a locked file, an unreadable header).
+        // Drop this handle, acquire the lock, re-open and re-read the metadata
+        // UNDER the lock (another process may have migrated while we waited),
+        // then ensure the sidecar from POST-OPEN bytes — a valid pre-migration
+        // store, but no longer byte-identical to what the operator had on disk.
+        let mut owned_lock: Option<MigrationLock> = None;
+        if needs_v3_migration || needs_v4_migration || needs_v5_migration {
+            let peek_was_unavailable = held.is_none();
+            if peek_was_unavailable {
+                drop(db);
+                owned_lock = Some(MigrationLock::acquire_exclusive(&path)?);
+                db = Self::create_database(&path, config)?;
+                metadata = Self::read_metadata(&db)?;
+                Self::validate_existing_metadata(&metadata, config)?;
+                (
+                    needs_v2_migration,
+                    needs_v3_migration,
+                    needs_v4_migration,
+                    needs_v5_migration,
+                ) = Self::schema_migration_flags(&metadata);
+            }
+            if needs_v3_migration || needs_v4_migration || needs_v5_migration {
+                let sidecar_present = pending_sidecar_path(&path, metadata.schema_version)
+                    .map(|backup_path| backup_path.try_exists().unwrap_or(false))
+                    .unwrap_or(false);
+                if !sidecar_present || peek_was_unavailable {
+                    if peek_was_unavailable {
+                        info!(
+                            schema_version = metadata.schema_version,
+                            "read-only schema-version peek was unavailable; ensuring the \
+                             schema sidecar from post-open bytes (a valid pre-migration \
+                             store, not byte-identical to the operator's on-disk file)"
+                        );
+                    }
+                    // On Windows the live redb handle holds an OS file lock, so the
+                    // copy needs the handle dropped; the store has had only reads up
+                    // to here, so dropping and reopening loses no state.
+                    drop(db);
+                    ensure_schema_backup(&path, metadata.schema_version)?;
+                    db = Self::create_database(&path, config)?;
+                    metadata = Self::read_metadata(&db)?;
+                    Self::validate_existing_metadata(&metadata, config)?;
+                    (
+                        needs_v2_migration,
+                        needs_v3_migration,
+                        needs_v4_migration,
+                        needs_v5_migration,
+                    ) = Self::schema_migration_flags(&metadata);
+                }
+            }
+        }
+
+        // The lock acquired on this call's behalf (the B4 path) must stay alive
+        // until this function returns — through the schema-migration commit
+        // below — so it is taken into a named binding rather than dropped here.
+        let _lock_held_until_commit = owned_lock.take();
 
         // Substrate-format marker gate (codec/redb-format axis, distinct from the
         // logical schema_version handled above). At this point the file is
@@ -4893,11 +5234,11 @@ mod tests {
         );
     }
 
-    /// Every leftover pristine staging temp beside `backup_path`, whatever
+    /// Every leftover sidecar staging temp beside `backup_path`, whatever
     /// per-call suffix it carries. The temp name is deliberately not
-    /// reconstructible by the caller (see `pristine_schema_backup_temp_path`),
-    /// so "no temp survived" is asserted by looking, not by guessing a name.
-    fn leftover_pristine_temps(backup_path: &Path) -> Vec<PathBuf> {
+    /// reconstructible by the caller (see [`sidecar_staging_temp_path`]), so
+    /// "no temp survived" is asserted by looking, not by guessing a name.
+    fn leftover_sidecar_temps(backup_path: &Path) -> Vec<PathBuf> {
         let dir = backup_path.parent().unwrap();
         let prefix = backup_path
             .file_name()
@@ -4909,7 +5250,7 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .filter(|entry| {
                 let name = entry.file_name().unwrap().to_string_lossy().to_string();
-                name.starts_with(&prefix) && name.ends_with(".pristine.tmp")
+                name.starts_with(&prefix) && name.ends_with(".sidecar.tmp")
             })
             .collect();
         found.sort();
@@ -4918,24 +5259,24 @@ mod tests {
 
     /// The staging temp must be unique per CALL, not per process.
     ///
-    /// PulseDB is a library: two THREADS opening the same schema-4 store in one
-    /// process is ordinary, and both run the pristine claim before any writer
-    /// lock exists. A pid-only name gives them the identical path, and
-    /// `stage_pristine_schema_backup` unconditionally `remove_file`s it before
-    /// creating its own — so one thread unlinks and replaces the other's
-    /// still-open staging file, and the other then validates or publishes bytes
-    /// it did not write.
+    /// A crashed run's staged temp is left behind by design (never
+    /// auto-cleaned); the per-call nonce plus the unlink before every
+    /// `create_new` means a later call can never wedge on it or mistake it for
+    /// its own staging. And two callers in ONE process — `publish_durable_sidecar`
+    /// is a free function that does not itself take the migration lock — each
+    /// stage at their own path, rather than one unlinking the other's still-open
+    /// staging file and publishing bytes it did not write.
     #[test]
-    fn test_pristine_staging_temp_is_unique_per_call() {
+    fn test_sidecar_staging_temp_is_unique_per_call() {
         let dir = tempdir().unwrap();
         let backup_path = dir.path().join("test.db.pre-v5.bak");
 
-        let first = pristine_schema_backup_temp_path(&backup_path);
-        let second = pristine_schema_backup_temp_path(&backup_path);
+        let first = sidecar_staging_temp_path(&backup_path);
+        let second = sidecar_staging_temp_path(&backup_path);
 
         assert_ne!(
             first, second,
-            "two claims in ONE process must not stage at the same temp path"
+            "two publishes in ONE process must not stage at the same temp path"
         );
         let pid = std::process::id().to_string();
         for temp in [&first, &second] {
@@ -4946,7 +5287,7 @@ mod tests {
                  are attributable: {name}"
             );
             assert!(
-                name.ends_with(".pristine.tmp"),
+                name.ends_with(".sidecar.tmp"),
                 "the temp must keep its recognisable suffix: {name}"
             );
             assert!(
@@ -4957,15 +5298,17 @@ mod tests {
         }
     }
 
-    /// The same defect through the real entry point: concurrent claimants in
-    /// ONE process must all complete, exactly one must publish, and the
-    /// published sidecar must be a byte-identical copy of the source — not a
-    /// half-written image another thread left at a shared temp path.
+    /// The same defect through the real publish entry point: concurrent callers
+    /// in ONE process must all succeed, and the sidecar at the final path must
+    /// be a byte-identical copy of the source — not a half-written image another
+    /// thread left at a shared temp path. The create-if-absent `hard_link`
+    /// guarantees exactly one caller creates the link; the rest take the
+    /// preserve branch and discard their staged copy.
     ///
     /// This is a RACE, so it is a probabilistic witness, not a deterministic
     /// one: it is run over several rounds with a barrier to widen the window.
     #[test]
-    fn test_concurrent_pristine_claims_publish_byte_identical_bytes() {
+    fn test_concurrent_durable_publishes_publish_byte_identical_bytes() {
         use std::sync::{Arc, Barrier};
 
         const THREADS: usize = 8;
@@ -4981,7 +5324,7 @@ mod tests {
             let backup_path = dir.path().join(format!("test.db.round-{round}.bak"));
             let barrier = Arc::new(Barrier::new(THREADS));
 
-            let published: usize = std::thread::scope(|scope| {
+            std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..THREADS)
                     .map(|_| {
                         let barrier = Arc::clone(&barrier);
@@ -4989,30 +5332,18 @@ mod tests {
                         let backup_path = backup_path.clone();
                         scope.spawn(move || {
                             barrier.wait();
-                            RedbStorage::claim_pristine_schema_backup_copy(
-                                &path,
-                                &backup_path,
-                                SCHEMA_VERSION,
-                            )
+                            publish_durable_sidecar(&path, &backup_path, SCHEMA_VERSION)
                         })
                     })
                     .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        let claimed = handle
-                            .join()
-                            .unwrap()
-                            .expect("a concurrent claimant must not fail");
-                        usize::from(claimed)
-                    })
-                    .sum()
+                for handle in handles {
+                    handle
+                        .join()
+                        .unwrap()
+                        .expect("a concurrent publisher must not fail");
+                }
             });
 
-            assert_eq!(
-                published, 1,
-                "exactly one concurrent claimant publishes the sidecar (round {round})"
-            );
             assert_eq!(
                 std::fs::read(&backup_path).unwrap(),
                 source,
@@ -5020,37 +5351,37 @@ mod tests {
                  source, not an image a racing thread left behind (round {round})"
             );
             assert!(
-                leftover_pristine_temps(&backup_path).is_empty(),
+                leftover_sidecar_temps(&backup_path).is_empty(),
                 "no staging temp may survive, on any thread's path (round {round})"
             );
         }
     }
 
     #[test]
-    fn test_pristine_schema_backup_discards_a_staged_copy_that_fails_validation() {
-        // The pristine claim runs BEFORE `create_or_migrate`, so no redb writer
-        // lock is held: the bytes it copies can be a torn mid-commit image of a
-        // store another process is writing. Such a copy must be staged, REJECTED
-        // and deleted — never published at the sidecar path, where every later
+    fn test_durable_publish_discards_a_staged_copy_that_fails_validation() {
+        // The bytes copied into the staged image can be torn — a crash or
+        // external damage can leave a truncated store — and the publish must
+        // never place such an image at the sidecar path, where every later
         // open's preserve-branch would take it for a genuine ADR-011 rollback
-        // point and silently restore a corrupt store.
+        // point and silently restore a corrupt store. Such a copy must be
+        // staged, REJECTED and deleted.
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
         let storage = RedbStorage::open(&path, &default_config()).unwrap();
         Box::new(storage).close().unwrap();
 
-        // Stand-in for a source read mid-write: a truncated image of the store.
+        // Stand-in for a damaged source: a truncated image of the store.
         // The peek is taken to have established schema_version 4 for it (the
-        // `.pre-v5.bak` claimant); the staged copy cannot corroborate that.
+        // `.pre-v5.bak` publish); the staged copy cannot corroborate that.
         let torn = dir.path().join("torn.db");
         let whole = std::fs::read(&path).unwrap();
         std::fs::write(&torn, &whole[..whole.len() / 4]).unwrap();
 
         let backup_path = pre_v5_backup_path(&torn);
-        let error = RedbStorage::claim_pristine_schema_backup_copy(&torn, &backup_path, 4)
+        let error = publish_durable_sidecar(&torn, &backup_path, 4)
             .expect_err("a staged copy that fails validation must never be published");
         assert!(
-            error.to_string().contains("staged pristine schema backup"),
+            error.to_string().contains("sidecar image"),
             "validation failure must be reported as such, got: {error}"
         );
         assert!(
@@ -5060,18 +5391,17 @@ mod tests {
             backup_path.display()
         );
         assert!(
-            leftover_pristine_temps(&backup_path).is_empty(),
+            leftover_sidecar_temps(&backup_path).is_empty(),
             "the rejected staging temp must be cleaned up on the failure path"
         );
 
-        // Best-effort throughout: a rejected claim never turns a successful open
-        // into an error.
+        // The failed publish leaves the store itself untouched and openable.
         let storage = RedbStorage::open(&path, &default_config()).unwrap();
         Box::new(storage).close().unwrap();
     }
 
     #[test]
-    fn test_pristine_schema_backup_publishes_the_validated_bytes_and_keeps_no_temp() {
+    fn test_durable_publish_writes_validated_bytes_and_keeps_no_temp() {
         // The publish is a create-if-absent hard link rather than a rename, so
         // the staged temp survives it and must be removed on the SUCCESS path
         // too — and an already-published sidecar is preserved, never replaced.
@@ -5081,39 +5411,33 @@ mod tests {
         Box::new(storage).close().unwrap();
 
         let backup_path = pre_v5_backup_path(&path);
-        assert!(
-            RedbStorage::claim_pristine_schema_backup_copy(&path, &backup_path, SCHEMA_VERSION)
-                .unwrap(),
-            "the first claim publishes the sidecar"
-        );
+        publish_durable_sidecar(&path, &backup_path, SCHEMA_VERSION)
+            .expect("the first publish must succeed");
         assert_eq!(
             std::fs::read(&backup_path).unwrap(),
             std::fs::read(&path).unwrap(),
             "the published sidecar must be the validated copy of the store"
         );
         assert!(
-            leftover_pristine_temps(&backup_path).is_empty(),
+            leftover_sidecar_temps(&backup_path).is_empty(),
             "the staging temp must not survive a successful publish"
         );
 
-        // A second claim keeps the published rollback point untouched.
+        // A second publish keeps the published rollback point untouched.
         let published = std::fs::read(&backup_path).unwrap();
-        assert!(
-            !RedbStorage::claim_pristine_schema_backup_copy(&path, &backup_path, SCHEMA_VERSION)
-                .unwrap(),
-            "an already-published sidecar is preserved, not re-published"
-        );
+        publish_durable_sidecar(&path, &backup_path, SCHEMA_VERSION)
+            .expect("an already-published sidecar is preserved, not replaced");
         assert_eq!(std::fs::read(&backup_path).unwrap(), published);
-        assert!(leftover_pristine_temps(&backup_path).is_empty());
+        assert!(leftover_sidecar_temps(&backup_path).is_empty());
     }
 
     /// A sidecar is a byte copy of the database, so it must never be more
     /// readable than the database: a store restricted to `0600` in a directory
     /// other accounts can reach would otherwise get a `0644` copy of its
-    /// contents. Both claim paths carry the source's mode onto the copy.
+    /// contents. Both publish paths carry the source's mode onto the copy.
     #[cfg(unix)]
     #[test]
-    fn test_schema_backup_sidecars_carry_the_source_permissions() {
+    fn test_backup_sidecars_carry_the_source_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let mode_of = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
@@ -5124,26 +5448,26 @@ mod tests {
         Box::new(storage).close().unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        // The pristine path: staged at a temp, published by hard link, so the
-        // mode is the one the temp was created with.
-        let pristine = pre_v5_backup_path(&path);
-        assert!(
-            RedbStorage::claim_pristine_schema_backup_copy(&path, &pristine, SCHEMA_VERSION)
-                .unwrap()
-        );
+        // The schema sidecar (durable publish): staged at a temp created with
+        // the source's mode, published by hard link, so the mode is the one the
+        // temp was created with.
+        let schema_backup = pre_v5_backup_path(&path);
+        publish_durable_sidecar(&path, &schema_backup, SCHEMA_VERSION)
+            .expect("the schema sidecar publish must succeed");
         assert_eq!(
-            mode_of(&pristine),
+            mode_of(&schema_backup),
             0o600,
-            "the pristine sidecar must not be more readable than the store"
+            "the schema sidecar must not be more readable than the store"
         );
 
-        // The post-lock path: `create_new` straight at the final path.
-        let post_lock = pre_v4_backup_path(&path);
-        assert!(claim_schema_backup_copy(&path, &post_lock).unwrap());
+        // The substrate sidecar (`backup_once`): the same temp-then-publish
+        // shape, so its mode must match too.
+        let substrate_backup = pre_substrate_backup_path(&path);
+        backup_once(&path, &substrate_backup).expect("the substrate backup must succeed");
         assert_eq!(
-            mode_of(&post_lock),
+            mode_of(&substrate_backup),
             0o600,
-            "the post-lock sidecar must not be more readable than the store"
+            "the substrate sidecar must not be more readable than the store"
         );
     }
 

@@ -6,8 +6,8 @@
 > v4→v5 sync-cursor split — see *Schema v5* below). A steady-state open performs **no migration
 > work**, but since 0.8.0 every **writable** open of an existing store first takes a bounded
 > read-only peek at the file — one `open_read_only`, the substrate marker and the metadata row, and a
-> metadata decode — to decide whether a pristine sidecar must be claimed before the writable open
-> rewrites the allocator pages. A current-schema (v5) store therefore pays that peek on every
+> metadata decode — to decide whether the pre-migration sidecar must be published before the writable
+> open rewrites the allocator pages. A current-schema (v5) store therefore pays that peek on every
 > writable open, then opens the file again to serve traffic. The peek is O(1) in store size and the
 > NFR-001 open budget (<100 ms) still applies; skipping it for a store already at the current schema
 > version is a tracked follow-up. A **read-only** open performs zero writes and never peeks.
@@ -98,17 +98,23 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
 
 **What happens on the first writable open of a schema-4 store** (every 0.7.x store):
 
-1. **Pristine backup.** `<db>.pre-v5.bak` is claimed as a byte-for-byte copy of the file **before the
-   first writable redb open** (a redb read-only open peeks at `schema_version`; a writable open would
-   already rewrite the file's allocator pages). Because no writer lock is held that early, the copy is
-   staged at a sibling temp, validated by re-opening the staged file read-only and reading
-   `schema_version` back off it, and published by an atomic create-if-absent hard link only if it
-   validates — a copy whose `schema_version` cannot be read back is discarded, never published. That
-   check reads `schema_version` only, so a copy torn by a concurrent writer's commit can still pass it
-   and be published (#89; see the 0.8.0 Known Limitations in the CHANGELOG). If the peek cannot run or the staged
-   copy fails validation (crashed session, locked file, concurrent writer), the copy is taken after the
-   open instead — a valid store, but not byte-identical. The sidecar is never overwritten once it
-   exists. (The same pre-open claim now covers `.pre-v4.bak` for redb-v3
+1. **Durable sidecar, under ownership.** `<db>.pre-v5.bak` is a byte-for-byte copy of the file,
+   published **before any migration write** and only while this process holds the migration lock —
+   `.migrate.lock` is acquired before any writable redb handle and held through the schema-migration
+   commit, so a second process opening the same store waits, then finds it already migrated. The
+   copy is staged at a process-unique sibling temp, `fsync`ed, **validated as a whole image**
+   (re-opened read-only: `schema_version` read back, then every table and multimap the image lists
+   traversed and every entry read — a metadata-only check cannot see a copy torn by a concurrent
+   writer's commit), and published by an atomic create-if-absent hard link, which never replaces an
+   existing sidecar. Any failure — a failed fsync, a torn image, a failed link — **refuses the
+   migration** with a typed error; the store stays at its pre-migration schema and the temp is
+   removed. If the peek cannot run (crashed session, locked file) and the open discovers a pending
+   migration, the copy is taken from the post-open bytes instead — a valid store, but not
+   byte-identical; the open says so at `info!`. An **existing** sidecar is proof only after the same
+   whole-image validation: a valid one is kept, and one that fails (does not open, wrong
+   `schema_version`, or fails the traversal) is renamed to
+   `<db>.pre-v5.bak.invalid-<unix-seconds>` (`-<n>` if taken) — logged at `warn` with both paths,
+   never deleted — and a fresh image is published. (The same rules cover `.pre-v4.bak` for redb-v3
    schema-3 stores; redb-v2 stores keep `.pre-substrate.bak` as their pristine copy.)
 2. **Cursor reset (single write transaction).** Every `sync_cursors` row is rewritten as
    `{ instance_id, push_sequence: 0, pull_sequence: 0 }`. The legacy `last_sequence` is **not** used
@@ -131,10 +137,17 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
 - **Events compacted before the upgrade are not recoverable.** If a pre-0.8.0 compaction already
   deleted unpushed events (the #9 failure), the migration cannot restore them; the resync covers only
   what is still in the WAL.
-- **Run the first writable open with no other process accessing the store.** The sidecar is a
-  clean rollback image only when that open has the store to itself: neither the pre-open nor the
-  post-open copy is serialized against a concurrent writer or migration, and neither is fsync'd
-  (#89).
+- **A second opener waits, then finds the store migrated.** Other writable openers block on the
+  migration lock with no timeout — a multi-minute migration must not fail its waiters — and a `warn!`
+  carrying the lock path is logged every 30 s while blocked. After the first migration commits, a
+  waiter re-checks the schema under the lock and proceeds against the already-migrated store. A
+  read-only open takes no lock and creates no `.migrate.lock` file.
 - **Rollback** (ADR-011): reinstall 0.7.x and restore `<db>.pre-v5.bak` over the store. A 0.7.x
   binary refuses a schema-5 store with `SchemaVersionMismatch`, so a downgrade without the restore
   fails loud rather than misreading cursors.
+- **Check the rollback image before restoring it.** Open it read-only with the binary you are
+  reinstalling (a 0.7.x `Config::read_only()` open of the schema-4 image) and confirm it reads. An
+  image published by a 0.8.0 binary was validated `schema_version`-only when written and is **not
+  re-validated later** — a schema-5 store needs no migration, so no open triggers a check
+  (re-validating on every open would bring back the steady-state cost #95 removes). The whole-image
+  validation above applies at publish and quarantine time, on the upgrading open.
