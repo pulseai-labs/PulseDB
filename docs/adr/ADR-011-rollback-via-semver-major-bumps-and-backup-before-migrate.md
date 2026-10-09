@@ -63,3 +63,28 @@ mechanics are unchanged.
 - **Mixed-version concurrent upgrades are unsupported.** These rules serialize
   two openers of the *same* PulseDB version; two different versions migrating
   one store concurrently remain outside the contract (B5).
+
+**2026-10-09 — r1.s6.w2 (#95).** A steady-state writable open of a
+current-schema store pays a stated, supported floor: one read-only open plus
+one read of the `db_metadata` row, taken in a single read transaction as of
+this item, measured on the reference machine at a few tens of microseconds and
+inside NFR-001's 100 ms open budget with a wide margin. The floor replaces the
+earlier "tracked follow-up" wording; the three cheaper alternatives were each
+rejected, and none is to be reintroduced without revisiting this note:
+
+- **Skip the peek when a `.pre-vN.bak` exists.** It never fires for a fresh v5
+  store (which has no sidecar), and sidecar existence is not proof that the
+  store is current: nothing deletes an older `.pre-vN.bak`, so a v4 store
+  carrying a `.pre-v3.bak` (or a store whose needed image was quarantined)
+  would skip the peek and publish its rollback image from post-open bytes —
+  breaking the byte-identity this amendment requires.
+- **A durable `<db>.schema` marker file.** A new persistent artifact plus a new
+  invalidation mode: an operator restore can leave a stale marker, and the
+  design then needs a typed refusal in `open_existing` and a delete step in the
+  ADR-011 rollback path — a new failure mode for a few microseconds.
+- **Feed the peek's `schema_version` forward to the writable handle.** Saves
+  nothing: the re-read on the writable handle is the only check made under the
+  exclusive lock, and it is what catches a newer binary that migrated the store
+  in the gap (`validate_existing_metadata` → `SchemaVersionMismatch`). Trusting
+  the pre-open snapshot there would let this build rewrite v5 metadata into a
+  future-version store.

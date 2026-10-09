@@ -5,12 +5,23 @@
 > (bincode→postcard, `SUBSTRATE_FORMAT` marker 1→2) and the logical-schema reshapes (v3→v4 tags,
 > v4→v5 sync-cursor split — see *Schema v5* below). A steady-state open performs **no migration
 > work**, but since 0.8.0 every **writable** open of an existing store first takes a bounded
-> read-only peek at the file — one `open_read_only`, the substrate marker and the metadata row, and a
-> metadata decode — to decide whether the pre-migration sidecar must be published before the writable
-> open rewrites the allocator pages. A current-schema (v5) store therefore pays that peek on every
-> writable open, then opens the file again to serve traffic. The peek is O(1) in store size and the
-> NFR-001 open budget (<100 ms) still applies; skipping it for a store already at the current schema
-> version is a tracked follow-up. A **read-only** open performs zero writes and never peeks.
+> read-only peek at the file — one `open_read_only` plus one metadata read (the substrate marker and
+> the `db_metadata` row, read in a single read transaction since #95) — to decide whether the
+> pre-migration sidecar must be published before the writable open rewrites the allocator pages.
+> A current-schema (v5) store therefore pays that peek on every writable open, then opens the file
+> again to serve traffic (about 2.8 ms median for the storage open on the reference machine, 1k and
+> 10k × 384-d stores alike; the peek is 27–32 µs median, p95 ≤ 40 µs, of that). **That peek is the
+> supported floor** for the steady-state open: it is O(1) in store size, ≤ 0.04 % of the NFR-001 open
+> budget (< 100 ms) — which the release-mode test `current_schema_store_opens_within_nfr001_budget`
+> asserts — and it cannot be removed without weakening ADR-011's byte-identical rollback image.
+> Proving a store is current needs a read of its `metadata` row; each cheaper alternative was
+> rejected: skipping the peek when a `.pre-vN.bak` exists never fires for a fresh v5 store and an
+> older sidecar is not proof that the store is current (nothing deletes one), a durable `<db>.schema`
+> marker file adds a persistent artifact with a stale-marker invalidation mode, and forwarding the
+> peek's version to the writable handle saves nothing because the under-lock re-read must stay. A
+> **read-only** open never peeks and makes no PulseDB-level write — no migration lock, no sidecar, no
+> metadata write; redb itself still opens the file writable and rewrites header bytes on
+> open+close (#117).
 
 ## What happens on first open of an older store
 
@@ -124,7 +135,8 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
    on builds **with and without** the `sync` feature (it goes through a feature-independent raw-table
    helper).
 3. **Read-only opens refuse.** A `read_only` open of a not-yet-migrated schema-4 store returns the typed
-   `ReadOnly` error and performs zero writes (no sidecar, no migration), as for v3→v4.
+   `ReadOnly` error and makes no PulseDB-level write (no migration lock, no sidecar, no metadata
+   write), as for v3→v4.
 
 **Consequences for operators.**
 
@@ -149,5 +161,6 @@ and `PullPage::scan_position`. The 0.8.0 sync protocol is **v5** and does not in
   reinstalling (a 0.7.x `Config::read_only()` open of the schema-4 image) and confirm it reads. An
   image published by a 0.8.0 binary was validated `schema_version`-only when written and is **not
   re-validated later** — a schema-5 store needs no migration, so no open triggers a check
-  (re-validating on every open would bring back the steady-state cost #95 removes). The whole-image
+  (re-validating on every open would add a second read to the steady-state open, whose floor is the
+  single metadata peek — see the top of this document). The whole-image
   validation above applies at publish and quarantine time, on the upgrading open.

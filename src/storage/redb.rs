@@ -313,8 +313,9 @@ fn create_sidecar_file(source: &Path, sidecar: &Path) -> std::io::Result<std::fs
 /// Operator note (audit fold 5): a sidecar published by a 0.8.0-era binary was
 /// validated `schema_version`-only when it was written, and it is NOT
 /// re-validated later — a current-schema store takes no sidecar, so no open
-/// triggers a check (re-validating on every open would bring back the
-/// steady-state cost #95 removes). Check a rollback image **before** restoring
+/// triggers a check (re-validating on every open would add a second read to
+/// the steady-state open, whose floor is the single metadata peek — see
+/// docs/storage-migration.md). Check a rollback image **before** restoring
 /// it: open it read-only with the binary you are downgrading to (e.g. a 0.7.x
 /// `Config::read_only()` open of the schema-4 image) and confirm it reads.
 fn pending_sidecar_path(path: &Path, schema_version: u32) -> Option<PathBuf> {
@@ -1274,9 +1275,13 @@ impl RedbStorage {
         // BEFORE any writable redb handle on the schema-migration path and held
         // from the sidecar step through the schema-migration commit (dropped on
         // every error path). It is taken only when the read-only peek reports a
-        // pending schema migration, so a current-schema open gains no lock
-        // (#95 is w2's). A read-only open never peeks here, so it never acquires
-        // — and never creates — `.migrate.lock` (FR-035: zero writes).
+        // pending schema migration, so a current-schema open gains no lock: the
+        // peek itself — one read-only open plus one metadata read — is the
+        // supported steady-state floor (#95), and it cannot be skipped without
+        // weakening the byte-identical rollback image ADR-011 requires (see
+        // docs/storage-migration.md). A read-only open never peeks here, so it
+        // never acquires — and never creates — `.migrate.lock` (FR-035: zero
+        // writes).
         //
         // The sidecar is ensured from the PRISTINE file, before the first
         // writable open: redb 4.x rewrites the file on every writable
@@ -1575,7 +1580,8 @@ impl RedbStorage {
     ///
     /// This runs at `open_existing` start, **before** the codec re-encode pass, so
     /// it cannot assume the values are postcard yet. It branches on the raw marker
-    /// (read serializer-independently via [`read_substrate_marker`]):
+    /// (read serializer-independently, in the same read transaction as the
+    /// metadata row — r1.s6.w2, #95):
     /// - `marker == Current` (`{redb-v3, postcard}`) ⇒ `postcard::from_bytes`;
     /// - `Absent | Older` (bincode-era values not yet re-encoded) ⇒
     ///   `legacy_bincode::decode` (1.01 vendored reader).
@@ -1583,11 +1589,26 @@ impl RedbStorage {
     /// `Newer` is handled by the caller (`open_existing`) before any value read, so
     /// it never reaches here; we treat it as the postcard path defensively.
     fn read_metadata<D: ReadableDatabase>(db: &D) -> Result<DatabaseMetadata> {
-        let marker = Self::read_substrate_marker(db)?;
+        // r1.s6.w2 (#95): ONE read transaction for both keys. The substrate
+        // marker and the metadata row live in the same table
+        // (`METADATA_TABLE`), and reading them under one `begin_read` removes
+        // one transaction from every steady-state open — the pre-open peek in
+        // `open` AND `open_existing`'s re-read on the writable handle — without
+        // changing behaviour: the marker is still read and decoded (its errors
+        // still surface) before the metadata row is read, and the decode branch
+        // below is unchanged.
         let read_txn = db.begin_read().map_err(StorageError::from)?;
         let meta_table = read_txn
             .open_table(METADATA_TABLE)
             .map_err(|e| StorageError::corrupted(format!("Cannot open metadata table: {}", e)))?;
+
+        let marker = match meta_table
+            .get(SUBSTRATE_FORMAT_KEY)
+            .map_err(StorageError::from)?
+        {
+            None => SubstrateFormat::Absent,
+            Some(entry) => SubstrateFormat::classify(decode_substrate_marker(entry.value())?),
+        };
 
         let metadata_bytes = meta_table
             .get(METADATA_KEY)
@@ -1919,12 +1940,15 @@ impl RedbStorage {
             );
         }
 
-        // Audit C6 / FR-035: a read-only open performs ZERO writes — it must not
-        // write `last_opened_at` (`touch()`) nor open a write txn, so it can run
-        // against a locked/old store without faulting. (An un-migrated store has
-        // already been refused above: redb-v2 in `create_or_migrate`, bincode-era
-        // marker via the `needs_marker_write` read-only gate.) A writable open
-        // always touches + writes, preserving prior behavior + the migration writes.
+        // Audit C6 / FR-035: a read-only open makes no PulseDB-level write — it
+        // writes no `last_opened_at` (`touch()`), takes no migration lock,
+        // publishes no sidecar and opens no write txn — so it can run against a
+        // locked/old store without faulting. (redb itself still opens the file
+        // writable and rewrites header bytes on open+close; that redb-layer
+        // behavior is tracked as #117.) (An un-migrated store has already been
+        // refused above: redb-v2 in `create_or_migrate`, bincode-era marker via
+        // the `needs_marker_write` read-only gate.) A writable open always
+        // touches + writes, preserving prior behavior + the migration writes.
         if !config.read_only {
             // Update last_opened_at timestamp and bump schema version if migrating.
             metadata.touch();
@@ -9002,5 +9026,124 @@ mod tests {
             audit_serde_blob_coverage(&[fake_serde_blob])
                 .expect("fake serde-blob table must be rejected");
         }
+    }
+
+    // ========================================================================
+    // r1.s6.w2 (#95) — the steady-state open: no migration lock, no sidecar,
+    // inside the NFR-001 budget.
+    // ========================================================================
+
+    /// AC-1 (r1.s6.w2, #95): reopening a current-schema (v5) store takes no
+    /// migration lock and publishes no sidecar — on every reopen.
+    ///
+    /// A fresh v5 store needs no migration. The pre-open peek reports
+    /// `schema_version == SCHEMA_VERSION`, so the `< SCHEMA_VERSION` gate is
+    /// false and the whole ownership block is skipped: no `.migrate.lock` is
+    /// created and no `.pre-v3/v4/v5.bak` / `.pre-substrate.bak` image is
+    /// published. This pins the invariant the w2 read-path change must not lose.
+    #[test]
+    fn current_schema_reopen_takes_no_migration_lock_and_publishes_no_sidecar() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("steady_state.db");
+
+        {
+            let storage = RedbStorage::open(&path, &default_config()).unwrap();
+            assert_eq!(storage.metadata().schema_version, SCHEMA_VERSION);
+        }
+
+        let lock_path = migration_lock_path(&path);
+        for reopen in 0..20 {
+            let storage = RedbStorage::open(&path, &default_config()).unwrap();
+            assert_eq!(storage.metadata().schema_version, SCHEMA_VERSION);
+            drop(storage);
+
+            assert!(
+                !lock_path.exists(),
+                "reopen {reopen}: a current-schema open must not create {}",
+                lock_path.display()
+            );
+            for backup in [
+                pre_v3_backup_path(&path),
+                pre_v4_backup_path(&path),
+                pre_v5_backup_path(&path),
+                pre_substrate_backup_path(&path),
+            ] {
+                assert!(
+                    !backup.exists(),
+                    "reopen {reopen}: a current-schema open must not publish {}",
+                    backup.display()
+                );
+            }
+        }
+    }
+
+    /// AC-2 (r1.s6.w2, #95; demo line s6-a2): the storage open of a
+    /// current-schema store stays inside NFR-001's "< 100 ms" open budget.
+    ///
+    /// A 1,000-experience × 384-d v5 store is opened writable 3 times as
+    /// warm-ups (excluded) and then 50 times timed; the returned handle is
+    /// dropped outside the timed span, so the measurement is the open call
+    /// itself. The median and p95 are printed for the record. Release only:
+    /// an unoptimized debug build cannot speak to a timing bound, so it is
+    /// ignored there.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bound; run with --release")]
+    fn current_schema_store_opens_within_nfr001_budget() {
+        use crate::NewExperience;
+        use std::time::{Duration, Instant};
+
+        /// Deterministic 384-d vector from a seed (research-harness shape).
+        fn make_embedding(seed: u64) -> Vec<f32> {
+            (0..384)
+                .map(|i| {
+                    let h = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(i as u64)
+                        .wrapping_mul(1_442_695_040_888_963_407);
+                    (h >> 33) as f32 / (u32::MAX as f32) - 0.5
+                })
+                .collect()
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nfr001_steady_state.db");
+        {
+            let db = PulseDB::open(&path, default_config()).unwrap();
+            let collective = db.create_collective("nfr001").unwrap();
+            for i in 0..1_000u64 {
+                db.record_experience(NewExperience {
+                    collective_id: collective,
+                    content: format!("Experience {i}"),
+                    embedding: Some(make_embedding(i)),
+                    ..Default::default()
+                })
+                .unwrap();
+            }
+        }
+
+        // 3 warm-ups, excluded: page cache + redb allocator state.
+        for _ in 0..3 {
+            drop(RedbStorage::open(&path, &default_config()).unwrap());
+        }
+
+        let runs = 50;
+        let mut samples = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let start = Instant::now();
+            let storage = RedbStorage::open(&path, &default_config()).unwrap();
+            samples.push(start.elapsed());
+            drop(storage);
+        }
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        let p95 = samples[((runs as f64 * 0.95).ceil() as usize).saturating_sub(1)];
+        println!(
+            "NFR-001 steady-state open: store={} bytes runs={runs} median={median:?} p95={p95:?}",
+            std::fs::metadata(&path).unwrap().len(),
+        );
+        assert!(
+            p95 < Duration::from_millis(100),
+            "NFR-001: steady-state storage open p95 {p95:?} exceeds 100 ms (median {median:?})"
+        );
     }
 }
