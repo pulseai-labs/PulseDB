@@ -390,8 +390,9 @@ enum SidecarOccupant {
     /// (Unix: device + inode). Still needs [`validate_sidecar_image`].
     Distinct,
     /// A regular file whose identity cannot be read: stable std exposes no file
-    /// identity on Windows. It cannot be proven distinct from the source, so it
-    /// is never kept as proof.
+    /// identity on Windows. It is validated, not identity-checked, so a hard-link
+    /// alias of the source is not detected there. Still needs
+    /// [`validate_sidecar_image`].
     #[cfg_attr(unix, allow(dead_code))]
     Unproven,
     /// Never a rollback image: a symlink (dangling or not), a non-regular
@@ -435,10 +436,6 @@ fn inspect_sidecar_occupant(source: &Path, backup_path: &Path) -> Result<Sidecar
     }
 }
 
-/// Why an [`SidecarOccupant::Unproven`] sidecar is quarantined.
-const UNPROVEN_SIDECAR: &str = "its file identity cannot be read on this platform, so it \
-                                cannot be proven distinct from the live store";
-
 /// Quarantines an occupant of `backup_path` that cannot be kept as proof
 /// ([`quarantine_invalid_sidecar`]: the entry itself is renamed — a symlink's
 /// target is never followed, a hard link's other names stay intact).
@@ -455,7 +452,8 @@ fn quarantine_sidecar_occupant(backup_path: &Path, reason: &dyn std::fmt::Displa
 }
 
 /// Judges an existing occupant of `backup_path`: `Ok(None)` when it is a
-/// distinct, valid image to keep, `Ok(Some(reason))` when it must be
+/// regular file (Unix: proven distinct; Windows: not identity-checked) that
+/// validates as a whole image to keep, `Ok(Some(reason))` when it must be
 /// quarantined. The outer `Err` (identity or image could not be checked)
 /// refuses the migration with nothing quarantined.
 fn judge_sidecar_occupant(
@@ -466,8 +464,7 @@ fn judge_sidecar_occupant(
     match inspect_sidecar_occupant(source, backup_path)? {
         SidecarOccupant::Absent => Ok(Some("the occupant vanished".to_owned())),
         SidecarOccupant::Unusable(reason) => Ok(Some(reason.to_owned())),
-        SidecarOccupant::Unproven => Ok(Some(UNPROVEN_SIDECAR.to_owned())),
-        SidecarOccupant::Distinct => {
+        SidecarOccupant::Distinct | SidecarOccupant::Unproven => {
             match validate_sidecar_image(backup_path, expected_schema_version)? {
                 Ok(()) => Ok(None),
                 Err(error) => Ok(Some(error.to_string())),
@@ -826,11 +823,11 @@ fn read_known_multimap_entries(read_txn: &::redb::ReadTransaction, name: &str) -
 /// a failed hard-link/copy publication all leave the store
 /// untouched at its pre-migration schema. A loser's `AlreadyExists` is the
 /// preserve branch, not a failure, but only for an occupant that
-/// [`judge_sidecar_occupant`] accepts — a distinct regular file that validates
-/// as a whole image; then the sidecar already at the final path wins and this
-/// call's staged copy is discarded. Any other occupant (a symlink, an alias of
-/// `source`, an invalid image, or on Windows any regular file) is quarantined
-/// and the publish retried ONCE; a second one refuses the migration (LF3/LF4,
+/// [`judge_sidecar_occupant`] accepts — a regular file (distinct from `source`
+/// on Unix; validated, not identity-checked, on Windows) that validates as a
+/// whole image; then the sidecar already at the final path wins and this
+/// call's staged copy is discarded. Any other occupant (a symlink, a Unix alias
+/// of `source`, an invalid image) is quarantined and the publish retried ONCE; a second one refuses the migration (LF3/LF4,
 /// PR #119).
 ///
 /// Publication uses `hard_link`, or an exclusive copy on link-less volumes.
@@ -944,7 +941,8 @@ fn publish_durable_sidecar_with(
                 return Ok(());
             }
             // LF3/LF4 (PR #119): an occupant is preserved only when it is a
-            // distinct regular file that validates as a whole image. Anything
+            // regular file (Unix: proven distinct; Windows: not
+            // identity-checked) that validates as a whole image. Anything
             // else is quarantined and the publish retried ONCE; a second
             // unusable occupant refuses the migration. `?`: an occupant that
             // could not be checked refuses, never counts as success.
@@ -1019,16 +1017,19 @@ fn sync_schema_sidecar_directory_with(
 /// Ensures the pre-migration sidecar for a store still at `schema_version`,
 /// under the migration lock (spec §2 + §3, r1.s6.w1 / #89 + #25).
 ///
-/// An EXISTING sidecar is proof only after [`inspect_sidecar_occupant`] proves
-/// it a regular file distinct from `source` and [`validate_sidecar_image`]
-/// accepts it (both stages, including redb's checksum-verifying integrity check
-/// on a disposable copy). A symlink (dangling or not), a non-regular entry, a
-/// hard link to `source` and — on Windows, where stable std reads no file
-/// identity — any regular file are quarantined like an invalid image (LF3/LF4,
-/// PR #119); an identity that cannot be read refuses the migration. A sidecar that cannot be checked refuses the migration and is left in
-/// place, neither kept as proof nor quarantined. A valid
-/// one is kept, but its contents must sync successfully before the directory
-/// barrier. Opening it for sync requires write access (including on Windows);
+/// An EXISTING sidecar is proof only after [`inspect_sidecar_occupant`] finds
+/// a regular file (on Unix, proven distinct from `source`) and
+/// [`validate_sidecar_image`] accepts it (both stages, including redb's
+/// checksum-verifying integrity check on a disposable copy). A symlink
+/// (dangling or not), a non-regular entry and a Unix hard link to `source` are
+/// quarantined like an invalid image (LF3/LF4, PR #119); a Unix identity that
+/// cannot be read refuses the migration. On Windows a regular-file sidecar is
+/// validated, not identity-checked: stable std exposes no file identity, so a
+/// hard-link alias of the store at the sidecar path is not detected there. A
+/// sidecar that cannot be checked refuses the migration and is left in place,
+/// neither kept as proof nor quarantined. A valid one is kept, but its
+/// contents must sync successfully before the directory barrier. Opening it
+/// for sync requires write access (including on Windows);
 /// access or sync failure refuses migration with a typed I/O error.
 /// An invalid one is renamed to `.pre-vN.bak.invalid-<unix-seconds>`
 /// ([`quarantine_invalid_sidecar`] — never deleted; `warn!` with both paths) and
@@ -1041,41 +1042,42 @@ fn ensure_schema_backup(source: &Path, schema_version: u32) -> Result<()> {
             "no pre-migration sidecar is defined for schema v{schema_version}"
         )))
     })?;
-    // Symlink-aware (LF3/LF4, PR #119): a symlink, a non-regular entry, a hard
-    // link to the store and (Windows) an unproven identity are quarantined;
-    // only a distinct regular file goes on to content validation. `?`: an
+    // Symlink-aware (LF3/LF4, PR #119): a symlink, a non-regular entry and a
+    // (Unix) hard link to the store are quarantined; a regular file goes on to
+    // content validation (Windows: not identity-checked). `?`: an
     // identity or image that could not be CHECKED refuses the migration and
     // is neither kept nor quarantined.
     match inspect_sidecar_occupant(source, &backup_path)? {
         SidecarOccupant::Absent => {}
         SidecarOccupant::Unusable(reason) => quarantine_sidecar_occupant(&backup_path, &reason)?,
-        SidecarOccupant::Unproven => quarantine_sidecar_occupant(&backup_path, &UNPROVEN_SIDECAR)?,
-        SidecarOccupant::Distinct => match validate_sidecar_image(&backup_path, schema_version)? {
-            Ok(()) => {
-                debug!(
-                    backup = %backup_path.display(),
-                    "existing pre-migration sidecar validated; keeping it"
-                );
-                // An interrupted fallback may have copied a valid image without
-                // syncing it. Flush its contents before making the name durable.
-                // Windows FlushFileBuffers requires a writable handle; failure
-                // to obtain one (e.g. a read-only file) must refuse migration.
-                let sidecar = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&backup_path)
-                    .map_err(PulseDBError::Io)?;
-                #[cfg(test)]
-                if FAIL_SCHEMA_FILE_SYNC.with(|fail| fail.replace(false)) {
-                    return Err(PulseDBError::Io(std::io::Error::other(
-                        "injected sidecar file sync failure",
-                    )));
+        SidecarOccupant::Distinct | SidecarOccupant::Unproven => {
+            match validate_sidecar_image(&backup_path, schema_version)? {
+                Ok(()) => {
+                    debug!(
+                        backup = %backup_path.display(),
+                        "existing pre-migration sidecar validated; keeping it"
+                    );
+                    // An interrupted fallback may have copied a valid image without
+                    // syncing it. Flush its contents before making the name durable.
+                    // Windows FlushFileBuffers requires a writable handle; failure
+                    // to obtain one (e.g. a read-only file) must refuse migration.
+                    let sidecar = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&backup_path)
+                        .map_err(PulseDBError::Io)?;
+                    #[cfg(test)]
+                    if FAIL_SCHEMA_FILE_SYNC.with(|fail| fail.replace(false)) {
+                        return Err(PulseDBError::Io(std::io::Error::other(
+                            "injected sidecar file sync failure",
+                        )));
+                    }
+                    sidecar.sync_all().map_err(PulseDBError::Io)?;
+                    drop(sidecar);
+                    return sync_schema_sidecar_directory(&backup_path);
                 }
-                sidecar.sync_all().map_err(PulseDBError::Io)?;
-                drop(sidecar);
-                return sync_schema_sidecar_directory(&backup_path);
+                Err(error) => quarantine_sidecar_occupant(&backup_path, &error)?,
             }
-            Err(error) => quarantine_sidecar_occupant(&backup_path, &error)?,
-        },
+        }
     }
     publish_durable_sidecar(source, &backup_path, schema_version)
 }
@@ -6078,13 +6080,13 @@ mod tests {
         assert!(leftover_sidecar_temps(&backup_path).is_empty());
     }
 
-    /// Windows posture (LF4, PR #119): stable std reads no file identity on
-    /// Windows, so an existing regular sidecar cannot be proven distinct from
-    /// the store. It is quarantined (never deleted) and a fresh sidecar is
-    /// published from the store, which reads at the pre-migration schema.
+    /// Windows posture (PR #119): stable std reads no file identity on
+    /// Windows, so a regular-file sidecar is validated, not identity-checked. A
+    /// valid one is kept as proof — never quarantined merely for being
+    /// unproven.
     #[cfg(windows)]
     #[test]
-    fn test_windows_unproven_regular_sidecar_is_quarantined_and_replaced() {
+    fn test_windows_valid_regular_sidecar_is_kept() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
         seed_schema_v4_image_with_marker(&path);
@@ -6092,18 +6094,12 @@ mod tests {
         std::fs::copy(&path, &backup_path).unwrap();
         let earlier = std::fs::read(&backup_path).unwrap();
 
-        ensure_schema_backup(&path, 4).expect("a fresh sidecar replaces the unproven one");
+        ensure_schema_backup(&path, 4).expect("a valid regular sidecar is kept");
 
-        assert_eq!(
-            std::fs::read(&backup_path).unwrap(),
-            std::fs::read(&path).unwrap()
-        );
-        let quarantined = quarantined_entries(dir.path(), ".pre-v5.bak.invalid-");
-        assert_eq!(quarantined.len(), 1, "the unproven sidecar is quarantined");
-        assert_eq!(
-            std::fs::read(&quarantined[0]).unwrap(),
-            earlier,
-            "quarantine keeps the earlier bytes"
+        assert_eq!(std::fs::read(&backup_path).unwrap(), earlier);
+        assert!(
+            quarantined_entries(dir.path(), ".pre-v5.bak.invalid-").is_empty(),
+            "a valid regular sidecar is not quarantined"
         );
         assert!(leftover_sidecar_temps(&backup_path).is_empty());
     }
@@ -6378,16 +6374,6 @@ mod tests {
             .close()
             .unwrap();
         let backup = pre_v5_backup_path(&path);
-        let winner_planted = Cell::new(false);
-        // Unix proves the winner distinct and preserves it. Windows cannot read
-        // its identity, so it is quarantined and the publish retried once
-        // (LF4, PR #119), which then copies this call's stage.
-        #[cfg(unix)]
-        let copy: fn(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()> =
-            |_, _| panic!("a preserved winner must not be copied into");
-        #[cfg(not(unix))]
-        let copy: fn(&mut std::fs::File, &mut std::fs::File) -> std::io::Result<()> =
-            copy_and_sync_sidecar;
         publish_durable_sidecar_with(
             &path,
             &backup,
@@ -6395,20 +6381,16 @@ mod tests {
             |from, to| {
                 // A winner appears only after staging/validation, before the
                 // fallback's exclusive destination creation.
-                if !winner_planted.replace(true) {
-                    std::fs::copy(from, to)?;
-                }
+                std::fs::copy(from, to)?;
                 unsupported_sidecar_link(from, to)
             },
-            copy,
+            |_, _| panic!("a preserved winner must not be copied into"),
         )
         .unwrap();
         assert_eq!(
             std::fs::read(&backup).unwrap(),
             std::fs::read(&path).unwrap()
         );
-        let quarantined = quarantined_entries(dir.path(), ".pre-v5.bak.invalid-");
-        assert_eq!(quarantined.len(), usize::from(cfg!(not(unix))));
         assert!(leftover_sidecar_temps(&backup).is_empty());
     }
 
