@@ -733,13 +733,20 @@ impl HnswIndex {
         name: &str,
         id: ExperienceId,
     ) -> Result<()> {
-        // Open ignores an unreadable sidecar (`load_metadata(..).ok()`), so it
-        // restores no mark from it; refusing here would only stall sync.
-        let mut metadata = match Self::load_metadata(dir, name) {
-            Ok(Some(metadata)) => metadata,
-            Ok(None) => return Ok(()),
+        let meta_path = dir.join(format!("{name}.hnsw.meta"));
+        if !meta_path.exists() {
+            return Ok(());
+        }
+        // A read error may be transient: the stale mark could be readable at
+        // the next open and hide the re-created row, so refuse and let sync retry.
+        let json = fs::read_to_string(&meta_path)
+            .map_err(|e| PulseDBError::vector(format!("Failed to read HNSW metadata: {e}")))?;
+        // Unparseable bytes stay unparseable, and open ignores them
+        // (`load_metadata(..).ok()`), so no mark can come back; refusing would only stall sync.
+        let mut metadata: IndexMetadata = match serde_json::from_str(&json) {
+            Ok(metadata) => metadata,
             Err(error) => {
-                tracing::warn!(%error, name, "Unreadable HNSW sidecar; open ignores it, so no mark to clear");
+                tracing::warn!(%error, name, "Unparseable HNSW sidecar; open ignores it, so no mark to clear");
                 return Ok(());
             }
         };

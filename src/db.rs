@@ -6107,6 +6107,79 @@ mod synced_index_repair_tests {
         }
     }
 
+    // A read error may be transient: the stale mark may be readable at the
+    // next open, so the create must refuse rather than save unrepaired.
+    #[test]
+    fn nf11_unreadable_sidecar_refuses_synced_create() {
+        use crate::sync::applier::RemoteChangeApplier;
+        use crate::sync::config::SyncConfig;
+        use crate::sync::types::{InstanceId, SyncChange, SyncEntityType, SyncPayload};
+        for insight in [false, true] {
+            let dir = tempdir().unwrap();
+            let db =
+                Arc::new(PulseDB::open(dir.path().join("test.db"), Config::default()).unwrap());
+            let cid = db.create_collective("unreadable-sidecar").unwrap();
+            let source = db.record_experience(exp_in(cid)).unwrap();
+            let exp = db.get_experience(source).unwrap().unwrap();
+            let iid = db
+                .store_insight(NewDerivedInsight {
+                    collective_id: cid,
+                    content: "insight".into(),
+                    embedding: Some(vec![0.1; 384]),
+                    source_experience_ids: vec![source],
+                    insight_type: crate::insight::InsightType::Pattern,
+                    confidence: 0.9,
+                    domain: vec![],
+                })
+                .unwrap();
+            let record = db.get_insight(iid).unwrap().unwrap();
+            let name = if insight {
+                format!("{cid}_insights")
+            } else {
+                cid.to_string()
+            };
+            if insight {
+                db.delete_insight(iid).unwrap();
+            } else {
+                db.delete_experience(source).unwrap();
+            }
+            // A directory at the sidecar path fails the read on every platform.
+            let meta_path = db.hnsw_dir().unwrap().join(format!("{name}.hnsw.meta"));
+            let _ = std::fs::remove_file(&meta_path);
+            std::fs::create_dir_all(&meta_path).unwrap();
+            let payload = if insight {
+                SyncPayload::InsightCreated(record)
+            } else {
+                SyncPayload::ExperienceCreated(exp.into())
+            };
+            let result = RemoteChangeApplier::new(db.clone(), SyncConfig::default())
+                .apply_batch(vec![SyncChange {
+                    sequence: 1,
+                    source_instance: InstanceId::new(),
+                    collective_id: cid,
+                    entity_type: if insight {
+                        SyncEntityType::Insight
+                    } else {
+                        SyncEntityType::Experience
+                    },
+                    payload,
+                    timestamp: Timestamp::now(),
+                }])
+                .unwrap();
+            assert_eq!(result.applied, 0);
+            assert_eq!(result.failed, 1);
+            assert_eq!(
+                result.safe_through, None,
+                "an unreadable sidecar must not let the re-create be acknowledged"
+            );
+            if insight {
+                assert!(db.get_insight(iid).unwrap().is_none());
+            } else {
+                assert!(db.get_experience(source).unwrap().is_none());
+            }
+        }
+    }
+
     #[test]
     fn stale_mark_corruption_refuses_recreate_before_durable_save() {
         use crate::sync::applier::RemoteChangeApplier;
